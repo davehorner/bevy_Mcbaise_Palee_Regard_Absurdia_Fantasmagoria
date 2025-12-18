@@ -1,5 +1,5 @@
 use burn_human::{AnnyBody, AnnyInput};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 fn load_body() -> AnnyBody {
     AnnyBody::from_reference_paths(
@@ -16,9 +16,7 @@ fn bench_forward(c: &mut Criterion) {
         b.iter(|| {
             for case in &cases {
                 let _out = body
-                    .forward(AnnyInput {
-                        case_name: case.as_str(),
-                    })
+                    .forward(AnnyInput::case(case.as_str()))
                     .expect("forward");
             }
         })

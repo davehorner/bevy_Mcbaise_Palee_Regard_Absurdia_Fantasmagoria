@@ -38,11 +38,9 @@ pub fn mat4_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
 /// Multiply a 4x4 matrix (row-major) by a vec4.
 pub fn mat4_mul_vec4(m: &[f64; 16], v: [f64; 4]) -> [f64; 4] {
     let mut out = [0.0; 4];
-    for row in 0..4 {
-        out[row] = m[row * 4 + 0] * v[0]
-            + m[row * 4 + 1] * v[1]
-            + m[row * 4 + 2] * v[2]
-            + m[row * 4 + 3] * v[3];
+    for (row, slot) in out.iter_mut().enumerate() {
+        let base = row * 4;
+        *slot = m[base] * v[0] + m[base + 1] * v[1] + m[base + 2] * v[2] + m[base + 3] * v[3];
     }
     out
 }

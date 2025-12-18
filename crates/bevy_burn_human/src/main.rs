@@ -1,29 +1,78 @@
-use bevy::asset::RenderAssetUsages;
-use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
-use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
+use bevy::app::AppExit;
+use bevy::input::{ButtonInput, keyboard::KeyCode};
 use bevy::prelude::*;
-use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
+use bevy::prelude::{MessageReader, MessageWriter};
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+use bevy_burn_human::BurnHumanSource;
+use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
-use bevy_tasks::{AsyncComputeTaskPool, Task};
-use futures_lite::future::block_on;
-use burn_human::data::reference::TensorData;
-use burn_human::{model::phenotype::PhenotypeEvaluator, AnnyBody, AnnyInput};
+use fastrand;
 use noise::{NoiseFn, OpenSimplex};
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Instant;
 
 #[cfg(all(target_arch = "wasm32", feature = "web"))]
 use wasm_bindgen::prelude::wasm_bindgen;
+
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+const TENSOR_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.safetensors");
+#[cfg(all(target_arch = "wasm32", feature = "web"))]
+const META_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.meta.json");
+
+#[derive(Component)]
+struct HumanTag;
+
+#[derive(Resource, Clone)]
+struct DemoState {
+    phenotype_labels: Vec<String>,
+    phenotype_values: Vec<f64>,
+    phenotype_noise_baseline: Vec<f64>,
+    use_reference_case: bool,
+    selected_case: usize,
+    selected_bone: usize,
+    bone_euler_deg: Vec<[f32; 3]>,
+    bone_noise_baseline: Vec<[f32; 3]>,
+    noise_enabled: bool,
+    noise_amp: f32,
+    phenotype_noise_amp: f32,
+    upper_leg_noise_amp: f32,
+    lower_leg_noise_amp: f32,
+    upper_arm_noise_amp: f32,
+    lower_arm_noise_amp: f32,
+    wrist_noise_amp: f32,
+    hand_noise_amp: f32,
+    spine_noise_amp: f32,
+    other_pose_noise_amp: f32,
+    time_scale: f32,
+}
+
+#[derive(Resource)]
+struct NoiseRig {
+    noise: OpenSimplex,
+}
 
 #[cfg_attr(all(target_arch = "wasm32", feature = "web"), wasm_bindgen(start))]
 pub fn main() {
     #[cfg(all(target_arch = "wasm32", feature = "web"))]
     console_error_panic_hook::set_once();
 
+    let burn_plugin = {
+        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        {
+            BurnHumanPlugin {
+                source: BurnHumanSource::Bytes {
+                    tensor: TENSOR_BYTES,
+                    meta: META_BYTES,
+                },
+            }
+        }
+        #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
+        {
+            BurnHumanPlugin::default()
+        }
+    };
+
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.04, 0.05, 0.08)))
-        .insert_resource(TimeScale { scale: 1.0 })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "burn_human demo".to_string(),
@@ -31,272 +80,64 @@ pub fn main() {
             }),
             ..default()
         }))
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(EguiPlugin::default())
         .add_plugins(PanOrbitCameraPlugin)
+        .add_plugins(burn_plugin)
         .add_systems(Startup, setup_scene)
-        .add_systems(Update, (queue_mesh_update, apply_mesh_update))
-        .add_systems(EguiPrimaryContextPass, ui_time_scale)
+        .add_systems(
+            PreUpdate,
+            (
+                handle_close_requests,
+                apply_random_pose_on_key,
+                gate_pan_orbit_during_egui,
+                drive_noise,
+            ),
+        )
+        .add_systems(EguiPrimaryContextPass, ui_controls)
         .run();
-}
-
-#[derive(Resource)]
-struct DemoModel {
-    body: Arc<AnnyBody>,
-    case_name: String,
-    mesh: Handle<Mesh>,
-    noise: OpenSimplex,
-    blendshape_len: usize,
-    pose_param_len: usize,
-    bone_rot_scales: Vec<f32>,
-    bone_trans_scales: Vec<f32>,
-    bone_count: usize,
-    phenotype_len: usize,
-    phenotype_labels: Vec<String>,
-    phenotype_base_inputs: Vec<f64>,
-    phenotype_base_weights: Vec<f64>,
-    phenotype_eval: Arc<PhenotypeEvaluator>,
-    bone_major_flags: Vec<bool>,
-    bone_neck_flags: Vec<bool>,
-    bone_symmetry_map: Vec<usize>,
-    faces: Arc<TensorData<i64>>,
-}
-
-#[derive(Resource)]
-struct TimeScale {
-    scale: f32,
-}
-
-#[derive(Resource, Clone)]
-struct NoiseControls {
-    global_amp: f32,
-    face_blend_amp: f32,
-    face_fast_amp: f32,
-    face_slow_amp: f32,
-    body_blend_amp: f32,
-    body_fast_amp: f32,
-    body_slow_amp: f32,
-    phenotype_amp: f32,
-    phenotype_freq: f32,
-    bone_major_amp: f32,
-    bone_neck_amp: f32,
-    bone_other_amp: f32,
-    bone_rot_amp: f32,
-    bone_trans_amp: f32,
-}
-
-#[derive(Resource)]
-struct MeshUpdateState {
-    task: Option<Task<MeshUpdate>>,
-    frame_counter: u32,
-    timer: Timer,
-    recompute_normals_every: u32,
-    start_time: Option<Instant>,
-    last_update_ms: f32,
-}
-
-struct MeshUpdate {
-    positions: Vec<[f32; 3]>,
-    normals: Option<Vec<[f32; 3]>>,
 }
 
 fn setup_scene(
     mut commands: Commands,
-    mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    assets: Res<BurnHumanAssets>,
 ) {
-    #[cfg(target_arch = "wasm32")]
-    let body = AnnyBody::from_reference_bytes(
-        include_bytes!("../../tests/reference/fullbody_default.safetensors"),
-        include_bytes!("../../tests/reference/fullbody_default.meta.json"),
-    )
-    .expect("load embedded reference");
-
-    #[cfg(not(target_arch = "wasm32"))]
-    let body = AnnyBody::from_reference_paths(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
-    )
-    .expect("load reference bundle");
-    let body = Arc::new(body);
-    let case_name = body
-        .case_names()
-        .next()
-        .expect("at least one reference case")
-        .to_string();
-    let initial = body
-        .forward(AnnyInput { case_name: &case_name })
-        .expect("forward");
-    let pose_param_len = body
+    let phenotype_labels = assets.body.metadata().metadata.phenotype_labels.clone();
+    let phenotype_values = vec![0.5; phenotype_labels.len()];
+    let selected_case = assets
+        .body
         .metadata()
         .cases
         .iter()
-        .find(|c| c.name == case_name)
-        .map(|c| c.pose_parameters.data.len())
-        .expect("case pose parameters length");
-    let bone_count = pose_param_len / 16;
-    let (bone_rot_scales, bone_trans_scales, bone_major_flags, bone_neck_flags, bone_symmetry_map) =
-    {
-        let labels = &body.metadata().metadata.bone_labels;
-        let mut rot = Vec::with_capacity(labels.len());
-        let mut trans = Vec::with_capacity(labels.len());
-        let mut major_flags = Vec::with_capacity(labels.len());
-        let mut neck_flags = Vec::with_capacity(labels.len());
-        let mut normalized_to_index: HashMap<String, usize> = HashMap::new();
-        let mut symmetry_map = Vec::with_capacity(labels.len());
-        for (i, label) in labels.iter().enumerate() {
-            let l: String = label.to_lowercase();
-            let is_root = i == 0 || l.contains("root");
-            let is_shoulder = l.contains("shoulder") || l.contains("clavicle");
-            let is_elbow = l.contains("elbow");
-            let is_knee = l.contains("knee");
-            let is_wrist = l.contains("wrist") || l.contains("hand");
-            let is_upper_arm = l.contains("upperarm") || l.contains("upper_arm");
-            let is_lower_arm = l.contains("lowerarm") || l.contains("lower_arm") || l.contains("forearm");
-            let is_thigh = l.contains("thigh") || l.contains("upperleg") || l.contains("upper_leg");
-            let is_calf = l.contains("calf") || l.contains("shin") || l.contains("lowerleg") || l.contains("lower_leg");
-            let is_arm = l.contains("arm") || is_shoulder || is_elbow || is_wrist || is_upper_arm || is_lower_arm;
-            let is_hip = l.contains("hip");
-            let is_leg = l.contains("leg") || is_knee || l.contains("foot") || is_hip || is_thigh || is_calf || l.contains("ankle");
-            let is_spine = l.contains("spine") || l.contains("back") || l.contains("chest") || l.contains("pelvis");
-            let is_neck = l.contains("neck") || l.contains("head");
-            let is_major_joint = is_shoulder || is_elbow || is_knee || is_wrist || l.contains("ankle");
-            let rot_scale = if is_root {
-                0.03
-            } else if is_major_joint {
-                0.5
-            } else if is_arm || is_leg || is_spine || is_neck {
-                0.38
-            } else {
-                0.17
-            };
-            let trans_scale = if is_root {
-                0.0
-            } else if is_major_joint {
-                0.005
-            } else if is_arm || is_leg || is_spine || is_neck {
-                0.0045
-            } else {
-                0.0035
-            };
-            rot.push(rot_scale);
-            trans.push(trans_scale);
-            major_flags.push(is_major_joint);
-            neck_flags.push(is_neck);
-            let normalized = l
-                .replace("left", "")
-                .replace("right", "")
-                .replace("l_", "")
-                .replace("r_", "")
-                .replace("-", "")
-                .replace(" ", "");
-            if let Some(&other) = normalized_to_index.get(&normalized) {
-                symmetry_map.push(other.min(i));
-            } else {
-                normalized_to_index.insert(normalized, i);
-                symmetry_map.push(i);
-            }
-        }
-        (rot, trans, major_flags, neck_flags, symmetry_map)
-    };
-    let phenotype_labels = body.metadata().metadata.phenotype_labels.clone();
-    let phenotype_len = phenotype_labels.len();
-    let phenotype_eval = Arc::new(PhenotypeEvaluator {
-        phenotype_labels: phenotype_labels.clone(),
-        macrodetail_keys: body.metadata().metadata.macrodetail_keys.clone(),
-        anchors: body.metadata().metadata.phenotype_anchors.clone(),
-        variations: body.metadata().metadata.phenotype_variations.clone(),
-        mask: body.metadata().static_data.blendshape_mask.clone(),
-    });
-    let phenotype_base_inputs = body
-        .metadata()
-        .cases
-        .iter()
-        .find(|c| c.name == case_name)
-        .map(|c| c.phenotype_inputs.data.clone())
-        .unwrap_or_else(|| vec![0.5; phenotype_len]);
-    let phenotype_base_weights = phenotype_eval
-        .as_ref()
-        .weights(&TensorData {
-            shape: vec![1, phenotype_len],
-            data: phenotype_base_inputs.clone(),
-        })
-        .expect("phenotype weights")
-        .data;
+        .position(|c| c.pose_parameters.shape[0] == 1)
+        .unwrap_or(0usize);
+    let bone_count = assets.body.metadata().metadata.bone_labels.len();
 
-    let faces = Arc::new(body.faces_quads().clone());
-    let positions = tensor_to_vec3(&initial.posed_vertices);
-    let blendshape_len = body.metadata().static_data.blendshapes.shape[0];
-    let mut mesh = Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    );
-    mesh.insert_indices(Indices::U32(triangulate_quads(faces.as_ref())));
-    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, to_position_attribute(&positions));
-    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, compute_normals(&positions, faces.as_ref()));
-    if let Some(uvs) =
-        tensor_to_uv_attribute(&body.metadata().static_data.texture_coordinates, positions.len())
-    {
-        mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
-    }
-    let mesh_handle = meshes.add(mesh);
-    commands.insert_resource(DemoModel {
-        body: body.clone(),
-        case_name: case_name.clone(),
-        mesh: mesh_handle.clone(),
-        noise: OpenSimplex::new(42),
-        blendshape_len,
-        pose_param_len,
-        bone_rot_scales,
-        bone_trans_scales,
-        bone_count,
-        phenotype_len,
+    commands.insert_resource(DemoState {
         phenotype_labels,
-        phenotype_base_inputs,
-        phenotype_base_weights,
-        phenotype_eval,
-        bone_major_flags,
-        bone_neck_flags,
-        bone_symmetry_map,
-        faces,
+        phenotype_values: phenotype_values.clone(),
+        phenotype_noise_baseline: phenotype_values.clone(),
+        use_reference_case: true,
+        selected_case,
+        selected_bone: 0,
+        bone_euler_deg: vec![[0.0; 3]; bone_count],
+        bone_noise_baseline: vec![[0.0; 3]; bone_count],
+        noise_enabled: false,
+        noise_amp: 0.35,
+        phenotype_noise_amp: 1.0,
+        upper_leg_noise_amp: 12.0,
+        lower_leg_noise_amp: 10.0,
+        upper_arm_noise_amp: 10.0,
+        lower_arm_noise_amp: 8.0,
+        wrist_noise_amp: 6.0,
+        hand_noise_amp: 6.0,
+        spine_noise_amp: 6.0,
+        other_pose_noise_amp: 3.0,
+        time_scale: 1.0,
     });
-    commands.insert_resource(NoiseControls {
-        global_amp: 1.0,
-        face_blend_amp: 0.6,
-        face_fast_amp: 0.6,
-        face_slow_amp: 0.7,
-        body_blend_amp: 0.55,
-        body_fast_amp: 0.55,
-        body_slow_amp: 0.65,
-        phenotype_amp: 0.45,
-        phenotype_freq: 0.85,
-        bone_major_amp: 1.0,
-        bone_neck_amp: 0.4,
-        bone_other_amp: 0.55,
-        bone_rot_amp: 1.0,
-        bone_trans_amp: 0.75,
+    commands.insert_resource(NoiseRig {
+        noise: OpenSimplex::new(42),
     });
-    commands.insert_resource(MeshUpdateState {
-        task: None,
-        frame_counter: 0,
-        timer: Timer::from_seconds(1.0 / 24.0, TimerMode::Repeating),
-        recompute_normals_every: 0,
-        start_time: None,
-        last_update_ms: 0.0,
-    });
-
-    commands.spawn((
-        Mesh3d(mesh_handle.clone()),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.72, 0.7, 0.68),
-            metallic: 0.0,
-            reflectance: 0.5,
-            perceptual_roughness: 0.55,
-            ..default()
-        })),
-        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-            .with_scale(Vec3::splat(1.15)),
-    ));
 
     commands.insert_resource(AmbientLight {
         color: Color::srgb(0.85, 0.85, 0.9),
@@ -313,8 +154,6 @@ fn setup_scene(
         },
         Transform::from_xyz(5.0, 7.0, 4.5).looking_at(Vec3::new(0.0, 1.2, 0.0), Vec3::Y),
     ));
-
-    // Opposing cool fill to reduce dark backsides.
     commands.spawn((
         DirectionalLight {
             illuminance: 1_800.0,
@@ -335,7 +174,6 @@ fn setup_scene(
         },
         Transform::from_xyz(-3.0, 3.2, 2.4),
     ));
-
     commands.spawn((
         PointLight {
             intensity: 520.0,
@@ -346,39 +184,30 @@ fn setup_scene(
         Transform::from_xyz(3.2, 2.4, -2.8),
     ));
 
-    // Low-front left fill to lift remaining shadows on face.
     commands.spawn((
-        DirectionalLight {
-            illuminance: 1_200.0,
-            shadows_enabled: false,
-            color: Color::srgb(0.98, 0.98, 1.0),
-            ..default()
+        BurnHumanInput {
+            case_name: assets
+                .body
+                .metadata()
+                .metadata
+                .case_names
+                .get(selected_case)
+                .cloned(),
+            phenotype_inputs: Some(phenotype_values),
+            ..Default::default()
         },
-        Transform::from_xyz(-2.5, 1.5, 4.0).looking_at(Vec3::new(0.0, 1.3, 0.0), Vec3::Y),
-    ));
-
-    // Soft back fill to lift rear shadows without harsh contrast.
-    commands.spawn((
-        PointLight {
-            intensity: 520.0,
-            range: 24.0,
-            color: Color::srgb(0.92, 0.95, 1.0),
-            shadows_enabled: false,
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.72, 0.7, 0.68),
+            metallic: 0.0,
+            reflectance: 0.5,
+            perceptual_roughness: 0.55,
             ..default()
-        },
-        Transform::from_xyz(0.0, 2.8, -6.0),
-    ));
-
-    // Overhead fill to even top lighting.
-    commands.spawn((
-        PointLight {
-            intensity: 450.0,
-            range: 20.0,
-            color: Color::srgb(0.98, 0.99, 1.0),
-            shadows_enabled: false,
-            ..default()
-        },
-        Transform::from_xyz(0.0, 6.5, 0.5),
+        })),
+        Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
+            .with_scale(Vec3::splat(1.15)),
+        Visibility::default(),
+        Name::new("burn_human"),
+        HumanTag,
     ));
 
     commands.spawn((
@@ -388,312 +217,486 @@ fn setup_scene(
     ));
 }
 
-fn queue_mesh_update(
-    time: Res<Time>,
-    time_scale: Res<TimeScale>,
-    noise_controls: Res<NoiseControls>,
-    model: Res<DemoModel>,
-    mut state: ResMut<MeshUpdateState>,
+fn ui_controls(
+    mut contexts: EguiContexts,
+    assets: Res<BurnHumanAssets>,
+    mut state: ResMut<DemoState>,
+    mut query: Query<&mut BurnHumanInput, With<HumanTag>>,
 ) {
-    if state.task.is_some() || !state.timer.tick(time.delta()).just_finished() {
+    let mut input = if let Ok(i) = query.single_mut() {
+        i
+    } else {
+        return;
+    };
+
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+
+    egui::Window::new("burn_human controls").show(ctx, |ui| {
+        ui.label("Reference data exported from the bundled Python Anny model.");
+        ui.separator();
+        ui.checkbox(&mut state.use_reference_case, "Use reference case");
+        if state.use_reference_case {
+            if let Some((idx, name)) = pick_single_sample_case(&mut state, &assets) {
+                state.selected_case = idx;
+                ui.label(format!("Reference case: {name}"));
+                input.case_name = Some(name);
+            } else {
+                ui.label("No single-sample reference case available");
+                input.case_name = None;
+            }
+            input.phenotype_inputs = None;
+            input.blendshape_weights = None;
+            input.blendshape_delta = None;
+        } else {
+            input.case_name = None;
+            ui.label("Phenotype sliders (drive blendshapes via mask).");
+            for idx in 0..state.phenotype_values.len() {
+                let label = state.phenotype_labels.get(idx).cloned().unwrap_or_default();
+                if let Some(value) = state.phenotype_values.get_mut(idx) {
+                    ui.add(egui::Slider::new(value, 0.0..=1.0).text(label));
+                }
+            }
+            if ui.button("Reset phenotype").clicked() {
+                for v in state.phenotype_values.iter_mut() {
+                    *v = 0.5;
+                }
+            }
+            input.phenotype_inputs = Some(state.phenotype_values.clone());
+        }
+
+        ui.separator();
+        ui.label(format!(
+            "Blendshapes: {} · Bones: {}",
+            assets.body.metadata().static_data.blendshapes.shape[0],
+            assets.body.metadata().metadata.bone_labels.len()
+        ));
+        ui.label(format!(
+            "Reference cases available: {}",
+            assets.body.metadata().metadata.case_names.len()
+        ));
+        ui.separator();
+        let was_noise = state.noise_enabled;
+        ui.checkbox(&mut state.noise_enabled, "Procedural motion");
+        if state.noise_enabled && !was_noise {
+            state.phenotype_noise_baseline = state.phenotype_values.clone();
+            state.bone_noise_baseline = state.bone_euler_deg.clone();
+        }
+        ui.add(
+            egui::Slider::new(&mut state.noise_amp, 0.0..=2.0)
+                .text("global noise")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.phenotype_noise_amp, 0.0..=2.0)
+                .text("phenotype noise")
+                .logarithmic(false),
+        );
+        ui.separator();
+        ui.label("Pose noise (deg, per group)");
+        ui.add(
+            egui::Slider::new(&mut state.upper_leg_noise_amp, 0.0..=50.0)
+                .text("upper leg")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.lower_leg_noise_amp, 0.0..=50.0)
+                .text("lower leg")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.upper_arm_noise_amp, 0.0..=50.0)
+                .text("upper arm")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.lower_arm_noise_amp, 0.0..=50.0)
+                .text("lower arm")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.wrist_noise_amp, 0.0..=50.0)
+                .text("wrist")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.hand_noise_amp, 0.0..=50.0)
+                .text("hand/fingers")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.spine_noise_amp, 0.0..=50.0)
+                .text("spine")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.other_pose_noise_amp, 0.0..=50.0)
+                .text("other pose")
+                .logarithmic(false),
+        );
+        ui.add(
+            egui::Slider::new(&mut state.time_scale, 0.25..=3.0)
+                .text("time scale")
+                .logarithmic(false),
+        );
+        ui.separator();
+        ui.label("Bone orientation (degrees)");
+        egui::ComboBox::from_id_salt("bone_select")
+            .selected_text(
+                assets
+                    .body
+                    .metadata()
+                    .metadata
+                    .bone_labels
+                    .get(state.selected_bone)
+                    .cloned()
+                    .unwrap_or_else(|| "bone".to_string()),
+            )
+            .show_ui(ui, |ui| {
+                for (idx, name) in assets
+                    .body
+                    .metadata()
+                    .metadata
+                    .bone_labels
+                    .iter()
+                    .enumerate()
+                {
+                    ui.selectable_value(&mut state.selected_bone, idx, name);
+                }
+            });
+        let selected_bone = state.selected_bone;
+        let mut euler = state
+            .bone_euler_deg
+            .get(selected_bone)
+            .copied()
+            .unwrap_or([0.0; 3]);
+        ui.add(egui::Slider::new(&mut euler[0], -90.0..=90.0).text("X"));
+        ui.add(egui::Slider::new(&mut euler[1], -90.0..=90.0).text("Y"));
+        ui.add(egui::Slider::new(&mut euler[2], -90.0..=90.0).text("Z"));
+        if ui.button("Reset bone").clicked() {
+            euler = [0.0; 3];
+        }
+        if let Some(slot) = state.bone_euler_deg.get_mut(selected_bone) {
+            *slot = euler;
+        }
+    });
+}
+
+fn gate_pan_orbit_during_egui(mut contexts: EguiContexts, mut query: Query<&mut PanOrbitCamera>) {
+    let Ok(ctx) = contexts.ctx_mut() else { return };
+    let block =
+        ctx.is_pointer_over_area() || ctx.wants_pointer_input() || ctx.wants_keyboard_input();
+    for mut cam in query.iter_mut() {
+        cam.enabled = !block;
+    }
+}
+
+fn apply_random_pose_on_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    assets: Res<BurnHumanAssets>,
+    mut state: ResMut<DemoState>,
+    mut query: Query<&mut BurnHumanInput, With<HumanTag>>,
+) {
+    if !keys.just_pressed(KeyCode::KeyR) {
         return;
     }
+    let mut rng = fastrand::Rng::new();
+    let mut input = if let Ok(i) = query.single_mut() {
+        i
+    } else {
+        return;
+    };
 
-    let t = time.elapsed_secs_f64() * time_scale.scale as f64;
-    let noise = model.noise.clone();
-    let body = model.body.clone();
-    let case_name = model.case_name.clone();
-    let blendshape_len = model.blendshape_len;
-    let pose_param_len = model.pose_param_len;
-    let faces = model.faces.clone();
-    let bone_rot_scales = model.bone_rot_scales.clone();
-    let bone_trans_scales = model.bone_trans_scales.clone();
-    let bone_count = model.bone_count;
-    let phenotype_len = model.phenotype_len;
-    let phenotype_labels = model.phenotype_labels.clone();
-    let phenotype_base_inputs = model.phenotype_base_inputs.clone();
-    let phenotype_base_weights = model.phenotype_base_weights.clone();
-    let phenotype_eval = model.phenotype_eval.clone();
-    let bone_major_flags = model.bone_major_flags.clone();
-    let bone_neck_flags = model.bone_neck_flags.clone();
-    let bone_symmetry_map = model.bone_symmetry_map.clone();
-    let nc = noise_controls.clone();
-    let do_normals = state.recompute_normals_every != 0
-        && state.frame_counter % state.recompute_normals_every == 0;
-    state.frame_counter = state.frame_counter.wrapping_add(1);
+    // Shuffle phenotype sliders around mid-range.
+    let phen_len = assets.body.metadata().metadata.phenotype_labels.len();
+    state.phenotype_values.clear();
+    for _ in 0..phen_len {
+        let jitter = rng.f64() * 0.5 - 0.25;
+        state.phenotype_values.push((0.5 + jitter).clamp(0.0, 1.0));
+    }
 
-    state.start_time = Some(Instant::now());
-
-    let task = AsyncComputeTaskPool::get().spawn(async move {
-        let mut blend_delta = vec![0.0f64; blendshape_len];
-        for (i, value) in blend_delta.iter_mut().enumerate() {
-            let is_face = i < 48;
-            let fast_scale = if is_face {
-                0.006 * nc.face_blend_amp as f64 * nc.face_fast_amp as f64
-            } else {
-                0.032 * nc.body_blend_amp as f64 * nc.body_fast_amp as f64
-            } * nc.global_amp as f64;
-            let slow_scale = if is_face {
-                0.012 * nc.face_blend_amp as f64 * nc.face_slow_amp as f64
-            } else {
-                0.05 * nc.body_blend_amp as f64 * nc.body_slow_amp as f64
-            } * nc.global_amp as f64;
-            let fast = noise.get([t * 0.32, i as f64 * 0.29]) * fast_scale;
-            let slow = noise.get([t * 0.05, i as f64 * 0.04]) * slow_scale;
-            let raw = fast + slow;
-            let clamp_limit = if is_face { 0.12 } else { 0.18 };
-            *value = raw.clamp(-clamp_limit, clamp_limit);
+    // Shuffle bone Euler sliders (skip root bone to avoid unrealistic drift).
+    for (idx, bone) in state.bone_euler_deg.iter_mut().enumerate() {
+        if idx == 0 {
+            *bone = [0.0; 3];
+            continue;
         }
-        let mut phenotype_inputs = phenotype_base_inputs.clone();
-        for (i, val) in phenotype_inputs.iter_mut().enumerate() {
-            let label = phenotype_labels.get(i).map(|s| s.as_str()).unwrap_or("");
-            let (freq, amp) = match label {
-                "gender" => (0.04, 0.35),
-                "muscle" | "weight" => (0.06, 0.28),
-                "height" => (0.04, 0.2),
-                "proportions" => (0.07, 0.28),
-                _ => (0.06, 0.22),
-            };
-            let amp = amp * nc.phenotype_amp as f64 * nc.global_amp as f64;
-            let n = noise.get([t * freq * nc.phenotype_freq as f64, (500.0 + i as f64) * 0.17]);
-            *val = (*val + n * amp).clamp(0.0, 1.0);
-        }
-        let phenotype_weights = phenotype_eval
-            .as_ref()
-            .weights(&TensorData {
-                shape: vec![1, phenotype_len],
-                data: phenotype_inputs.clone(),
-            })
-            .unwrap_or_else(|_| TensorData {
-                shape: vec![1, phenotype_len],
-                data: phenotype_base_weights.clone(),
-            });
-        for (dst, w) in blend_delta
-            .iter_mut()
-            .zip(phenotype_weights.data.iter().zip(phenotype_base_weights.iter()))
+        bone[0] = rng.f32() * 40.0 - 20.0;
+        bone[1] = rng.f32() * 50.0 - 25.0;
+        bone[2] = rng.f32() * 40.0 - 20.0;
+    }
+
+    // Drive directly from sliders (no reference case).
+    state.use_reference_case = false;
+    state.phenotype_noise_baseline = state.phenotype_values.clone();
+    state.bone_noise_baseline = state.bone_euler_deg.clone();
+    input.case_name = None;
+    input.phenotype_inputs = Some(state.phenotype_values.clone());
+    input.blendshape_weights = None;
+    input.blendshape_delta = None;
+    input.pose_parameters = None;
+    input.pose_parameters_delta = None;
+    apply_pose_from_state(&mut input, &assets, &state);
+}
+
+fn handle_close_requests(
+    mut reader: MessageReader<bevy::window::WindowCloseRequested>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if reader.read().next().is_some() {
+        exit.write(AppExit::Success);
+    }
+}
+
+fn apply_pose_from_state(input: &mut BurnHumanInput, assets: &BurnHumanAssets, state: &DemoState) {
+    let bones = assets.body.metadata().metadata.bone_labels.len();
+    let (batch, mut pose) = if let Some(name) = input.case_name.as_ref() {
+        if let Some(case) = assets
+            .body
+            .metadata()
+            .cases
+            .iter()
+            .find(|c| &c.name == name)
         {
-            let delta = (w.0 - w.1) * 0.22 * nc.global_amp as f64;
-            *dst += delta;
+            (
+                case.pose_parameters.shape[0],
+                case.pose_parameters.data.clone(),
+            )
+        } else {
+            (1, Vec::new())
         }
+    } else {
+        (1, Vec::new())
+    };
 
-        let mut pose_delta = vec![0.0f64; pose_param_len];
-        let rot_indices = [0usize, 1, 2, 4, 5, 6, 8, 9, 10];
-        for bone in 0..bone_count {
+    if pose.is_empty() {
+        pose = vec![0.0f64; bones * 16];
+        for bone in 0..bones {
             let base = bone * 16;
-            let sym = *bone_symmetry_map.get(bone).unwrap_or(&bone);
-            let sym_seed = (sym as f64) * 0.19;
-            for (j, idx) in rot_indices.iter().enumerate() {
-                let n = noise.get([t * 0.26, sym_seed + (idx + j) as f64 * 0.021]);
-                let base_scale = *bone_rot_scales.get(bone).unwrap_or(&0.2) as f64;
-                let joint_mult = if *bone_neck_flags.get(bone).unwrap_or(&false) {
-                    nc.bone_neck_amp
-                } else if *bone_major_flags.get(bone).unwrap_or(&false) {
-                    nc.bone_major_amp
-                } else {
-                    nc.bone_other_amp * 0.5
-                };
-                let scale = base_scale * joint_mult as f64 * nc.bone_rot_amp as f64 * nc.global_amp as f64;
-                let max_rot = if *bone_major_flags.get(bone).unwrap_or(&false) {
-                    0.34
-                } else if *bone_neck_flags.get(bone).unwrap_or(&false) {
-                    0.18
-                } else {
-                    0.24
-                };
-                pose_delta[base + idx] = (n * scale).clamp(-max_rot, max_rot);
-            }
-            if bone > 0 {
-                let tscale = *bone_trans_scales.get(bone).unwrap_or(&0.018) as f64
-                    * nc.bone_trans_amp as f64
-                    * nc.global_amp as f64;
-                pose_delta[base + 3] =
-                    (noise.get([t * 0.14, sym_seed + 0.17]) * tscale).clamp(-0.02, 0.02);
-                pose_delta[base + 7] =
-                    (noise.get([t * 0.15, sym_seed + 0.15]) * tscale).clamp(-0.02, 0.02);
-                pose_delta[base + 11] =
-                    (noise.get([t * 0.13, sym_seed + 0.13]) * tscale).clamp(-0.02, 0.02);
-            }
+            pose[base] = 1.0;
+            pose[base + 5] = 1.0;
+            pose[base + 10] = 1.0;
+            pose[base + 15] = 1.0;
         }
+    }
 
-        let out = body
-            .forward_with_offsets(&case_name, Some(&blend_delta), None, Some(&pose_delta))
-            .expect("forward with offsets");
-        let positions = tensor_to_vec3(&out.posed_vertices);
-        let normals = if do_normals {
-            Some(compute_normals(&positions, faces.as_ref()))
+    for b in 0..batch.max(1) {
+        for (bone, rot_deg) in state.bone_euler_deg.iter().enumerate().take(bones) {
+            let base = (b * bones + bone) * 16;
+            if base + 15 >= pose.len() {
+                break;
+            }
+            let base_rot = [
+                [pose[base], pose[base + 1], pose[base + 2]],
+                [pose[base + 4], pose[base + 5], pose[base + 6]],
+                [pose[base + 8], pose[base + 9], pose[base + 10]],
+            ];
+            let delta = euler_deg_to_mat3(rot_deg[0], rot_deg[1], rot_deg[2]);
+            let rot = mat3_mul(delta, base_rot);
+            pose[base] = rot[0][0];
+            pose[base + 1] = rot[0][1];
+            pose[base + 2] = rot[0][2];
+            pose[base + 4] = rot[1][0];
+            pose[base + 5] = rot[1][1];
+            pose[base + 6] = rot[1][2];
+            pose[base + 8] = rot[2][0];
+            pose[base + 9] = rot[2][1];
+            pose[base + 10] = rot[2][2];
+            pose[base + 15] = 1.0;
+        }
+    }
+    input.pose_parameters = Some(pose);
+    input.pose_parameters_delta = None;
+}
+
+fn euler_deg_to_mat3(rx_deg: f32, ry_deg: f32, rz_deg: f32) -> [[f64; 3]; 3] {
+    let (rx, ry, rz) = (
+        rx_deg.to_radians() as f64,
+        ry_deg.to_radians() as f64,
+        rz_deg.to_radians() as f64,
+    );
+    let (sx, cx) = rx.sin_cos();
+    let (sy, cy) = ry.sin_cos();
+    let (sz, cz) = rz.sin_cos();
+    // Z * Y * X rotation order
+    [
+        [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+        [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+        [-sy, cy * sx, cy * cx],
+    ]
+}
+
+fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+struct PoseNoiseScales {
+    upper_leg: f32,
+    lower_leg: f32,
+    upper_arm: f32,
+    lower_arm: f32,
+    wrist: f32,
+    hand: f32,
+    spine: f32,
+    other: f32,
+}
+
+impl From<&DemoState> for PoseNoiseScales {
+    fn from(state: &DemoState) -> Self {
+        Self {
+            upper_leg: state.upper_leg_noise_amp,
+            lower_leg: state.lower_leg_noise_amp,
+            upper_arm: state.upper_arm_noise_amp,
+            lower_arm: state.lower_arm_noise_amp,
+            wrist: state.wrist_noise_amp,
+            hand: state.hand_noise_amp,
+            spine: state.spine_noise_amp,
+            other: state.other_pose_noise_amp,
+        }
+    }
+}
+
+fn pose_noise_scale_for_bone(name: &str, scales: &PoseNoiseScales) -> f32 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("upperleg") || lower.contains("upper_leg") || lower.contains("thigh") {
+        scales.upper_leg
+    } else if lower.contains("lowerleg")
+        || lower.contains("lower_leg")
+        || lower.contains("calf")
+        || lower.contains("knee")
+        || lower.contains("foot")
+        || lower.contains("toe")
+    {
+        scales.lower_leg
+    } else if lower.contains("upper_arm")
+        || lower.contains("shoulder")
+        || lower.contains("clavicle")
+        || lower.contains("upperarm")
+    {
+        scales.upper_arm
+    } else if lower.contains("lower_arm")
+        || lower.contains("lowerarm")
+        || lower.contains("elbow")
+        || lower.contains("forearm")
+    {
+        scales.lower_arm
+    } else if lower.contains("wrist") {
+        scales.wrist
+    } else if lower.contains("hand") || lower.contains("finger") || lower.contains("metacarpal") {
+        scales.hand
+    } else if lower.contains("spine") || lower.contains("neck") || lower.contains("chest") {
+        scales.spine
+    } else {
+        scales.other
+    }
+}
+
+fn pick_single_sample_case(
+    state: &mut DemoState,
+    assets: &BurnHumanAssets,
+) -> Option<(usize, String)> {
+    let cases = &assets.body.metadata().cases;
+    let names = &assets.body.metadata().metadata.case_names;
+    if let Some((idx, _)) = cases
+        .iter()
+        .enumerate()
+        .find(|(_, c)| c.pose_parameters.shape[0] == 1)
+    {
+        state.selected_case = idx;
+        return names.get(idx).cloned().map(|n| (idx, n));
+    }
+    names
+        .get(state.selected_case)
+        .cloned()
+        .map(|n| (state.selected_case, n))
+}
+
+fn drive_noise(
+    time: Res<Time>,
+    assets: Res<BurnHumanAssets>,
+    noise: Res<NoiseRig>,
+    mut state: ResMut<DemoState>,
+    mut query: Query<&mut BurnHumanInput, With<HumanTag>>,
+) {
+    let mut input = if let Ok(i) = query.single_mut() {
+        i
+    } else {
+        return;
+    };
+
+    if !state.noise_enabled {
+        input.case_name = if state.use_reference_case {
+            pick_single_sample_case(&mut state, &assets).map(|(_, n)| n)
         } else {
             None
         };
-
-        MeshUpdate {
-            positions: to_position_attribute(&positions),
-            normals,
-        }
-    });
-
-    state.task = Some(task);
-}
-
-fn apply_mesh_update(
-    mut meshes: ResMut<Assets<Mesh>>,
-    model: Res<DemoModel>,
-    mut state: ResMut<MeshUpdateState>,
-) {
-    if let Some(task) = state.task.take() {
-        if task.is_finished() {
-            let update = block_on(task);
-            if let Some(mesh) = meshes.get_mut(&model.mesh) {
-                mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, update.positions);
-                if let Some(normals) = update.normals {
-                    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
-                }
-            }
-            if let Some(start) = state.start_time.take() {
-                state.last_update_ms = start.elapsed().as_secs_f32() * 1000.0;
-            }
+        input.phenotype_inputs = if input.case_name.is_none() {
+            Some(state.phenotype_values.clone())
         } else {
-            state.task = Some(task);
+            None
+        };
+        apply_pose_from_state(&mut input, &assets, &state);
+        return;
+    }
+
+    state.use_reference_case = false;
+    let t = time.elapsed_secs_f64() * state.time_scale as f64;
+
+    let phenotype_len = assets.body.metadata().metadata.phenotype_labels.len();
+    state.phenotype_noise_baseline.resize(phenotype_len, 0.5);
+    state.phenotype_values.resize(phenotype_len, 0.5);
+    let phen_labels = assets.body.metadata().metadata.phenotype_labels.clone();
+    let phen_baseline = state.phenotype_noise_baseline.clone();
+    let noise_amp = state.noise_amp as f64;
+    let phen_amp = state.phenotype_noise_amp as f64;
+    for (i, value) in state.phenotype_values.iter_mut().enumerate() {
+        let label = phen_labels.get(i).map(|s| s.as_str()).unwrap_or("");
+        let (freq, amp_hint) = match label {
+            "gender" => (0.5, 0.25),
+            "muscle" | "weight" => (0.7, 0.22),
+            "height" => (0.6, 0.18),
+            "proportions" => (0.8, 0.22),
+            _ => (0.6, 0.2),
+        };
+        let n = noise.noise.get([t * freq, (200.0 + i as f64) * 0.11]);
+        let amp = amp_hint * noise_amp * phen_amp;
+        let base = *phen_baseline.get(i).unwrap_or(&0.5);
+        *value = (base + n * amp).clamp(0.0, 1.0);
+    }
+
+    let bone_count = state.bone_euler_deg.len();
+    state.bone_noise_baseline.resize(bone_count, [0.0; 3]);
+    let bone_baseline = state.bone_noise_baseline.clone();
+    let noise_amp_f32 = state.noise_amp;
+    let bone_labels = assets.body.metadata().metadata.bone_labels.clone();
+    let pose_scales = PoseNoiseScales::from(&*state);
+    for (idx, bone) in state.bone_euler_deg.iter_mut().enumerate() {
+        if idx == 0 {
+            *bone = [0.0; 3];
+            continue;
         }
+        let base = bone_baseline.get(idx).copied().unwrap_or([0.0; 3]);
+        let nx = noise.noise.get([t * 0.35, idx as f64 * 0.17]);
+        let ny = noise.noise.get([t * 0.45 + 97.0, idx as f64 * 0.23]);
+        let nz = noise.noise.get([t * 0.55 + 197.0, idx as f64 * 0.13]);
+        let group_amp = bone_labels
+            .get(idx)
+            .map(|name| pose_noise_scale_for_bone(name, &pose_scales))
+            .unwrap_or(pose_scales.other);
+        let amp = group_amp * noise_amp_f32;
+        bone[0] = (base[0] + (nx as f32) * amp).clamp(-90.0, 90.0);
+        bone[1] = (base[1] + (ny as f32) * amp).clamp(-90.0, 90.0);
+        bone[2] = (base[2] + (nz as f32) * amp).clamp(-90.0, 90.0);
     }
-}
 
-fn ui_time_scale(
-    mut contexts: EguiContexts,
-    mut time_scale: ResMut<TimeScale>,
-    mut noise_controls: ResMut<NoiseControls>,
-    diagnostics: Res<DiagnosticsStore>,
-    state: Res<MeshUpdateState>,
-) {
-    let ctx = contexts.ctx_mut().expect("primary Egui context");
-    egui::Window::new("Playback").show(ctx, |ui| {
-        ui.label("Time scale");
-        ui.add(
-            egui::Slider::new(&mut time_scale.scale, 0.0..=3.0)
-                .logarithmic(false)
-                .text("speed"),
-        );
-        ui.label("Lower to slow motion; raise to speed up.");
-        ui.separator();
-        ui.label("Noise amplitudes");
-        ui.add(egui::Slider::new(&mut noise_controls.global_amp, 0.0..=2.0).text("global"));
-        ui.add(egui::Slider::new(&mut noise_controls.face_blend_amp, 0.0..=2.0).text("face blend"));
-        ui.add(egui::Slider::new(&mut noise_controls.face_fast_amp, 0.0..=2.0).text("face fast noise"));
-        ui.add(egui::Slider::new(&mut noise_controls.face_slow_amp, 0.0..=2.0).text("face slow noise"));
-        ui.add(egui::Slider::new(&mut noise_controls.body_blend_amp, 0.0..=2.0).text("body blend"));
-        ui.add(egui::Slider::new(&mut noise_controls.body_fast_amp, 0.0..=2.0).text("body fast noise"));
-        ui.add(egui::Slider::new(&mut noise_controls.body_slow_amp, 0.0..=2.0).text("body slow noise"));
-        ui.add(
-            egui::Slider::new(&mut noise_controls.phenotype_amp, 0.0..=2.0)
-                .text("phenotype/body-type"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.phenotype_freq, 0.25..=3.0)
-                .logarithmic(true)
-                .text("phenotype noise freq"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.bone_major_amp, 0.0..=2.0)
-                .text("joints (shoulder/elbow/wrist/knee)"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.bone_neck_amp, 0.0..=2.0).text("neck/head joints"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.bone_rot_amp, 0.0..=2.0).text("joint rotation scale"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.bone_trans_amp, 0.0..=2.0).text("joint translation scale"),
-        );
-        ui.add(
-            egui::Slider::new(&mut noise_controls.bone_other_amp, 0.0..=2.0)
-                .text("other joints"),
-        );
-        ui.separator();
-        if let Some(fps) = diagnostics
-            .get(&FrameTimeDiagnosticsPlugin::FPS)
-            .and_then(|d| d.smoothed())
-        {
-            ui.label(format!("FPS: {:.1}", fps));
-        }
-        ui.label(format!("Last mesh update: {:.1} ms", state.last_update_ms));
-    });
-}
-
-fn tensor_to_vec3(data: &TensorData<f64>) -> Vec<Vec3> {
-    match data.shape.as_slice() {
-        // legacy shape [N,3]
-        [n, 3] => data
-            .data
-            .chunks_exact(3)
-            .take(*n)
-            .map(|c| Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))
-            .collect(),
-        // batched shape [1,N,3]
-        [1, n, 3] => data
-            .data
-            .chunks_exact(3)
-            .take(*n)
-            .map(|c| Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))
-            .collect(),
-        other => panic!("expected [N,3] or [1,N,3] tensor, got shape {:?}", other),
-    }
-}
-
-fn to_position_attribute(points: &[Vec3]) -> Vec<[f32; 3]> {
-    points.iter().map(|p| [p.x, p.y, p.z]).collect()
-}
-
-fn tensor_to_uv_attribute(data: &TensorData<f64>, vertex_count: usize) -> Option<Vec<[f32; 2]>> {
-    let to_uvs = |n: usize, data: &[f64]| -> Vec<[f32; 2]> {
-        data.chunks_exact(2)
-            .take(n.min(vertex_count))
-            .map(|c| [c[0] as f32, c[1] as f32])
-            .collect()
-    };
-    match data.shape.as_slice() {
-        [n, 2] => Some(to_uvs(*n, &data.data)),
-        [1, n, 2] => Some(to_uvs(*n, &data.data)),
-        _ => None,
-    }
-}
-
-fn triangulate_quads(quads: &TensorData<i64>) -> Vec<u32> {
-    assert_eq!(quads.shape.len(), 2, "faces tensor should be [F,4]");
-    assert_eq!(quads.shape[1], 4, "faces tensor should be [F,4]");
-    let mut indices = Vec::with_capacity(quads.shape[0] * 6);
-    for face in quads.data.chunks_exact(4) {
-        let (a, b, c, d) = (
-            face[0] as u32,
-            face[1] as u32,
-            face[2] as u32,
-            face[3] as u32,
-        );
-        indices.extend_from_slice(&[a, b, c, a, c, d]);
-    }
-    indices
-}
-
-fn compute_normals(positions: &[Vec3], quads: &TensorData<i64>) -> Vec<[f32; 3]> {
-    let mut normals = vec![Vec3::ZERO; positions.len()];
-    for face in quads.data.chunks_exact(4) {
-        let a = face[0] as usize;
-        let b = face[1] as usize;
-        let c = face[2] as usize;
-        let d = face[3] as usize;
-        let pa = positions[a];
-        let pb = positions[b];
-        let pc = positions[c];
-        let pd = positions[d];
-        let n0 = (pb - pa).cross(pc - pa);
-        let n1 = (pc - pa).cross(pd - pa);
-        let normal = (n0 + n1).normalize_or_zero();
-        for idx in [a, b, c, d] {
-            normals[idx] += normal;
-        }
-    }
-    normals
-        .into_iter()
-        .map(|n| n.normalize_or_zero())
-        .map(|n| [n.x, n.y, n.z])
-        .collect()
+    input.case_name = None;
+    input.phenotype_inputs = Some(state.phenotype_values.clone());
+    input.blendshape_weights = None;
+    input.blendshape_delta = None;
+    apply_pose_from_state(&mut input, &assets, &state);
 }

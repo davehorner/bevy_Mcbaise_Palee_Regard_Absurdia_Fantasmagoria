@@ -1,6 +1,6 @@
 //! Forward kinematics over the skeleton tree.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::data::reference::TensorData;
 use crate::util::math::{cross3, dot3, invert_rigid_mat4, mat4_mul, normalize3, rotvec_to_rotmat};
@@ -50,8 +50,8 @@ pub fn forward_root_relative_world(
     for b in 0..batch {
         // Clone deltas for in-place adjustment of root.
         let mut deltas = vec![[0.0f64; 16]; bones];
-        for j in 0..bones {
-            deltas[j] = slice_mat4(pose_parameters, b, j)?;
+        for (j, delta) in deltas.iter_mut().enumerate().take(bones) {
+            *delta = slice_mat4(pose_parameters, b, j)?;
         }
 
         // root_relative_world adjustment
@@ -170,7 +170,7 @@ pub fn rest_bone_poses_from_heads_tails(
 }
 
 fn slice_mat4(t: &TensorData<f64>, b: usize, j: usize) -> Result<[f64; 16]> {
-    let idx = ((b * t.shape[1] + j) * 16) as usize;
+    let idx = (b * t.shape[1] + j) * 16;
     let slice = t
         .data
         .get(idx..idx + 16)
@@ -181,7 +181,7 @@ fn slice_mat4(t: &TensorData<f64>, b: usize, j: usize) -> Result<[f64; 16]> {
 }
 
 fn write_mat4(t: &mut TensorData<f64>, b: usize, j: usize, m: &[f64; 16]) -> Result<()> {
-    let idx = ((b * t.shape[1] + j) * 16) as usize;
+    let idx = (b * t.shape[1] + j) * 16;
     let slice = t
         .data
         .get_mut(idx..idx + 16)
@@ -200,7 +200,7 @@ fn read_vec3(t: &TensorData<f64>, b: usize, j: usize) -> Result<[f64; 3]> {
 }
 
 fn read_mat3(t: &TensorData<f64>, b: usize, j: usize) -> Result<[f64; 9]> {
-    let idx = ((b * t.shape[1] + j) * 9) as usize;
+    let idx = (b * t.shape[1] + j) * 9;
     let slice = t
         .data
         .get(idx..idx + 9)
@@ -214,9 +214,13 @@ fn mat3_mul(a: &[f64; 9], b: &[f64; 9]) -> [f64; 9] {
     let mut out = [0.0; 9];
     for row in 0..3 {
         for col in 0..3 {
-            out[row * 3 + col] = a[row * 3 + 0] * b[0 * 3 + col]
-                + a[row * 3 + 1] * b[1 * 3 + col]
-                + a[row * 3 + 2] * b[2 * 3 + col];
+            let a0 = a[row * 3];
+            let a1 = a[row * 3 + 1];
+            let a2 = a[row * 3 + 2];
+            let b0 = b[col];
+            let b1 = b[3 + col];
+            let b2 = b[6 + col];
+            out[row * 3 + col] = a0 * b0 + a1 * b1 + a2 * b2;
         }
     }
     out

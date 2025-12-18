@@ -111,7 +111,8 @@ fn anny_body_forward_returns_reference_outputs() -> Result<(), Box<dyn Error>> {
 
     for case in &bundle.cases {
         let out = body.forward(AnnyInput {
-            case_name: &case.name,
+            case_name: Some(&case.name),
+            ..Default::default()
         })?;
         // Compare rest vertices and posed vertices.
         assert_eq!(out.posed_vertices.shape, case.posed_vertices.shape);

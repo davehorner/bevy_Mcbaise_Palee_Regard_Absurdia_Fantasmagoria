@@ -1,6 +1,6 @@
 //! Linear blend skinning helpers.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::data::reference::TensorData;
 use crate::util::math::{invert_rigid_mat4, mat4_mul, mat4_mul_vec4};
@@ -95,7 +95,7 @@ pub fn linear_blend_skinning(
 }
 
 fn slice_mat4(t: &TensorData<f64>, b: usize, j: usize) -> Result<[f64; 16]> {
-    let idx = ((b * t.shape[1] + j) * 16) as usize;
+    let idx = (b * t.shape[1] + j) * 16;
     let slice = t
         .data
         .get(idx..idx + 16)

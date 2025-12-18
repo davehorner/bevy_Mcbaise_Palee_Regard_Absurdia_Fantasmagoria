@@ -11,11 +11,11 @@ pub mod util;
 use std::collections::HashMap;
 
 use crate::data::reference::{
-    load_reference_bundle, load_reference_bundle_from_bytes, ReferenceBundle, ReferenceCase,
-    TensorData,
+    ReferenceBundle, ReferenceCase, TensorData, load_reference_bundle,
+    load_reference_bundle_from_bytes,
 };
-use anyhow::{bail, Context, Result};
-use model::{kinematics, skinning};
+use anyhow::{Context, Result, bail};
+use model::{kinematics, phenotype::PhenotypeEvaluator, skinning};
 
 /// Lightweight placeholder for the eventual loaded model.
 #[derive(Debug, Clone, Default)]
@@ -39,6 +39,7 @@ impl AnnyBodyPlaceholder {
 pub struct AnnyReference {
     bundle: ReferenceBundle,
     cases_by_name: HashMap<String, ReferenceCase>,
+    phenotype_eval: PhenotypeEvaluator,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +50,9 @@ pub struct AnnyOutput {
     pub bone_poses: TensorData<f64>,
     pub bone_heads: TensorData<f64>,
     pub bone_tails: TensorData<f64>,
+    pub blendshape_weights: TensorData<f64>,
+    pub phenotype_inputs: TensorData<f64>,
+    pub pose_parameters: TensorData<f64>,
 }
 
 impl AnnyReference {
@@ -58,106 +62,146 @@ impl AnnyReference {
         meta_path: impl AsRef<std::path::Path>,
     ) -> Result<Self> {
         let bundle = load_reference_bundle(tensor_path, meta_path)?;
-        let mut cases_by_name = HashMap::new();
-        for case in bundle.cases.iter() {
-            cases_by_name.insert(case.name.clone(), case.clone());
-        }
-        Ok(Self {
-            bundle,
-            cases_by_name,
-        })
+        Self::new(bundle)
     }
 
     /// Load reference safetensors + metadata from in-memory bytes (useful for wasm).
     pub fn from_bytes(tensor_bytes: &'static [u8], meta_bytes: &'static [u8]) -> Result<Self> {
         let bundle = load_reference_bundle_from_bytes(tensor_bytes, meta_bytes)?;
+        Self::new(bundle)
+    }
+
+    fn new(bundle: ReferenceBundle) -> Result<Self> {
         let mut cases_by_name = HashMap::new();
         for case in bundle.cases.iter() {
             cases_by_name.insert(case.name.clone(), case.clone());
         }
+        let phenotype_eval = PhenotypeEvaluator {
+            phenotype_labels: bundle.metadata.phenotype_labels.clone(),
+            macrodetail_keys: bundle.metadata.macrodetail_keys.clone(),
+            anchors: bundle.metadata.phenotype_anchors.clone(),
+            variations: bundle.metadata.phenotype_variations.clone(),
+            mask: bundle.static_data.blendshape_mask.clone(),
+        };
         Ok(Self {
             bundle,
             cases_by_name,
+            phenotype_eval,
         })
     }
 
     /// Run a forward pass for a known reference case by name.
     pub fn forward_case(&self, name: &str) -> Result<AnnyOutput> {
-        self.forward_with_offsets(name, None, None, None)
+        self.forward(AnnyInput::case(name))
     }
 
-    /// Forward pass with optional blendshape and root translation offsets.
-    /// Offsets are added to the stored reference values and clamped to [0, 1] for blendshapes.
-    pub fn forward_with_offsets(
-        &self,
-        name: &str,
-        blendshape_delta: Option<&[f64]>,
-        root_translation_delta: Option<[f64; 3]>,
-        pose_parameters_delta: Option<&[f64]>,
-    ) -> Result<AnnyOutput> {
-        let case = self
-            .cases_by_name
-            .get(name)
-            .context("reference case not found")?;
-        let weights = if let Some(delta) = blendshape_delta {
-            if delta.len() != case.blendshape_coeffs.data.len() {
-                bail!("blendshape delta len mismatch");
-            }
-            let mut w = case.blendshape_coeffs.data.clone();
-            for (w_i, d) in w.iter_mut().zip(delta.iter()) {
-                *w_i = (*w_i + d).clamp(0.0, 1.0);
-            }
-            TensorData {
-                shape: case.blendshape_coeffs.shape.clone(),
-                data: w,
-            }
+    /// Forward pass with custom parameters or reference cases.
+    pub fn forward(&self, input: AnnyInput<'_>) -> Result<AnnyOutput> {
+        let case = if let Some(name) = input.case_name {
+            Some(
+                self.cases_by_name
+                    .get(name)
+                    .context("reference case not found")?,
+            )
         } else {
-            case.blendshape_coeffs.clone()
+            None
         };
+
+        let blend_count = self.bundle.static_data.blendshapes.shape[0];
+        let bone_count = self.bundle.static_data.template_bone_heads.shape[0];
+        let phenotype_len = self.bundle.metadata.phenotype_labels.len();
+
+        let phenotype_inputs = if let Some(vals) = input.phenotype_inputs {
+            ensure_len(vals.len(), phenotype_len, "phenotype_inputs")?;
+            TensorData {
+                shape: vec![1, phenotype_len],
+                data: vals.to_vec(),
+            }
+        } else if let Some(case) = case {
+            case.phenotype_inputs.clone()
+        } else {
+            TensorData {
+                shape: vec![1, phenotype_len],
+                data: vec![0.5; phenotype_len],
+            }
+        };
+
+        let mut blendshape_weights = match input.blendshape_weights {
+            Some(weights) => {
+                ensure_len(weights.len(), blend_count, "blendshape_weights")?;
+                TensorData {
+                    shape: vec![1, blend_count],
+                    data: weights.to_vec(),
+                }
+            }
+            None => match (&input.phenotype_inputs, &case) {
+                (_, None) | (Some(_), _) => self.phenotype_eval.weights(&phenotype_inputs)?,
+                (None, Some(c)) => c.blendshape_coeffs.clone(),
+            },
+        };
+        if let Some(delta) = input.blendshape_delta {
+            ensure_len(
+                delta.len(),
+                blendshape_weights.data.len(),
+                "blendshape_delta",
+            )?;
+            for (w, d) in blendshape_weights.data.iter_mut().zip(delta.iter()) {
+                *w = (*w + d).clamp(0.0, 1.0);
+            }
+        }
+
+        let mut pose_parameters = if let Some(pose) = input.pose_parameters {
+            ensure_len(pose.len(), bone_count * 16, "pose_parameters")?;
+            TensorData {
+                shape: vec![1, bone_count, 4, 4],
+                data: pose.to_vec(),
+            }
+        } else if let Some(case) = case {
+            case.pose_parameters.clone()
+        } else {
+            identity_pose_parameters(bone_count)
+        };
+        if let Some(delta) = input.pose_parameters_delta {
+            ensure_len(
+                delta.len(),
+                pose_parameters.data.len(),
+                "pose_parameters_delta",
+            )?;
+            for (p, d) in pose_parameters.data.iter_mut().zip(delta.iter()) {
+                *p += d;
+            }
+        }
+        if let Some(delta_t) = input.root_translation_delta {
+            // indices 3,7,11 in row-major 4x4 for translation
+            let base = 0;
+            if pose_parameters.data.len() >= 12 {
+                pose_parameters.data[base + 3] += delta_t[0];
+                pose_parameters.data[base + 7] += delta_t[1];
+                pose_parameters.data[base + 11] += delta_t[2];
+            }
+        }
 
         let rest_vertices = model::blendshape::apply_blendshapes(
             &self.bundle.static_data.template_vertices,
             &self.bundle.static_data.blendshapes,
-            &weights,
+            &blendshape_weights,
         )?;
         let rest_bone_heads = model::blendshape::apply_bone_blendshapes(
             &self.bundle.static_data.template_bone_heads,
             &self.bundle.static_data.bone_heads_blendshapes,
-            &weights,
+            &blendshape_weights,
         )?;
         let rest_bone_tails = model::blendshape::apply_bone_blendshapes(
             &self.bundle.static_data.template_bone_tails,
             &self.bundle.static_data.bone_tails_blendshapes,
-            &weights,
+            &blendshape_weights,
         )?;
         let rest_bone_poses = kinematics::rest_bone_poses_from_heads_tails(
             &rest_bone_heads,
             &rest_bone_tails,
             &self.bundle.static_data.bone_rolls_rotmat,
         )?;
-        let mut pose = case.pose_parameters.data.clone();
-        if let Some(delta) = pose_parameters_delta {
-            if delta.len() != pose.len() {
-                bail!("pose_parameters delta len mismatch");
-            }
-            for (p, d) in pose.iter_mut().zip(delta.iter()) {
-                *p += d;
-            }
-        }
-        if let Some(delta_t) = root_translation_delta {
-            // indices 3,7,11 in row-major 4x4 for translation
-            let base = 0;
-            if pose.len() >= 12 {
-                pose[base + 3] += delta_t[0];
-                pose[base + 7] += delta_t[1];
-                pose[base + 11] += delta_t[2];
-            }
-        }
-        let pose_parameters = TensorData {
-            shape: case.pose_parameters.shape.clone(),
-            data: pose,
-        };
-        let (bone_poses, _) = kinematics::forward_root_relative_world(
+        let (bone_poses, bone_transforms) = kinematics::forward_root_relative_world(
             &rest_bone_poses,
             &pose_parameters,
             &self.bundle.metadata.bone_parents,
@@ -169,13 +213,18 @@ impl AnnyReference {
             &self.bundle.static_data.vertex_bone_indices,
             &self.bundle.static_data.vertex_bone_weights,
         )?;
+        let bone_heads = transform_points(&rest_bone_heads, &bone_transforms)?;
+        let bone_tails = transform_points(&rest_bone_tails, &bone_transforms)?;
         Ok(AnnyOutput {
             rest_vertices,
             posed_vertices,
             rest_bone_poses,
             bone_poses,
-            bone_heads: case.bone_heads.clone(),
-            bone_tails: case.bone_tails.clone(),
+            bone_heads,
+            bone_tails,
+            blendshape_weights,
+            phenotype_inputs,
+            pose_parameters,
         })
     }
 
@@ -187,6 +236,10 @@ impl AnnyReference {
     pub fn metadata(&self) -> &ReferenceBundle {
         &self.bundle
     }
+
+    pub fn phenotype_evaluator(&self) -> &PhenotypeEvaluator {
+        &self.phenotype_eval
+    }
 }
 
 /// Public-facing inference-only model (backed by reference data for now).
@@ -195,10 +248,31 @@ pub struct AnnyBody {
     reference: AnnyReference,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AnnyInput<'a> {
     /// Select a precomputed reference case by name (from metadata.case_names).
-    pub case_name: &'a str,
+    pub case_name: Option<&'a str>,
+    /// Override phenotype inputs [P]; if None, use case (if provided) or mid anchors.
+    pub phenotype_inputs: Option<&'a [f64]>,
+    /// Directly provide blendshape weights [N]; if None, derived from phenotype or case.
+    pub blendshape_weights: Option<&'a [f64]>,
+    /// Blendshape deltas added to the base weights and clamped to [0, 1].
+    pub blendshape_delta: Option<&'a [f64]>,
+    /// Pose parameters [J*16] row-major; if None, use case (if provided) or identity.
+    pub pose_parameters: Option<&'a [f64]>,
+    /// Pose deltas added to the base pose parameters.
+    pub pose_parameters_delta: Option<&'a [f64]>,
+    /// Root translation delta applied to pose parameters.
+    pub root_translation_delta: Option<[f64; 3]>,
+}
+
+impl<'a> AnnyInput<'a> {
+    pub fn case(name: &'a str) -> Self {
+        Self {
+            case_name: Some(name),
+            ..Default::default()
+        }
+    }
 }
 
 impl AnnyBody {
@@ -222,9 +296,9 @@ impl AnnyBody {
         })
     }
 
-    /// Forward pass using reference outputs (placeholder until full pipeline).
+    /// Forward pass using reference cases or custom inputs.
     pub fn forward(&self, input: AnnyInput<'_>) -> Result<AnnyOutput> {
-        self.reference.forward_case(input.case_name)
+        self.reference.forward(input)
     }
 
     /// Forward pass with optional blendshape and root translation offsets.
@@ -235,13 +309,18 @@ impl AnnyBody {
         root_translation_delta: Option<[f64; 3]>,
         pose_parameters_delta: Option<&[f64]>,
     ) -> Result<AnnyOutput> {
-        self.reference
-            .forward_with_offsets(
-                case_name,
-                blendshape_delta,
-                root_translation_delta,
-                pose_parameters_delta,
-            )
+        self.reference.forward(AnnyInput {
+            case_name: Some(case_name),
+            blendshape_delta,
+            root_translation_delta,
+            pose_parameters_delta,
+            ..Default::default()
+        })
+    }
+
+    /// Backwards-compatible convenience for case-only forward passes.
+    pub fn forward_case(&self, case_name: &str) -> Result<AnnyOutput> {
+        self.reference.forward_case(case_name)
     }
 
     /// Quad faces (topology helper).
@@ -262,6 +341,14 @@ impl AnnyBody {
         )
     }
 
+    /// Bone labels (matching joint order) and parent indices (-1 for root).
+    pub fn bone_hierarchy(&self) -> (&[String], &[i64]) {
+        (
+            &self.reference.bundle.metadata.bone_labels,
+            &self.reference.bundle.metadata.bone_parents,
+        )
+    }
+
     /// Template/rest vertices from static data.
     pub fn template_vertices(&self) -> &TensorData<f64> {
         &self.reference.bundle.static_data.template_vertices
@@ -271,6 +358,77 @@ impl AnnyBody {
     pub fn metadata(&self) -> &ReferenceBundle {
         self.reference.metadata()
     }
+
+    pub fn phenotype_evaluator(&self) -> &PhenotypeEvaluator {
+        self.reference.phenotype_evaluator()
+    }
+}
+
+fn ensure_len(actual: usize, expected: usize, label: &str) -> Result<()> {
+    if actual != expected {
+        bail!(
+            "{} length mismatch: expected {}, got {}",
+            label,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+fn identity_pose_parameters(bones: usize) -> TensorData<f64> {
+    let mut data = vec![0.0; bones * 16];
+    for b in 0..bones {
+        let base = b * 16;
+        data[base] = 1.0;
+        data[base + 5] = 1.0;
+        data[base + 10] = 1.0;
+        data[base + 15] = 1.0;
+    }
+    TensorData {
+        shape: vec![1, bones, 4, 4],
+        data,
+    }
+}
+
+fn transform_points(
+    points: &TensorData<f64>,     // [B,J,3]
+    transforms: &TensorData<f64>, // [B,J,4,4]
+) -> Result<TensorData<f64>> {
+    if points.shape.len() != 3 || points.shape[2] != 3 {
+        bail!("points must be [B,J,3]");
+    }
+    if transforms.shape.len() != 4
+        || transforms.shape[0] != points.shape[0]
+        || transforms.shape[1] != points.shape[1]
+        || transforms.shape[2] != 4
+        || transforms.shape[3] != 4
+    {
+        bail!("transforms must be [B,J,4,4] matching points batch/bones");
+    }
+    let batch = points.shape[0];
+    let bones = points.shape[1];
+    let mut out = TensorData {
+        shape: points.shape.clone(),
+        data: vec![0.0; points.data.len()],
+    };
+    for b in 0..batch {
+        for j in 0..bones {
+            let p_idx = (b * bones + j) * 3;
+            let px = points.data[p_idx];
+            let py = points.data[p_idx + 1];
+            let pz = points.data[p_idx + 2];
+            let t_idx = (b * bones + j) * 16;
+            let m = &transforms.data[t_idx..t_idx + 16];
+            let x = m[0] * px + m[1] * py + m[2] * pz + m[3];
+            let y = m[4] * px + m[5] * py + m[6] * pz + m[7];
+            let z = m[8] * px + m[9] * py + m[10] * pz + m[11];
+            out.data[p_idx] = x;
+            out.data[p_idx + 1] = y;
+            out.data[p_idx + 2] = z;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

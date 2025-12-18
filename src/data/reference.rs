@@ -1,5 +1,5 @@
-use anyhow::{anyhow, bail, Context, Result};
-use safetensors::{tensor::Dtype, tensor::TensorView, SafeTensors};
+use anyhow::{Context, Result, anyhow, bail};
+use safetensors::{SafeTensors, tensor::Dtype, tensor::TensorView};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -68,7 +68,7 @@ fn tensor_to_vec_f64(t: TensorView) -> Result<TensorData<f64>> {
     }
     let slice: &[f64] = bytemuck::try_cast_slice(t.data()).map_err(|e| anyhow!(e))?;
     Ok(TensorData {
-        shape: t.shape().iter().map(|d| *d as usize).collect(),
+        shape: t.shape().to_vec(),
         data: slice.to_vec(),
     })
 }
@@ -79,7 +79,7 @@ fn tensor_to_vec_i64(t: TensorView) -> Result<TensorData<i64>> {
     }
     let slice: &[i64] = bytemuck::try_cast_slice(t.data()).map_err(|e| anyhow!(e))?;
     Ok(TensorData {
-        shape: t.shape().iter().map(|d| *d as usize).collect(),
+        shape: t.shape().to_vec(),
         data: slice.to_vec(),
     })
 }

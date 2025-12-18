@@ -1,6 +1,6 @@
 //! Phenotype parameter interpolation into blendshape weights.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::data::reference::TensorData;
 
@@ -36,7 +36,7 @@ impl PhenotypeEvaluator {
         }
 
         // Race handling: if race labels are missing, default to 1/3 each.
-        let mut race_values = vec![
+        let mut race_values = [
             label_to_values
                 .remove("african")
                 .unwrap_or_else(|| vec![1.0 / 3.0; batch]),
@@ -48,16 +48,22 @@ impl PhenotypeEvaluator {
                 .unwrap_or_else(|| vec![1.0 / 3.0; batch]),
         ];
         // normalize
-        for b in 0..batch {
-            let sum = race_values[0][b] + race_values[1][b] + race_values[2][b];
+        let [african, asian, caucasian] = &mut race_values;
+        for ((a, b), c) in african
+            .iter_mut()
+            .zip(asian.iter_mut())
+            .zip(caucasian.iter_mut())
+        {
+            let sum = *a + *b + *c;
             if sum != 0.0 {
-                for r in 0..3 {
-                    race_values[r][b] /= sum;
-                }
+                let inv = 1.0 / sum;
+                *a *= inv;
+                *b *= inv;
+                *c *= inv;
             } else {
-                race_values[0][b] = 1.0 / 3.0;
-                race_values[1][b] = 1.0 / 3.0;
-                race_values[2][b] = 1.0 / 3.0;
+                *a = 1.0 / 3.0;
+                *b = 1.0 / 3.0;
+                *c = 1.0 / 3.0;
             }
         }
 
@@ -84,10 +90,7 @@ impl PhenotypeEvaluator {
                 bail!("variation count mismatch for feature {feature}");
             }
             for (i, var_name) in variations.iter().enumerate() {
-                let mut v = Vec::with_capacity(batch);
-                for b in 0..batch {
-                    v.push(coeffs[b][i]);
-                }
+                let v = coeffs.iter().map(|row| row[i]).collect::<Vec<_>>();
                 variation_values.insert(var_name.clone(), v);
             }
         }
@@ -98,8 +101,8 @@ impl PhenotypeEvaluator {
             let vals = variation_values
                 .get(key)
                 .unwrap_or_else(|| panic!("missing macrodetail key {key}"));
-            for b in 0..batch {
-                phens[b][macro_idx] = vals[b];
+            for (b, slot) in phens.iter_mut().take(batch).enumerate() {
+                slot[macro_idx] = vals[b];
             }
         }
 
@@ -110,12 +113,12 @@ impl PhenotypeEvaluator {
             shape: vec![batch, blend_count],
             data: vec![0.0; batch * blend_count],
         };
-        for b in 0..batch {
+        for (b, row) in phens.iter().enumerate().take(batch) {
             for blend in 0..blend_count {
                 let mut prod = 1.0;
-                for m in 0..macro_len {
+                for (m, val) in row.iter().enumerate().take(macro_len) {
                     let mask = self.mask.data[blend * macro_len + m];
-                    prod *= phens[b][m] * mask + (1.0 - mask);
+                    prod *= *val * mask + (1.0 - mask);
                 }
                 weights.data[b * blend_count + blend] = prod;
             }

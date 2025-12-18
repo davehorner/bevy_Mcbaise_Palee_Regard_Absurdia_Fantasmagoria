@@ -1,6 +1,6 @@
 //! Blendshape application in the rest pose.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::data::reference::TensorData;
 
