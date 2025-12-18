@@ -1,0 +1,12 @@
+[package]
+name = "burn_human_tool"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "import"
+path = "src/bin/import.rs"
+
+[dependencies]
+burn_human = { path = ".." }

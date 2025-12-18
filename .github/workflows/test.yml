@@ -1,0 +1,22 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+        toolchain: [nightly]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: brndnmtthws/rust-action@v1
+        with:
+          toolchain: ${{ matrix.toolchain }}
+      - name: Cargo test
+        run: cargo test --all

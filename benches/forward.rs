@@ -1,0 +1,29 @@
+use burn_human::{AnnyBody, AnnyInput};
+use criterion::{criterion_group, criterion_main, Criterion};
+
+fn load_body() -> AnnyBody {
+    AnnyBody::from_reference_paths(
+        "tests/reference/fullbody_default.safetensors",
+        "tests/reference/fullbody_default.meta.json",
+    )
+    .expect("load reference")
+}
+
+fn bench_forward(c: &mut Criterion) {
+    let body = load_body();
+    let cases: Vec<String> = body.case_names().map(|s| s.to_string()).collect();
+    c.bench_function("forward_all_cases", |b| {
+        b.iter(|| {
+            for case in &cases {
+                let _out = body
+                    .forward(AnnyInput {
+                        case_name: case.as_str(),
+                    })
+                    .expect("forward");
+            }
+        })
+    });
+}
+
+criterion_group!(benches, bench_forward);
+criterion_main!(benches);
