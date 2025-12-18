@@ -3,12 +3,11 @@ name = "bevy_burn_human"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-publish = false
+publish = true
 
 [features]
 default = ["native"]
-native = []
-web = ["console_error_panic_hook", "wasm-bindgen"]
+native = ["bevy/multi_threaded"]
 
 [dependencies]
 bevy = { version = "0.17", default-features = false, features = [
@@ -31,7 +30,6 @@ bevy = { version = "0.17", default-features = false, features = [
     "bevy_window",
     "bevy_winit",
     "jpeg",
-    "multi_threaded",
     "png",
     "std",
     "tonemapping_luts",
@@ -40,9 +38,12 @@ bevy = { version = "0.17", default-features = false, features = [
     "zstd_rust",
 ] }
 burn_human = { path = "../../" }
-console_error_panic_hook = { version = "0.1", optional = true }
-wasm-bindgen = { version = "0.2", optional = true }
 bevy_egui = { version = "0.38", default-features = false, features = ["default_fonts", "render"] }
 bevy_panorbit_camera = "0.33"
 noise = "0.9"
 fastrand = "2"
+
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+wasm-bindgen = "0.2"

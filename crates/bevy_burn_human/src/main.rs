@@ -2,7 +2,7 @@ use bevy::app::AppExit;
 use bevy::input::{ButtonInput, keyboard::KeyCode};
 use bevy::prelude::*;
 use bevy::prelude::{MessageReader, MessageWriter};
-#[cfg(all(target_arch = "wasm32", feature = "web"))]
+#[cfg(target_arch = "wasm32")]
 use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
@@ -10,12 +10,12 @@ use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use fastrand;
 use noise::{NoiseFn, OpenSimplex};
 
-#[cfg(all(target_arch = "wasm32", feature = "web"))]
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
 
-#[cfg(all(target_arch = "wasm32", feature = "web"))]
+#[cfg(target_arch = "wasm32")]
 const TENSOR_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.safetensors");
-#[cfg(all(target_arch = "wasm32", feature = "web"))]
+#[cfg(target_arch = "wasm32")]
 const META_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.meta.json");
 
 #[derive(Component)]
@@ -50,13 +50,13 @@ struct NoiseRig {
     noise: OpenSimplex,
 }
 
-#[cfg_attr(all(target_arch = "wasm32", feature = "web"), wasm_bindgen(start))]
+#[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub fn main() {
-    #[cfg(all(target_arch = "wasm32", feature = "web"))]
+    #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
     let burn_plugin = {
-        #[cfg(all(target_arch = "wasm32", feature = "web"))]
+        #[cfg(target_arch = "wasm32")]
         {
             BurnHumanPlugin {
                 source: BurnHumanSource::Bytes {
@@ -65,7 +65,7 @@ pub fn main() {
                 },
             }
         }
-        #[cfg(not(all(target_arch = "wasm32", feature = "web")))]
+        #[cfg(not(target_arch = "wasm32"))]
         {
             BurnHumanPlugin::default()
         }
@@ -287,7 +287,7 @@ fn ui_controls(
                 .logarithmic(false),
         );
         ui.add(
-            egui::Slider::new(&mut state.phenotype_noise_amp, 0.0..=2.0)
+            egui::Slider::new(&mut state.phenotype_noise_amp, 0.0..=4.0)
                 .text("phenotype noise")
                 .logarithmic(false),
         );
