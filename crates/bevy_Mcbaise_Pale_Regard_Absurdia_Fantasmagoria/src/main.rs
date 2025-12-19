@@ -2836,6 +2836,7 @@ fn update_overlays(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn ui_overlay(
     mut commands: Commands,
     mut egui_contexts: EguiContexts,
@@ -3247,7 +3248,7 @@ fn ui_overlay(
 
 fn progress_from_video_time(video_time_sec: f32) -> f32 {
     let speed = 0.0028;
-    (video_time_sec * speed).min(0.985).max(0.0)
+    (video_time_sec * speed).clamp(0.0, 0.985)
 }
 
 fn theta_from_time(t: f32) -> f32 {
@@ -3283,6 +3284,7 @@ fn camera_mode(video_time_sec: f32) -> CameraMode {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn camera_pose(
     video_time_sec: f32,
     cam_center: Vec3,

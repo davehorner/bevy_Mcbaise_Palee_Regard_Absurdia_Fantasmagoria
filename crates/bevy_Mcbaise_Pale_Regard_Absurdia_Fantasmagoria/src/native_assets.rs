@@ -21,7 +21,7 @@ fn ensure_dir(path: &Path) -> io::Result<()> {
 
 fn cache_root_dir() -> io::Result<PathBuf> {
     let proj = directories::ProjectDirs::from("io", "mcbaise", "bevy_mcbaise_fantasmagoria")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "failed to resolve user data dir"))?;
+        .ok_or_else(|| io::Error::other("failed to resolve user data dir"))?;
     Ok(proj.data_local_dir().to_path_buf())
 }
 
@@ -41,13 +41,13 @@ fn download_to_bytes(url: &str) -> io::Result<Vec<u8>> {
     let resp = ureq::get(url)
         .set("User-Agent", "bevy_mcbaise_fantasmagoria")
         .call()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("download failed: {e}")))?;
+        .map_err(|e| io::Error::other(format!("download failed: {e}")))?;
 
     if resp.status() < 200 || resp.status() >= 300 {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("download failed: HTTP {}", resp.status()),
-        ));
+        return Err(io::Error::other(format!(
+            "download failed: HTTP {}",
+            resp.status()
+        )));
     }
 
     let mut reader = resp
@@ -55,19 +55,19 @@ fn download_to_bytes(url: &str) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
     reader
         .read_to_end(&mut buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("read download: {e}")))?;
+        .map_err(|e| io::Error::other(format!("read download: {e}")))?;
     Ok(buf)
 }
 
 fn unzip_into(zip_bytes: &[u8], out_dir: &Path) -> io::Result<()> {
     let cursor = std::io::Cursor::new(zip_bytes);
     let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("open zip: {e}")))?;
+        .map_err(|e| io::Error::other(format!("open zip: {e}")))?;
 
     for i in 0..archive.len() {
         let mut file = archive
             .by_index(i)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("zip entry: {e}")))?;
+            .map_err(|e| io::Error::other(format!("zip entry: {e}")))?;
 
         let Some(name) = file.enclosed_name().map(|p| p.to_owned()) else {
             continue;
