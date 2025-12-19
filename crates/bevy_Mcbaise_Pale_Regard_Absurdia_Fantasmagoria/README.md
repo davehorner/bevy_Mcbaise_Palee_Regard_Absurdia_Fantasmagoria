@@ -4,7 +4,7 @@
 
 Forked from https://github.com/mosure/burn_human.git
 
-Bevy port of the CodePen https://codepen.io/Dave-Horner/pen/zxqgOOo “absurdia -stuck in an endless loop in mcdonalds playground slide” visualization, using `bevy_burn_human` as the moving subject.
+Bevy port of the CodePen <https://codepen.io/Dave-Horner/pen/zxqgOOo> “absurdia-stuck in an endless loop in mcdonalds playground slide” visualization, using `bevy_burn_human` as the moving subject.
 
 <p align="center">
 	<img alt="Screenshot" src="https://raw.githubusercontent.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/main/crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/screenshot.jpg" />

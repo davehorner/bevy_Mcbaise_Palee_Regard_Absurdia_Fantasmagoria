@@ -115,3 +115,131 @@ tasks:
         echo Serve started. Open:
         echo http://localhost:{{.MCBAISE_PORT}}/{{.MCBAISE_WWW_DIR}}/
         python -m http.server {{.MCBAISE_PORT}} || py -m http.server {{.MCBAISE_PORT}}
+
+  
+  update-chromedriver:mac:brew:
+    desc: macOS - upgrade chromedriver via Homebrew if available
+    status:
+      - brew --version
+    cmds:
+      - |-
+        set -euo pipefail
+        # Try to upgrade; if installed, reinstall as a fallback; otherwise install
+        if brew list --cask chromedriver >/dev/null 2>&1; then
+          brew upgrade chromedriver || brew reinstall --cask chromedriver || true
+        else
+          brew install --cask chromedriver || true
+        fi
+
+        # Verify Chrome and chromedriver major versions; fall back to download if they mismatch
+        CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        CHROME_MAJOR=""
+        if [[ -x "$CHROME_BIN" ]]; then
+          CHROME_MAJOR=$($CHROME_BIN --version 2>/dev/null | awk '{print $3}' | cut -d. -f1 || true)
+        fi
+        CD_MAJOR=$(chromedriver --version 2>/dev/null | awk '{print $2}' | cut -d. -f1 || true)
+        if [[ -n "$CHROME_MAJOR" && -n "$CD_MAJOR" && "$CHROME_MAJOR" != "$CD_MAJOR" ]]; then
+          echo "chromedriver major ($CD_MAJOR) does not match Chrome major ($CHROME_MAJOR); falling back to direct download"
+          task update-chromedriver:mac:download
+        else
+          echo "chromedriver appears to match Chrome (major: ${CHROME_MAJOR:-unknown})"
+        fi
+
+  update-chromedriver:mac:download:
+    desc: macOS - download matching chromedriver and install to {{default "/opt/homebrew/bin" .UPDATE_CHROMEDRIVER_INSTALL_DIR}}
+    cmds:
+      - |
+        set -euo pipefail
+        CHROME_BIN="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+        if [[ ! -x "$CHROME_BIN" ]]; then
+          echo "Chrome binary not executable at $CHROME_BIN; try passing --chrome-bin env var"; exit 1
+        fi
+        CHROME_VERSION_RAW="$($CHROME_BIN --version 2>/dev/null || true)"
+        CHROME_VERSION=$(echo "$CHROME_VERSION_RAW" | awk '{print $3}')
+        CHROME_MAJOR=$(echo "$CHROME_VERSION" | cut -d. -f1)
+        echo "Detected Chrome version: $CHROME_VERSION"
+        LATEST_URL="https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}"
+        DRIVER_VERSION=$(curl -fsSL "$LATEST_URL" || true)
+        if [[ -z "$DRIVER_VERSION" ]]; then
+          echo "No matching chromedriver LATEST_RELEASE for $CHROME_MAJOR; falling back to latest"; DRIVER_VERSION=$(curl -fsSL https://chromedriver.storage.googleapis.com/LATEST_RELEASE)
+        fi
+        ARCH=$(uname -m)
+        if [[ "$ARCH" == "arm64" || "$ARCH" == "aarch64" ]]; then
+          ZIP_NAME="chromedriver_mac_arm64.zip"
+        else
+          ZIP_NAME="chromedriver_mac64.zip"
+        fi
+        DOWNLOAD_URL="https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/${ZIP_NAME}"
+        TMP_ZIP="/tmp/chromedriver-${DRIVER_VERSION}.zip"
+        TMP_DIR="/tmp/chromedriver-${DRIVER_VERSION}"
+        echo "Download URL: $DOWNLOAD_URL"
+        curl -fL -o "$TMP_ZIP" "$DOWNLOAD_URL"
+        unzip -q -d "$TMP_DIR" "$TMP_ZIP"
+        chmod +x "$TMP_DIR/chromedriver"
+        sudo mkdir -p "{{default "/opt/homebrew/bin" .UPDATE_CHROMEDRIVER_INSTALL_DIR}}" || true
+        sudo mv "$TMP_DIR/chromedriver" "{{default "/opt/homebrew/bin" .UPDATE_CHROMEDRIVER_INSTALL_DIR}}/chromedriver"
+        sudo chmod +x "{{default "/opt/homebrew/bin" .UPDATE_CHROMEDRIVER_INSTALL_DIR}}/chromedriver"
+        echo "Installed chromedriver to {{default "/opt/homebrew/bin" .UPDATE_CHROMEDRIVER_INSTALL_DIR}}/chromedriver"
+
+  update-chromedriver:linux:download:
+    desc: Linux - download matching chromedriver and install to /usr/local/bin (requires sudo)
+    cmds:
+      - |
+        set -euo pipefail
+        CHROME_BIN=$(command -v google-chrome-stable || command -v google-chrome || command -v chromium-browser || true)
+        if [[ -z "$CHROME_BIN" ]]; then
+          echo "Cannot find chrome/chromium binary on PATH"; exit 1
+        fi
+        CHROME_VERSION_RAW="$($CHROME_BIN --version 2>/dev/null || true)"
+        CHROME_VERSION=$(echo "$CHROME_VERSION_RAW" | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n1)
+        CHROME_MAJOR=$(echo "$CHROME_VERSION" | cut -d. -f1)
+        echo "Detected Chrome version: $CHROME_VERSION"
+        DRIVER_VERSION=$(curl -fsSL "https://chromedriver.storage.googleapis.com/LATEST_RELEASE_${CHROME_MAJOR}" || true)
+        if [[ -z "$DRIVER_VERSION" ]]; then
+          DRIVER_VERSION=$(curl -fsSL "https://chromedriver.storage.googleapis.com/LATEST_RELEASE")
+        fi
+        ZIP_NAME="chromedriver_linux64.zip"
+        DOWNLOAD_URL="https://chromedriver.storage.googleapis.com/${DRIVER_VERSION}/${ZIP_NAME}"
+        TMP_ZIP="/tmp/chromedriver-${DRIVER_VERSION}.zip"
+        TMP_DIR="/tmp/chromedriver-${DRIVER_VERSION}"
+        echo "Download URL: $DOWNLOAD_URL"
+        curl -fL -o "$TMP_ZIP" "$DOWNLOAD_URL"
+        unzip -q -d "$TMP_DIR" "$TMP_ZIP"
+        chmod +x "$TMP_DIR/chromedriver"
+        sudo mv "$TMP_DIR/chromedriver" /usr/local/bin/chromedriver
+        sudo chmod +x /usr/local/bin/chromedriver
+        echo "Installed chromedriver to /usr/local/bin/chromedriver"
+
+  update-chromedriver:windows:choco:
+    desc: Windows - install chromedriver via Chocolatey (requires choco)
+    status:
+      - choco --version
+    cmds:
+      - choco upgrade chromedriver -y || choco install chromedriver -y
+
+  update-chromedriver:
+    desc: Cross-platform helper that picks the right platform-specific task
+    cmds:
+      - |
+        set -euo pipefail
+        OS=$(uname -s 2>/dev/null || echo "Windows")
+        case "$OS" in
+          Darwin*)
+            if command -v brew >/dev/null 2>&1; then
+              echo "Using Homebrew to update chromedriver"
+              task update-chromedriver:mac:brew
+            else
+              echo "Homebrew not found; downloading chromedriver directly"
+              task update-chromedriver:mac:download
+            fi
+            ;;
+          Linux*)
+            echo "Downloading chromedriver for Linux"
+            task update-chromedriver:linux:download
+            ;;
+          *)
+            # Assume Windows
+            echo "Using Chocolatey on Windows"
+            task update-chromedriver:windows:choco
+            ;;
+        esac

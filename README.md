@@ -2,6 +2,10 @@
 
 <https://davehorner.github.io/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/>
 
+Bevy port of the CodePen <https://codepen.io/Dave-Horner/pen/zxqgOOo> “absurdia-stuck in an endless loop in mcdonalds playground slide” visualization, using `bevy_burn_human` as the moving subject.
+
+Timeline youtube sync between the visualization and the video playback.
+
 Forked from https://github.com/mosure/burn_human.git
 
 <p align="center">
@@ -141,8 +145,49 @@ task export-reference
 # Run demos
 task demo:native
 task mcbaise:native
+task mcbaise:native:youtube
 task mcbaise:wasm:serve
 ```
+
+## Tasks
+
+This project exposes several convenient `task` invocations (see `Taskfile.yml`). Run tasks with the `task` command (go-task). Example: `task demo:native`.
+
+Quick list of notable tasks and examples:
+
+- demo:native — Run the bevy_burn_human demo natively
+    - Example: `task demo:native`
+
+- install-python-modules — Install Python deps used by tools and exporters
+    - Example: `task install-python-modules`
+
+- export-reference — Produce `assets/model/fullbody_default.safetensors` (depends on `install-python-modules`)
+    - Example: `task export-reference`
+
+- mcbaise:native — Run the main tube ride demo natively
+    - Example: `task mcbaise:native`
+
+- mcbaise:wasm:serve — Build and serve the WASM demo (opens URL shown in output)
+    - Example: `task mcbaise:wasm:serve`
+
+- mcbaise:native:youtube — Run the native tube ride + YouTube sync via WebDriver
+    - Example: `task mcbaise:native:youtube`
+    - Note: without a `cookies.txt` file playback can be interrupted by ads; export browser cookies and set `MCBAISE_CHROME_COOKIES_TXT` for longer playback during tests.
+
+- update-chromedriver — Cross-platform helper to update chromedriver (dispatches to platform-specific subtasks)
+    - Example: `task update-chromedriver`
+    - macOS specific: `task update-chromedriver:mac:brew` (uses Homebrew) or `task update-chromedriver:mac:download` (direct download)
+    - Linux: `task update-chromedriver:linux:download` (installs to `/usr/local/bin`)
+    - Windows: `task update-chromedriver:windows:choco` (Chocolatey)
+
+For the full list of tasks and details, see the `Taskfile.yml` at the repo root.
+
+
+## YouTube (native) cookie note
+
+If you run the native YouTube task without providing a `cookies.txt` file (see `MCBAISE_CHROME_COOKIES_TXT` / `MCBAISE_CHROME_USER_DATA_DIR` in `Taskfile.yml`), the demo will often show ads and, in our tests, playback stops after roughly one minute. To avoid ads and get longer playback during tests, export your browser cookies to `cookies.txt` and point `MCBAISE_CHROME_COOKIES_TXT` at that file before running `task mcbaise:native:youtube`.
+
+mpv playback is yet to work.
 
 
 ## license
