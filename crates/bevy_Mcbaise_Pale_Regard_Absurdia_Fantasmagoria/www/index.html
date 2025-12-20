@@ -192,6 +192,7 @@
     let playerReady = false;
     let isPlaying = false;
     let rafId = null;
+    let pollId = null;
     let pendingPlayingRequest = null;
 
     // Called from Rust (wasm) to request play/pause.
@@ -225,6 +226,20 @@
       rafId = null;
     }
 
+    function startPoll() {
+      if (pollId) return;
+      pollId = setInterval(() => {
+        if (!wasm?.set_video_time || !playerReady || !player?.getCurrentTime) return;
+        const t = player.getCurrentTime();
+        wasm.set_video_time(t, !!isPlaying);
+      }, 250);
+    }
+
+    function stopPoll() {
+      if (pollId) clearInterval(pollId);
+      pollId = null;
+    }
+
     window.onYouTubeIframeAPIReady = () => {
       player = new YT.Player("player", {
         videoId: VIDEO_ID,
@@ -250,12 +265,26 @@
             if (e.data === YT.PlayerState.PLAYING) {
               isPlaying = true;
               startLoop();
+              startPoll();
             } else {
               isPlaying = false;
               const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
               wasm?.set_video_time?.(t, false);
               stopLoop();
+              stopPoll();
             }
+          },
+          onPlaybackRateChange: () => {
+            // Keep wasm time/playing fresh when playback rate changes.
+            const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
+            wasm?.set_video_time?.(t, !!isPlaying);
+          },
+          onError: (err) => {
+            console.warn('YouTube player error', err);
+            const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
+            wasm?.set_video_time?.(t, false);
+            stopLoop();
+            stopPoll();
           }
         }
       });

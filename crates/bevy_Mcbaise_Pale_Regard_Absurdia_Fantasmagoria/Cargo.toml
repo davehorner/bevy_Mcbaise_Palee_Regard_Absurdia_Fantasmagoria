@@ -69,5 +69,12 @@ sha2 = "0.10"
 ureq = { version = "2", default-features = true, features = ["tls", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+raw-window-handle = "0.6"
+
 [build-dependencies]
 lz4_flex = { version = "0.11", default-features = false }

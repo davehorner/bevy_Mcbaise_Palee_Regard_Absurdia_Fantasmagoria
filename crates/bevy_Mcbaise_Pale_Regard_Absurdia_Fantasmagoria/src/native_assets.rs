@@ -50,8 +50,7 @@ fn download_to_bytes(url: &str) -> io::Result<Vec<u8>> {
         )));
     }
 
-    let mut reader = resp
-        .into_reader();
+    let mut reader = resp.into_reader();
     let mut buf = Vec::new();
     reader
         .read_to_end(&mut buf)
@@ -61,8 +60,8 @@ fn download_to_bytes(url: &str) -> io::Result<Vec<u8>> {
 
 fn unzip_into(zip_bytes: &[u8], out_dir: &Path) -> io::Result<()> {
     let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .map_err(|e| io::Error::other(format!("open zip: {e}")))?;
+    let mut archive =
+        zip::ZipArchive::new(cursor).map_err(|e| io::Error::other(format!("open zip: {e}")))?;
 
     for i in 0..archive.len() {
         let mut file = archive
@@ -123,7 +122,9 @@ pub fn resolve_burn_human_source() -> BurnHumanSource {
         };
     }
 
-    let zip_url = std::env::var("MCBAISE_ASSETS_ZIP_URL").ok().filter(|v| !v.trim().is_empty());
+    let zip_url = std::env::var("MCBAISE_ASSETS_ZIP_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let zip_url = zip_url.as_deref().unwrap_or(DEFAULT_RELEASE_ZIP_URL);
 
     let expected_sha = std::env::var("MCBAISE_ASSETS_ZIP_SHA256")
@@ -172,7 +173,10 @@ pub fn resolve_burn_human_source() -> BurnHumanSource {
     eprintln!("[mcbaise] cache dir: {}", cache_root.display());
 
     ensure_dir(&cache_assets_root).unwrap_or_else(|e| {
-        panic!("failed to create cache dir {}: {e}", cache_assets_root.display())
+        panic!(
+            "failed to create cache dir {}: {e}",
+            cache_assets_root.display()
+        )
     });
 
     let zip_bytes = download_to_bytes(zip_url).unwrap_or_else(|e| {

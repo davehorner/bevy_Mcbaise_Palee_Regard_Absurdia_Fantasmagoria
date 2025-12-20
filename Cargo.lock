@@ -973,6 +973,7 @@ dependencies = [
  "fantoccini",
  "fastrand",
  "lz4_flex",
+ "raw-window-handle",
  "serde_json",
  "sha2",
  "time",
@@ -980,6 +981,7 @@ dependencies = [
  "ureq",
  "url",
  "wasm-bindgen",
+ "windows-sys 0.61.2",
  "zip 2.4.2",
 ]
 

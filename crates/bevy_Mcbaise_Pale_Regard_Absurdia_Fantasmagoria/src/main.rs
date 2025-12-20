@@ -1,17 +1,19 @@
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
 use bevy::asset::RenderAssetUsages;
+use bevy::asset::embedded_asset;
+use bevy::asset::io::embedded::EmbeddedAssetRegistry;
+use bevy::ecs::system::SystemParam;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::pbr::{DistanceFog, FogFalloff, Material, MaterialPlugin};
 use bevy::prelude::*;
-use bevy::render::render_resource::AsBindGroup;
 use bevy::reflect::TypePath;
+use bevy::render::render_resource::AsBindGroup;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
-use bevy::asset::embedded_asset;
-use bevy::asset::io::embedded::EmbeddedAssetRegistry;
-use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::PrimaryWindow;
+use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 
 use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
@@ -26,8 +28,10 @@ use wasm_bindgen::prelude::wasm_bindgen;
 const META_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.meta.json");
 
 #[cfg(target_arch = "wasm32")]
-const TENSOR_LZ4_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/fullbody_default.safetensors.lz4"));
+const TENSOR_LZ4_BYTES: &[u8] = include_bytes!(concat!(
+    env!("OUT_DIR"),
+    "/fullbody_default.safetensors.lz4"
+));
 
 const VIDEO_ID: &str = "v2hcW03gcus";
 
@@ -42,8 +46,8 @@ const VIDEO_ID: &str = "v2hcW03gcus";
 mod native_mpv {
     use std::io::{BufRead, BufReader as StdBufReader};
     use std::process::{Child, Command as ProcessCommand, Stdio};
-    use std::sync::mpsc::{self, Receiver, Sender};
     use std::sync::mpsc::TryRecvError;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
     use std::thread::JoinHandle;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -92,7 +96,8 @@ mod native_mpv {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = evt_tx.send(Event::Error(format!("failed to create tokio runtime: {e}")));
+                    let _ =
+                        evt_tx.send(Event::Error(format!("failed to create tokio runtime: {e}")));
                     return;
                 }
             };
@@ -549,11 +554,11 @@ mod native_mpv {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
 mod native_youtube {
-    use std::collections::BTreeMap;
-    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::mpsc::TryRecvError;
-    use std::thread::JoinHandle;
+    use std::sync::mpsc::{self, Receiver, Sender};
     use std::thread;
+    use std::thread::JoinHandle;
     use std::time::Duration;
 
     use std::process::{Child, Command as ProcessCommand};
@@ -569,7 +574,6 @@ mod native_youtube {
     #[derive(Debug, Clone)]
     struct NetscapeCookie {
         domain_host: String,
-        include_subdomains: bool,
         path: String,
         secure: bool,
         expires_unix: Option<i64>,
@@ -607,7 +611,6 @@ mod native_youtube {
                 continue;
             }
 
-            let include_subdomains = parts[1].trim().eq_ignore_ascii_case("true");
             let path = parts[2].trim().to_string();
             let secure = parts[3].trim().eq_ignore_ascii_case("true");
             let expires_unix = parts[4]
@@ -623,7 +626,6 @@ mod native_youtube {
 
             out.push(NetscapeCookie {
                 domain_host,
-                include_subdomains,
                 path,
                 secure,
                 expires_unix,
@@ -635,10 +637,7 @@ mod native_youtube {
         out
     }
 
-    async fn import_cookies_txt_if_present(
-        client: &fantoccini::Client,
-        evt_tx: &Sender<Event>,
-    ) {
+    async fn import_cookies_txt_if_present(client: &fantoccini::Client, evt_tx: &Sender<Event>) {
         let disabled = std::env::var("MCBAISE_YOUTUBE_DISABLE_COOKIE_TXT")
             .ok()
             .map(|v| parse_bool(&v))
@@ -707,14 +706,14 @@ mod native_youtube {
 
             for c in cookies {
                 // Skip expired cookies.
-                if let Some(exp) = c.expires_unix {
-                    if exp <= (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64)
-                    {
-                        continue;
-                    }
+                if let Some(exp) = c.expires_unix
+                    && exp
+                        <= (std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs() as i64)
+                {
+                    continue;
                 }
 
                 let mut cookie = fantoccini::cookies::Cookie::new(c.name, c.value);
@@ -723,11 +722,7 @@ mod native_youtube {
                 }
                 // Set a domain cookie so it applies across subdomains when possible.
                 // (Chrome generally accepts this when current host is within the domain.)
-                if c.include_subdomains {
-                    cookie.set_domain(host.clone());
-                } else {
-                    cookie.set_domain(host.clone());
-                }
+                cookie.set_domain(host.clone());
                 cookie.set_secure(c.secure);
                 cookie.set_http_only(c.http_only);
                 if let Some(exp) = c.expires_unix {
@@ -738,7 +733,9 @@ mod native_youtube {
                     Ok(_) => imported += 1,
                     Err(e) => {
                         failed += 1;
-                        println!("[native-youtube] cookie import: add_cookie failed for {host}: {e}");
+                        println!(
+                            "[native-youtube] cookie import: add_cookie failed for {host}: {e}"
+                        );
                     }
                 }
             }
@@ -756,15 +753,30 @@ mod native_youtube {
     pub enum Command {
         SetPlaying(bool),
         SeekSeconds(f32),
-        ReloadAndSeek { time_sec: f32, playing: bool },
+        ReloadAndSeek {
+            time_sec: f32,
+            playing: bool,
+        },
+        SetWindowRect {
+            x: u32,
+            y: u32,
+            width: u32,
+            height: u32,
+        },
         Shutdown,
     }
 
     #[derive(Debug, Clone)]
     pub enum Event {
-        State { time_sec: f32, playing: bool },
+        State {
+            time_sec: f32,
+            playing: bool,
+        },
         PlayerErrorOverlay,
-        AdState { playing_ad: bool, label: Option<String> },
+        AdState {
+            playing_ad: bool,
+            label: Option<String>,
+        },
         Error(String),
     }
 
@@ -780,9 +792,6 @@ mod native_youtube {
 
         let video_id = video_id.to_string();
         let webdriver_url = webdriver_url.to_string();
-        let launch_webdriver = launch_webdriver;
-        let chrome_user_data_dir = chrome_user_data_dir;
-        let chrome_profile_dir = chrome_profile_dir;
 
         let join = thread::spawn(move || {
             let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -792,9 +801,8 @@ mod native_youtube {
             {
                 Ok(rt) => rt,
                 Err(e) => {
-                    let _ = evt_tx.send(Event::Error(format!(
-                        "failed to create tokio runtime: {e}"
-                    )));
+                    let _ =
+                        evt_tx.send(Event::Error(format!("failed to create tokio runtime: {e}")));
                     return;
                 }
             };
@@ -815,6 +823,8 @@ mod native_youtube {
                         "--no-default-browser-check".to_string(),
                         "--log-level=3".to_string(),
                         "--autoplay-policy=no-user-gesture-required".to_string(),
+                        // Avoid Chrome prompting for notification permissions.
+                        "--disable-notifications".to_string(),
                         // Reduce startup flakiness (especially with real profiles).
                         "--disable-extensions".to_string(),
                         "--disable-component-extensions-with-background-pages".to_string(),
@@ -839,6 +849,10 @@ mod native_youtube {
                         "browserName": "chrome",
                         "goog:chromeOptions": {
                             "args": args,
+                            "prefs": {
+                                // 1=allow, 2=block.
+                                "profile.default_content_setting_values.notifications": 2
+                            },
                             // Avoid Chrome spewing verbose logs into our parent process output.
                             "excludeSwitches": ["enable-logging"]
                         }
@@ -963,6 +977,34 @@ Start chromedriver (example): chromedriver --port=9515"
                         }
                     }
                 };
+
+                // Immediately switch to a cheap "launch" page so we can apply window geometry
+                // before the user sees a default-sized Chrome window sitting on a random page.
+                let _ = client.goto("about:blank").await;
+
+                // Give the app a brief moment to send us a desired window rect.
+                // Store any other early commands and replay them once the watch page is loaded.
+                let mut pending_cmds: VecDeque<Command> = VecDeque::new();
+                let mut applied_rect = false;
+                for _ in 0..40 {
+                    match cmd_rx.try_recv() {
+                        Ok(Command::SetWindowRect { x, y, width, height }) => {
+                            let _ = client.set_window_rect(x, y, width.max(1), height.max(1)).await;
+                            applied_rect = true;
+                        }
+                        Ok(other) => pending_cmds.push_back(other),
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => {
+                            shutdown_browser(client, &mut chromedriver_child).await;
+                            return;
+                        }
+                    }
+
+                    if applied_rect {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(15)).await;
+                }
 
                 async fn shutdown_browser(
                     client: fantoccini::Client,
@@ -1107,8 +1149,26 @@ Start chromedriver (example): chromedriver --port=9515"
 
                 loop {
                     loop {
-                        match cmd_rx.try_recv() {
-                            Ok(Command::SetPlaying(playing)) => {
+                        let next_cmd = if let Some(cmd) = pending_cmds.pop_front() {
+                            Some(cmd)
+                        } else {
+                            match cmd_rx.try_recv() {
+                                Ok(cmd) => Some(cmd),
+                                Err(TryRecvError::Empty) => None,
+                                Err(TryRecvError::Disconnected) => {
+                                    // If the app exits and drops the sender, shut down cleanly.
+                                    shutdown_browser(client, &mut chromedriver_child).await;
+                                    return;
+                                }
+                            }
+                        };
+
+                        let Some(cmd) = next_cmd else {
+                            break;
+                        };
+
+                        match cmd {
+                            Command::SetPlaying(playing) => {
                                 let _ = client
                                     .execute(
                                         r#"
@@ -1150,7 +1210,7 @@ Start chromedriver (example): chromedriver --port=9515"
                                     )
                                     .await;
                             }
-                            Ok(Command::SeekSeconds(time_sec)) => {
+                            Command::SeekSeconds(time_sec) => {
                                 let _ = client
                                     .execute(
                                         r#"
@@ -1163,7 +1223,7 @@ Start chromedriver (example): chromedriver --port=9515"
                                     )
                                     .await;
                             }
-                            Ok(Command::ReloadAndSeek { time_sec, playing }) => {
+                            Command::ReloadAndSeek { time_sec, playing } => {
                                 // Best-effort recover from YouTube's transient player error overlay.
                                 // Reload the watch page, wait for <video>, then seek and restore play/pause.
                                 let _ = client.goto(&watch_url).await;
@@ -1230,13 +1290,14 @@ Start chromedriver (example): chromedriver --port=9515"
                                         .await;
                                 }
                             }
-                            Ok(Command::Shutdown) => {
-                                shutdown_browser(client, &mut chromedriver_child).await;
-                                return;
+                            Command::SetWindowRect { x, y, width, height } => {
+                                // Best-effort: reposition the browser window.
+                                // This requires a non-headless driver and may be ignored by some platforms.
+                                let _ = client
+                                    .set_window_rect(x, y, width.max(1), height.max(1))
+                                    .await;
                             }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => {
-                                // If the app exits and drops the sender, shut down cleanly.
+                            Command::Shutdown => {
                                 shutdown_browser(client, &mut chromedriver_child).await;
                                 return;
                             }
@@ -1244,7 +1305,7 @@ Start chromedriver (example): chromedriver --port=9515"
                     }
 
                                         poll_tick = poll_tick.wrapping_add(1);
-                                        let slow_scan = poll_tick % 25 == 0;
+                                        let slow_scan = poll_tick.is_multiple_of(25);
                                         let try_skip = skip_ad_cooldown_ticks == 0;
 
                                         // One JS round-trip for video/ad/error/skip. Keep it cheap: use fast selectors every tick,
@@ -1371,9 +1432,7 @@ Start chromedriver (example): chromedriver --port=9515"
                         } else {
                             last_sent_error_overlay = false;
                         }
-                        if error_overlay_cooldown_ticks > 0 {
-                            error_overlay_cooldown_ticks -= 1;
-                        }
+                        error_overlay_cooldown_ticks = error_overlay_cooldown_ticks.saturating_sub(1);
 
                         // Emit ad state changes.
                         let ad_visible = v.get("ad").and_then(|x| x.as_bool()).unwrap_or(false);
@@ -1391,9 +1450,7 @@ Start chromedriver (example): chromedriver --port=9515"
                         }
 
                         // Skip click throttle.
-                        if skip_ad_cooldown_ticks > 0 {
-                            skip_ad_cooldown_ticks -= 1;
-                        }
+                        skip_ad_cooldown_ticks = skip_ad_cooldown_ticks.saturating_sub(1);
                         let skip_clicked = v
                             .get("skipClicked")
                             .and_then(|x| x.as_bool())
@@ -1431,18 +1488,16 @@ Start chromedriver (example): chromedriver --port=9515"
 
                         // Common transient: YouTube/Chrome can change window handles during ads / reloads.
                         // Try to recover by switching to an available window.
-                        if msg.contains("no such window")
+                        if (msg.contains("no such window")
                             || msg.contains("web view not found")
-                            || msg.contains("target window already closed")
+                            || msg.contains("target window already closed"))
+                            && let Ok(handles) = client.windows().await
+                            && let Some(handle) = handles.last().cloned()
                         {
-                            if let Ok(handles) = client.windows().await {
-                                if let Some(handle) = handles.last().cloned() {
-                                    let _ = client.switch_to_window(handle).await;
-                                    consecutive_poll_errors = 0;
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
-                                    continue;
-                                }
-                            }
+                            let _ = client.switch_to_window(handle).await;
+                            consecutive_poll_errors = 0;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            continue;
                         }
 
                         // If we're accumulating poll failures, attempt a reload before giving up.
@@ -1469,6 +1524,13 @@ Start chromedriver (example): chromedriver --port=9515"
 
         (cmd_tx, evt_rx, join)
     }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+#[derive(Resource, Default)]
+struct NativeYoutubeWindowLayout {
+    applied: bool,
+    force_topmost: bool,
 }
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
@@ -1527,10 +1589,10 @@ impl Drop for NativeYoutubeSync {
 
         // Critical: wait for the webdriver thread to actually close the browser
         // before the process exits (otherwise Chrome can be left running).
-        if let Ok(mut slot) = self.join.lock() {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut slot) = self.join.lock()
+            && let Some(handle) = slot.take()
+        {
+            let _ = handle.join();
         }
     }
 }
@@ -1584,8 +1646,11 @@ impl Drop for NativeMpvSync {
 
 const TUBE_RADIUS: f32 = 3.4;
 const SUBJECT_RADIUS: f32 = 0.78;
-const WALL_R: f32 = TUBE_RADIUS - SUBJECT_RADIUS;
-const SUBJECT_INSET: f32 = 0.18;
+const HUMAN_SCALE: f32 = 1.15;
+const HUMAN_RADIUS: f32 = SUBJECT_RADIUS * HUMAN_SCALE;
+const BALL_RADIUS: f32 = 0.70;
+const CONTACT_EPS: f32 = 0.01;
+const GRAVITY: f32 = 9.81;
 
 const FRAMES_SAMPLES: usize = 3200;
 
@@ -1606,7 +1671,693 @@ struct TubeTag;
 struct SubjectTag;
 
 #[derive(Component)]
+struct BallTag;
+
+#[derive(Component)]
+struct SubjectLightTag;
+
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+enum SubjectMode {
+    #[default]
+    Auto,
+    Random,
+    Human,
+    Ball,
+}
+
+impl SubjectMode {
+    fn label(self) -> &'static str {
+        match self {
+            SubjectMode::Auto => "Subject: auto",
+            SubjectMode::Random => "Subject: random",
+            SubjectMode::Human => "Subject: human",
+            SubjectMode::Ball => "Subject: ball",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            SubjectMode::Auto => "auto",
+            SubjectMode::Random => "random",
+            SubjectMode::Human => "human",
+            SubjectMode::Ball => "ball",
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+enum ColorSchemeMode {
+    #[default]
+    Auto,
+    Random,
+    OrangeWhite,
+    Nin,
+    BlackWhite,
+    RandomGrey,
+}
+
+impl ColorSchemeMode {
+    fn label(self) -> &'static str {
+        match self {
+            ColorSchemeMode::Auto => "Colors: auto",
+            ColorSchemeMode::Random => "Colors: random",
+            ColorSchemeMode::OrangeWhite => "Colors: orange and white",
+            ColorSchemeMode::Nin => "Colors: NIN",
+            ColorSchemeMode::BlackWhite => "Colors: black and white",
+            ColorSchemeMode::RandomGrey => "Colors: random grey",
+        }
+    }
+
+    fn short_label_from_value(v: u32) -> &'static str {
+        match v % 4 {
+            0 => "orange/white",
+            1 => "NIN",
+            2 => "black/white",
+            _ => "random grey",
+        }
+    }
+
+    fn from_value(v: u32) -> Self {
+        match v % 4 {
+            0 => ColorSchemeMode::OrangeWhite,
+            1 => ColorSchemeMode::Nin,
+            2 => ColorSchemeMode::BlackWhite,
+            _ => ColorSchemeMode::RandomGrey,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+enum TexturePatternMode {
+    #[default]
+    Auto,
+    Random,
+    Stripe,
+    Swirl,
+    StripeWire,
+    SwirlWire,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppearancePreset {
+    BlueGlass,
+    OpaqueWhite,
+    Blue,
+    Polkadot,
+    MatteLightBlue,
+    Wireframe,
+}
+
+impl AppearancePreset {
+    fn label(self) -> &'static str {
+        match self {
+            AppearancePreset::BlueGlass => "blue glass",
+            AppearancePreset::OpaqueWhite => "opaque white",
+            AppearancePreset::Blue => "blue",
+            AppearancePreset::Polkadot => "polkadot",
+            AppearancePreset::MatteLightBlue => "matte light blue",
+            AppearancePreset::Wireframe => "wireframe",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum AppearanceMode {
+    Auto,
+    Random,
+    #[default]
+    BlueGlass,
+    OpaqueWhite,
+    Blue,
+    Polkadot,
+    MatteLightBlue,
+    Wireframe,
+}
+
+impl AppearanceMode {
+    fn label(self) -> &'static str {
+        match self {
+            AppearanceMode::Auto => "auto",
+            AppearanceMode::Random => "random",
+            AppearanceMode::BlueGlass => "blue glass",
+            AppearanceMode::OpaqueWhite => "opaque white",
+            AppearanceMode::Blue => "blue",
+            AppearanceMode::Polkadot => "polkadot",
+            AppearanceMode::MatteLightBlue => "matte light blue",
+            AppearanceMode::Wireframe => "wireframe",
+        }
+    }
+
+    fn preset(self) -> Option<AppearancePreset> {
+        match self {
+            AppearanceMode::BlueGlass => Some(AppearancePreset::BlueGlass),
+            AppearanceMode::OpaqueWhite => Some(AppearancePreset::OpaqueWhite),
+            AppearanceMode::Blue => Some(AppearancePreset::Blue),
+            AppearanceMode::Polkadot => Some(AppearancePreset::Polkadot),
+            AppearanceMode::MatteLightBlue => Some(AppearancePreset::MatteLightBlue),
+            AppearanceMode::Wireframe => Some(AppearancePreset::Wireframe),
+            AppearanceMode::Auto | AppearanceMode::Random => None,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct HumanAppearanceMode(AppearanceMode);
+
+impl Default for HumanAppearanceMode {
+    fn default() -> Self {
+        Self(AppearanceMode::Auto)
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct BallAppearanceMode(AppearanceMode);
+
+impl Default for BallAppearanceMode {
+    fn default() -> Self {
+        Self(AppearanceMode::Auto)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AutoAppearanceState {
+    rng: u32,
+    since_switch_sec: f32,
+    next_switch_sec: f32,
+    current: AppearancePreset,
+}
+
+impl AutoAppearanceState {
+    fn lcg_next(&mut self) -> u32 {
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng
+    }
+
+    fn rand01(&mut self) -> f32 {
+        (self.lcg_next() as f32) / (u32::MAX as f32)
+    }
+
+    fn rand_range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.rand01()
+    }
+
+    fn schedule_next_switch(&mut self) {
+        self.since_switch_sec = 0.0;
+        self.next_switch_sec = self.rand_range(3.0, 6.0);
+    }
+
+    fn pick_next_preset(&mut self) -> AppearancePreset {
+        let candidates = [
+            AppearancePreset::BlueGlass,
+            AppearancePreset::OpaqueWhite,
+            AppearancePreset::Blue,
+            AppearancePreset::Polkadot,
+            AppearancePreset::MatteLightBlue,
+            AppearancePreset::Wireframe,
+        ];
+
+        for _ in 0..6 {
+            let idx = (self.rand01() * candidates.len() as f32)
+                .floor()
+                .clamp(0.0, (candidates.len() - 1) as f32) as usize;
+            let p = candidates[idx];
+            if p != self.current {
+                return p;
+            }
+        }
+
+        // Fallback cycle.
+        match self.current {
+            AppearancePreset::BlueGlass => AppearancePreset::OpaqueWhite,
+            AppearancePreset::OpaqueWhite => AppearancePreset::Blue,
+            AppearancePreset::Blue => AppearancePreset::Polkadot,
+            AppearancePreset::Polkadot => AppearancePreset::MatteLightBlue,
+            AppearancePreset::MatteLightBlue => AppearancePreset::Wireframe,
+            AppearancePreset::Wireframe => AppearancePreset::BlueGlass,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct AutoHumanAppearanceState(AutoAppearanceState);
+
+impl Default for AutoHumanAppearanceState {
+    fn default() -> Self {
+        let mut s = AutoAppearanceState {
+            rng: 0xA11C_E001,
+            since_switch_sec: 0.0,
+            next_switch_sec: 0.0,
+            current: AppearancePreset::OpaqueWhite,
+        };
+        s.schedule_next_switch();
+        Self(s)
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct AutoBallAppearanceState(AutoAppearanceState);
+
+impl Default for AutoBallAppearanceState {
+    fn default() -> Self {
+        let mut s = AutoAppearanceState {
+            rng: 0xB411_C0DE,
+            since_switch_sec: 0.0,
+            next_switch_sec: 0.0,
+            current: AppearancePreset::BlueGlass,
+        };
+        s.schedule_next_switch();
+        Self(s)
+    }
+}
+
+#[derive(Resource, Clone)]
+struct AppearanceTextures {
+    polkadot: Handle<Image>,
+}
+
+impl TexturePatternMode {
+    fn label(self) -> &'static str {
+        match self {
+            TexturePatternMode::Auto => "Texture: auto",
+            TexturePatternMode::Random => "Texture: random",
+            TexturePatternMode::Stripe => "Texture: stripe",
+            TexturePatternMode::Swirl => "Texture: swirl",
+            TexturePatternMode::StripeWire => "Texture: stripe (wire)",
+            TexturePatternMode::SwirlWire => "Texture: swirl (wire)",
+        }
+    }
+
+    fn short_label_from_value(v: u32) -> &'static str {
+        match v % 4 {
+            0 => "stripe",
+            1 => "swirl",
+            2 => "stripe wire",
+            _ => "swirl wire",
+        }
+    }
+
+    fn from_value(v: u32) -> Self {
+        match v % 4 {
+            0 => TexturePatternMode::Stripe,
+            1 => TexturePatternMode::Swirl,
+            2 => TexturePatternMode::StripeWire,
+            _ => TexturePatternMode::SwirlWire,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+enum PoseMode {
+    #[default]
+    Auto,
+    Random,
+    Standing,
+    Belly,
+    Back,
+    LeftSide,
+    RightSide,
+}
+
+impl PoseMode {
+    fn label(self) -> &'static str {
+        match self {
+            PoseMode::Auto => "Pose: auto",
+            PoseMode::Random => "Pose: random",
+            PoseMode::Standing => "Pose: standing",
+            PoseMode::Belly => "Pose: belly",
+            PoseMode::Back => "Pose: back",
+            PoseMode::LeftSide => "Pose: left side",
+            PoseMode::RightSide => "Pose: right side",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            PoseMode::Auto => "auto",
+            PoseMode::Random => "random",
+            PoseMode::Standing => "standing",
+            PoseMode::Belly => "belly",
+            PoseMode::Back => "back",
+            PoseMode::LeftSide => "left side",
+            PoseMode::RightSide => "right side",
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct AutoPoseState {
+    rng: u32,
+    current: PoseMode,
+    since_switch_sec: f32,
+    next_switch_sec: f32,
+    collision_cooldown_sec: f32,
+}
+
+#[derive(Resource, Clone)]
+struct AutoCameraState {
+    rng: u32,
+    since_switch_sec: f32,
+    next_switch_sec: f32,
+    current: CameraMode,
+}
+
+#[derive(Resource, Clone, Copy)]
+struct AutoSubjectState {
+    rng: u32,
+    since_switch_sec: f32,
+    next_switch_sec: f32,
+    current: SubjectMode,
+}
+
+impl Default for AutoSubjectState {
+    fn default() -> Self {
+        let mut s = Self {
+            rng: 0xBADC_0FFEu32,
+            since_switch_sec: 0.0,
+            next_switch_sec: 0.0,
+            current: SubjectMode::Human,
+        };
+        s.schedule_next_switch();
+        s
+    }
+}
+
+impl AutoSubjectState {
+    fn lcg_next(&mut self) -> u32 {
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng
+    }
+
+    fn rand01(&mut self) -> f32 {
+        (self.lcg_next() as f32) / (u32::MAX as f32)
+    }
+
+    fn rand_range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.rand01()
+    }
+
+    fn schedule_next_switch(&mut self) {
+        self.since_switch_sec = 0.0;
+        self.next_switch_sec = self.rand_range(3.0, 6.0);
+    }
+
+    fn pick_next_subject(&mut self) -> SubjectMode {
+        match self.current {
+            SubjectMode::Ball => SubjectMode::Human,
+            _ => SubjectMode::Ball,
+        }
+    }
+}
+
+#[derive(Resource, Clone, Copy)]
+struct AutoTubeStyleState {
+    rng: u32,
+    scheme_current: u32,
+    scheme_since_switch_sec: f32,
+    scheme_next_switch_sec: f32,
+    pattern_current: u32,
+    pattern_since_switch_sec: f32,
+    pattern_next_switch_sec: f32,
+    auto_wire_since_switch_sec: f32,
+    auto_wire_next_switch_sec: f32,
+}
+
+impl Default for AutoTubeStyleState {
+    fn default() -> Self {
+        let mut s = Self {
+            rng: 0xC0DE_CAFEu32,
+            scheme_current: 0,
+            scheme_since_switch_sec: 0.0,
+            scheme_next_switch_sec: 0.0,
+            pattern_current: 0,
+            pattern_since_switch_sec: 0.0,
+            pattern_next_switch_sec: 0.0,
+            auto_wire_since_switch_sec: 0.0,
+            auto_wire_next_switch_sec: 0.0,
+        };
+        s.schedule_next_scheme_switch();
+        s.schedule_next_pattern_switch();
+        s
+    }
+}
+
+impl AutoTubeStyleState {
+    fn lcg_next(&mut self) -> u32 {
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng
+    }
+
+    fn rand01(&mut self) -> f32 {
+        (self.lcg_next() as f32) / (u32::MAX as f32)
+    }
+
+    fn rand_range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.rand01()
+    }
+
+    fn schedule_next_scheme_switch(&mut self) {
+        self.scheme_since_switch_sec = 0.0;
+        self.scheme_next_switch_sec = self.rand_range(3.0, 6.0);
+    }
+
+    fn schedule_next_pattern_switch(&mut self) {
+        self.pattern_since_switch_sec = 0.0;
+        self.pattern_next_switch_sec = self.rand_range(3.0, 6.0);
+    }
+
+    fn schedule_next_auto_wire_pattern_switch(&mut self) {
+        self.auto_wire_since_switch_sec = 0.0;
+        self.auto_wire_next_switch_sec = self.rand_range(1.0, 2.0);
+    }
+
+    fn pick_next_scheme(&mut self) {
+        let prev = self.scheme_current % 4;
+        let mut next = prev;
+        for _ in 0..8 {
+            next = self.lcg_next() % 4;
+            if next != prev {
+                break;
+            }
+        }
+        self.scheme_current = next;
+    }
+
+    fn pick_next_pattern(&mut self) {
+        let prev = self.pattern_current % 4;
+        let mut next = prev;
+        for _ in 0..8 {
+            next = self.lcg_next() % 4;
+            if next != prev {
+                break;
+            }
+        }
+        self.pattern_current = next;
+    }
+
+    fn pick_next_wire_pattern(&mut self) {
+        let prev = self.pattern_current;
+        let mut next = prev;
+        for _ in 0..8 {
+            next = 2 + (self.lcg_next() % 2);
+            if next != prev {
+                break;
+            }
+        }
+        self.pattern_current = next;
+    }
+}
+
+impl Default for AutoCameraState {
+    fn default() -> Self {
+        let mut s = Self {
+            rng: 0xC0FFEE_u32,
+            since_switch_sec: 0.0,
+            next_switch_sec: 0.0,
+            current: CameraMode::BallChase,
+        };
+        s.schedule_next_switch();
+        s
+    }
+}
+
+impl AutoCameraState {
+    fn lcg_next(&mut self) -> u32 {
+        // Deterministic, cheap RNG.
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng
+    }
+
+    fn rand01(&mut self) -> f32 {
+        let v = self.lcg_next();
+        (v as f32) / (u32::MAX as f32)
+    }
+
+    fn rand_range(&mut self, a: f32, b: f32) -> f32 {
+        a + (b - a) * self.rand01()
+    }
+
+    fn schedule_next_switch(&mut self) {
+        // Change every 3–6 seconds (uniform), i.e. ~4.5s average.
+        self.since_switch_sec = 0.0;
+        self.next_switch_sec = self.rand_range(3.0, 6.0);
+    }
+
+    fn pick_next_mode(&mut self) -> CameraMode {
+        // All camera modes (keep this in sync with enum `CameraMode`).
+        // Avoid picking the same mode twice.
+        let candidates = [
+            CameraMode::First,
+            CameraMode::Over,
+            CameraMode::Back,
+            CameraMode::BallChase,
+            CameraMode::Side,
+        ];
+
+        // Try a few times to avoid repeats.
+        for _ in 0..6 {
+            let idx = (self.rand01() * candidates.len() as f32)
+                .floor()
+                .clamp(0.0, (candidates.len() - 1) as f32) as usize;
+            let m = candidates[idx];
+            if m != self.current {
+                return m;
+            }
+        }
+        // Fallback: deterministic step.
+        match self.current {
+            CameraMode::BallChase => CameraMode::Back,
+            CameraMode::Back => CameraMode::Side,
+            CameraMode::Side => CameraMode::First,
+            CameraMode::First => CameraMode::Over,
+            CameraMode::Over => CameraMode::BallChase,
+        }
+    }
+}
+
+impl Default for AutoPoseState {
+    fn default() -> Self {
+        Self {
+            rng: 0xC0FF_EE11,
+            current: PoseMode::Standing,
+            since_switch_sec: 0.0,
+            next_switch_sec: 2.3,
+            collision_cooldown_sec: 0.0,
+        }
+    }
+}
+
+impl AutoPoseState {
+    fn lcg_next(&mut self) -> u32 {
+        // Deterministic, fast RNG (good enough for pose variation).
+        self.rng = self.rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        self.rng
+    }
+
+    fn rand_f32_01(&mut self) -> f32 {
+        let v = self.lcg_next();
+        // Use top 24 bits for a stable mantissa.
+        let mant = (v >> 8) & 0x00FF_FFFF;
+        mant as f32 / 16_777_215.0
+    }
+
+    fn pick_random_pose(&mut self) -> PoseMode {
+        let poses = [
+            PoseMode::Standing,
+            PoseMode::Belly,
+            PoseMode::Back,
+            PoseMode::LeftSide,
+            PoseMode::RightSide,
+        ];
+        let mut idx = (self.lcg_next() as usize) % poses.len();
+        if poses[idx] == self.current {
+            idx = (idx + 1) % poses.len();
+        }
+        poses[idx]
+    }
+
+    fn schedule_next_switch(&mut self) {
+        // 1.2s .. 3.6s
+        self.next_switch_sec = 1.2 + 2.4 * self.rand_f32_01();
+        self.since_switch_sec = 0.0;
+    }
+}
+
+fn pose_targets(pose: PoseMode) -> (f32, f32) {
+    match pose {
+        PoseMode::Standing => (0.0, 0.0),
+        PoseMode::Belly => (0.0, 1.0),
+        PoseMode::Back => (0.0, -1.0),
+        PoseMode::LeftSide => (std::f32::consts::FRAC_PI_2, 0.0),
+        PoseMode::RightSide => (-std::f32::consts::FRAC_PI_2, 0.0),
+        PoseMode::Auto | PoseMode::Random => (0.0, 0.0),
+    }
+}
+
+fn pose_from_local_hit_dir(local_hit_dir: Vec3) -> PoseMode {
+    // Choose the dominant axis in the model-local frame:
+    // - +Z belly, -Z back
+    // - +X left side, -X right side
+    // - +Y standing (upright contact)
+    let d = local_hit_dir.normalize_or_zero();
+    if d.length_squared() < 1e-6 {
+        return PoseMode::Standing;
+    }
+
+    if d.y > 0.78 {
+        return PoseMode::Standing;
+    }
+
+    if d.z.abs() >= d.x.abs() {
+        if d.z >= 0.0 {
+            PoseMode::Belly
+        } else {
+            PoseMode::Back
+        }
+    } else if d.x >= 0.0 {
+        PoseMode::LeftSide
+    } else {
+        PoseMode::RightSide
+    }
+}
+
+#[derive(Component)]
 struct MainCamera;
+
+#[derive(Resource, Default)]
+struct SubjectNormalsComputed(std::collections::HashSet<bevy::asset::AssetId<Mesh>>);
+
+#[derive(Resource, Clone, Copy)]
+struct SubjectDynamics {
+    initialized: bool,
+    theta: f32,
+    omega: f32,
+    human_r: f32,
+    human_vr: f32,
+    human_roll: f32,
+    human_pitch: f32,
+    ball_r: f32,
+    ball_vr: f32,
+    ball_roll: f32,
+}
+
+impl Default for SubjectDynamics {
+    fn default() -> Self {
+        let human_r_max = TUBE_RADIUS - HUMAN_RADIUS;
+        let ball_r_max = TUBE_RADIUS - BALL_RADIUS;
+        Self {
+            initialized: false,
+            theta: 0.0,
+            omega: 0.0,
+            human_r: human_r_max - CONTACT_EPS,
+            human_vr: 0.0,
+            human_roll: 0.0,
+            human_pitch: 0.0,
+            ball_r: ball_r_max - CONTACT_EPS,
+            ball_vr: 0.0,
+            ball_roll: 0.0,
+        }
+    }
+}
 
 #[derive(Resource, Clone)]
 struct Playback {
@@ -1633,10 +2384,16 @@ struct OverlayState {
     last_credit_idx: i32,
     last_caption_idx: i32,
     last_visible: bool,
+    last_caption_visible: bool,
 }
 
 #[derive(Resource, Clone, Copy)]
 struct OverlayVisibility {
+    show: bool,
+}
+
+#[derive(Resource, Clone, Copy)]
+struct CaptionVisibility {
     show: bool,
 }
 
@@ -1652,7 +2409,8 @@ impl Default for OverlayState {
         Self {
             last_credit_idx: -1,
             last_caption_idx: -1,
-            last_visible: true,
+            last_visible: false,
+            last_caption_visible: true,
         }
     }
 }
@@ -1668,6 +2426,7 @@ struct JsInput {
     has_time: bool,
     time_sec: f32,
     playing: bool,
+    sample_age_sec: f32,
     toggle_scheme: bool,
     toggle_texture: bool,
     speed_delta: i32,
@@ -1681,6 +2440,7 @@ impl JsInput {
             has_time: false,
             time_sec: 0.0,
             playing: false,
+            sample_age_sec: 0.0,
             toggle_scheme: false,
             toggle_texture: false,
             speed_delta: 0,
@@ -1816,11 +2576,14 @@ pub fn main() {
             impl Drop for Restore {
                 fn drop(&mut self) {
                     if self.had_tensor {
-                        let _ = fs::create_dir_all(self.local_tensor.parent().unwrap_or(Path::new(".")));
+                        let _ = fs::create_dir_all(
+                            self.local_tensor.parent().unwrap_or(Path::new(".")),
+                        );
                         let _ = fs::rename(&self.backup_tensor, &self.local_tensor);
                     }
                     if self.had_meta {
-                        let _ = fs::create_dir_all(self.local_meta.parent().unwrap_or(Path::new(".")));
+                        let _ =
+                            fs::create_dir_all(self.local_meta.parent().unwrap_or(Path::new(".")));
                         let _ = fs::rename(&self.backup_meta, &self.local_meta);
                     }
                     let _ = fs::remove_dir_all(&self.backup_dir);
@@ -1848,10 +2611,16 @@ pub fn main() {
             match src {
                 BurnHumanSource::Paths { tensor, meta } => {
                     if !exists_file(&tensor) {
-                        panic!("assets self-test failed: tensor missing at {}", tensor.display());
+                        panic!(
+                            "assets self-test failed: tensor missing at {}",
+                            tensor.display()
+                        );
                     }
                     if !exists_file(&meta) {
-                        panic!("assets self-test failed: meta missing at {}", meta.display());
+                        panic!(
+                            "assets self-test failed: meta missing at {}",
+                            meta.display()
+                        );
                     }
                     eprintln!("[mcbaise] assets self-test ok");
                     eprintln!("[mcbaise] tensor: {}", tensor.display());
@@ -1957,8 +2726,7 @@ pub fn main() {
         }
     }
 
-    app
-        .insert_resource(ClearColor(Color::BLACK))
+    app.insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Playback {
             time_sec: 0.0,
             playing: cfg!(not(target_arch = "wasm32")),
@@ -1968,36 +2736,60 @@ pub fn main() {
             scheme: 0,
             pattern: 0,
         })
-        .insert_resource(OverlayVisibility { show: true })
+        .insert_resource(OverlayVisibility { show: false })
+        .insert_resource(CaptionVisibility { show: true })
         .insert_resource(OverlayText::default())
+        .init_resource::<SubjectMode>()
+        .init_resource::<PoseMode>()
+        .init_resource::<CameraPreset>()
+        .init_resource::<AutoPoseState>()
+        .init_resource::<AutoCameraState>()
+        .init_resource::<AutoSubjectState>()
+        .init_resource::<ColorSchemeMode>()
+        .init_resource::<TexturePatternMode>()
+        .init_resource::<AutoTubeStyleState>()
+        .init_resource::<HumanAppearanceMode>()
+        .init_resource::<BallAppearanceMode>()
+        .init_resource::<AutoHumanAppearanceState>()
+        .init_resource::<AutoBallAppearanceState>()
+        .init_resource::<SubjectDynamics>()
+        .init_resource::<SubjectNormalsComputed>()
         .add_plugins(plugins)
-    .add_plugins(EguiPlugin::default())
-    // Ensure embedded assets are registered before materials request shaders.
-    .add_plugins(local_embedded_asset_plugin)
-    .add_plugins(MaterialPlugin::<TubeMaterial>::default())
+        .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
+        .add_plugins(EguiPlugin::default())
+        // Ensure embedded assets are registered before materials request shaders.
+        .add_plugins(local_embedded_asset_plugin)
+        .add_plugins(MaterialPlugin::<TubeMaterial>::default())
         .add_plugins(burn_plugin)
-
         .add_systems(Startup, setup_scene)
-    // Diagnostic: print embedded registry contents at startup to verify registered paths
-    .add_systems(Startup, (register_embedded_asset_source, print_embedded_registry))
+        // Diagnostic: print embedded registry contents at startup to verify registered paths
         .add_systems(
-            Update,
-            (
-                #[cfg(target_arch = "wasm32")]
-                apply_js_input,
-                #[cfg(not(target_arch = "wasm32"))]
-                advance_time_native,
-                #[cfg(not(target_arch = "wasm32"))]
-                native_controls,
-                update_tube_and_subject,
-                update_overlays,
-            ),
+            Startup,
+            (register_embedded_asset_source, print_embedded_registry),
         )
+        .add_systems(Update, ensure_subject_normals)
+        .add_systems(Update, update_subject_appearance)
+        .add_systems(Update, update_tube_and_subject)
+        .add_systems(Update, apply_subject_mode)
+        .add_systems(Update, update_overlays)
         .add_systems(EguiPrimaryContextPass, ui_overlay);
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, apply_js_input);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, (advance_time_native, native_controls));
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
     {
-        app.add_systems(Update, (native_youtube_shutdown_on_exit, native_youtube_sync));
+        app.add_systems(
+            Update,
+            (native_youtube_shutdown_on_exit, native_youtube_sync),
+        );
+        app.add_systems(
+            Update,
+            native_youtube_align_browser_window.after(native_youtube_sync),
+        );
         init_native_youtube(&mut app);
     }
 
@@ -2050,6 +2842,8 @@ fn init_native_youtube(app: &mut App) {
         chrome_profile_dir: chrome_profile_dir.clone(),
     });
 
+    app.init_resource::<NativeYoutubeWindowLayout>();
+
     if let Some(mut playback) = app.world_mut().get_resource_mut::<Playback>() {
         // YouTube is authoritative.
         playback.speed = 1.0;
@@ -2084,6 +2878,118 @@ fn init_native_youtube(app: &mut App) {
 
         heal_cooldown_sec: 0.0,
     });
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+fn native_youtube_align_browser_window(
+    sync: Option<Res<NativeYoutubeSync>>,
+    mut layout: ResMut<NativeYoutubeWindowLayout>,
+    mut primary: Query<(Entity, &mut Window), With<PrimaryWindow>>,
+    winit_windows: Option<NonSend<bevy::winit::WinitWindows>>,
+) {
+    let Some(sync) = sync else {
+        return;
+    };
+    if !sync.enabled {
+        return;
+    }
+
+    let Some((primary_entity, mut bevy_window)) = primary.iter_mut().next() else {
+        return;
+    };
+
+    // Best-effort: keep Bevy on top for a short window after we move Chrome.
+    #[cfg(windows)]
+    {
+        use bevy::window::WindowLevel;
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            HWND_TOPMOST, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+            ShowWindow,
+        };
+
+        // Once we've positioned Chrome, keep Bevy as topmost so it doesn't fall behind.
+        if layout.force_topmost {
+            bevy_window.window_level = WindowLevel::AlwaysOnTop;
+        }
+
+        if layout.force_topmost
+            && let Some(winit_windows) = winit_windows.as_ref()
+            && let Some(w) = winit_windows.get_window(primary_entity)
+        {
+            let hwnd: Option<HWND> =
+                w.window_handle()
+                    .ok()
+                    .and_then(|handle| match handle.as_raw() {
+                        RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
+                        _ => None,
+                    });
+
+            if let Some(hwnd) = hwnd {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+                    );
+                    // If minimized, restore. (Doesn't force foreground.)
+                    ShowWindow(hwnd, SW_RESTORE);
+                }
+            }
+        }
+    }
+
+    if layout.applied {
+        return;
+    }
+
+    // Prefer true OS window geometry via winit (includes current monitor coords).
+    if let Some(winit_windows) = winit_windows {
+        let Some(w) = winit_windows.get_window(primary_entity) else {
+            return;
+        };
+
+        let Ok(pos) = w.outer_position() else {
+            return;
+        };
+        let size = w.outer_size();
+
+        let x_i32 = pos.x.saturating_add(size.width as i32);
+        let y_i32 = pos.y;
+        let width_u32 = size.width.max(1);
+        let height_u32 = size.height.max(1);
+
+        let x = x_i32.max(0) as u32;
+        let y = y_i32.max(0) as u32;
+
+        let _ = sync.tx.send(native_youtube::Command::SetWindowRect {
+            x,
+            y,
+            width: width_u32,
+            height: height_u32,
+        });
+        layout.applied = true;
+        layout.force_topmost = true;
+        return;
+    }
+
+    // Fallback: we can't get the OS position, but we can at least match the size.
+    // Place at (width, 0) so it ends up "to the right" on the primary monitor.
+    let width_u32 = bevy_window.resolution.physical_width().max(1);
+    let height_u32 = bevy_window.resolution.physical_height().max(1);
+    let _ = sync.tx.send(native_youtube::Command::SetWindowRect {
+        x: width_u32,
+        y: 0,
+        width: width_u32,
+        height: height_u32,
+    });
+    layout.applied = true;
+    layout.force_topmost = true;
 }
 
 #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
@@ -2145,10 +3051,10 @@ fn init_native_mpv(app: &mut App) {
 
     if cookie_file.is_none() {
         if let Ok(v) = std::env::var("MCBAISE_MPV_COOKIES_FROM_BROWSER") {
-        let v = v.trim();
-        if !v.is_empty() {
-            ytdl_raw_options.push(format!("cookies-from-browser={v}"));
-        }
+            let v = v.trim();
+            if !v.is_empty() {
+                ytdl_raw_options.push(format!("cookies-from-browser={v}"));
+            }
         }
     }
     if let Ok(v) = std::env::var("MCBAISE_MPV_YTDL_RAW_OPTIONS") {
@@ -2163,10 +3069,11 @@ fn init_native_mpv(app: &mut App) {
     // This helps avoid some iOS/tv client failures and can improve format availability.
     // Opt out with: `MCBAISE_MPV_DISABLE_DEFAULT_YOUTUBE_EXTRACTOR_ARGS=1`
     if looks_like_youtube {
-        let disable_default_extractor_args = std::env::var("MCBAISE_MPV_DISABLE_DEFAULT_YOUTUBE_EXTRACTOR_ARGS")
-            .ok()
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        let disable_default_extractor_args =
+            std::env::var("MCBAISE_MPV_DISABLE_DEFAULT_YOUTUBE_EXTRACTOR_ARGS")
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
 
         if !disable_default_extractor_args {
             let has_extractor_args = ytdl_raw_options
@@ -2193,9 +3100,9 @@ fn init_native_mpv(app: &mut App) {
     // If the user didn't specify any format selection, default to something permissive.
     // This avoids ytdl_hook errors like: "Requested format is not available".
     if looks_like_youtube {
-        let has_mpv_ytdl_format = extra_args.iter().any(|a| {
-            a == "--ytdl-format" || a.to_ascii_lowercase().starts_with("--ytdl-format=")
-        });
+        let has_mpv_ytdl_format = extra_args
+            .iter()
+            .any(|a| a == "--ytdl-format" || a.to_ascii_lowercase().starts_with("--ytdl-format="));
         let has_ytdlp_format = ytdl_raw_options
             .iter()
             .any(|s| s.to_ascii_lowercase().contains("format="));
@@ -2207,7 +3114,11 @@ fn init_native_mpv(app: &mut App) {
     if !ytdl_raw_options.is_empty() {
         let joined = ytdl_raw_options
             .into_iter()
-            .flat_map(|s| s.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>())
+            .flat_map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().to_string())
+                    .collect::<Vec<_>>()
+            })
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join(",");
@@ -2248,7 +3159,11 @@ fn init_native_mpv(app: &mut App) {
 }
 
 #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
-fn native_mpv_sync(time: Res<Time>, mut playback: ResMut<Playback>, mpv: Option<ResMut<NativeMpvSync>>) {
+fn native_mpv_sync(
+    time: Res<Time>,
+    mut playback: ResMut<Playback>,
+    mpv: Option<ResMut<NativeMpvSync>>,
+) {
     let Some(mut mpv) = mpv else {
         return;
     };
@@ -2382,14 +3297,10 @@ fn native_youtube_sync(
         }
 
         // If we were showing a transient healing message, clear it once we have a valid sample again.
-        if let Ok(mut slot) = sync.last_error.lock() {
-            if slot
-                .as_deref()
-                .map(|s| s.starts_with("healing:"))
-                .unwrap_or(false)
-            {
-                *slot = None;
-            }
+        if let Ok(mut slot) = sync.last_error.lock()
+            && slot.as_deref().is_some_and(|s| s.starts_with("healing:"))
+        {
+            *slot = None;
         }
 
         if !sync.has_remote {
@@ -2411,10 +3322,8 @@ fn native_youtube_sync(
             }
 
             // Only defer seek if we're actually trying to reach content.
-            if playback.playing || force_heal {
-                if sync.last_good_time_sec > 0.01 {
-                    sync.pending_seek_after_ad = true;
-                }
+            if (playback.playing || force_heal) && sync.last_good_time_sec > 0.01 {
+                sync.pending_seek_after_ad = true;
             }
 
             // Freeze our local animation time at the last known good content time.
@@ -2452,10 +3361,7 @@ fn native_youtube_sync(
             playback.speed = 1.0;
 
             if let Ok(mut slot) = sync.last_error.lock() {
-                let label = sync
-                    .ad_label
-                    .as_deref()
-                    .unwrap_or("ad playing");
+                let label = sync.ad_label.as_deref().unwrap_or("ad playing");
                 *slot = Some(format!(
                     "healing: ad detected ({label}) — waiting; t≈{:.2}",
                     playback.time_sec
@@ -2506,10 +3412,11 @@ fn native_youtube_sync(
             if let Ok(mut slot) = sync.last_error.lock() {
                 *slot = Some("healing: YouTube player error overlay (reloading)".to_string());
             }
-        } else if playback.playing && sync.sample_age_sec > 1.25 {
-            if let Ok(mut slot) = sync.last_error.lock() {
-                *slot = Some("healing: YouTube state stalled (seeking)".to_string());
-            }
+        } else if playback.playing
+            && sync.sample_age_sec > 1.25
+            && let Ok(mut slot) = sync.last_error.lock()
+        {
+            *slot = Some("healing: YouTube state stalled (seeking)".to_string());
         }
 
         if sync.heal_cooldown_sec <= 0.0
@@ -2566,7 +3473,10 @@ fn native_youtube_sync(
             sync.heal_cooldown_sec = 1.0;
 
             if let Ok(mut slot) = sync.last_error.lock() {
-                *slot = Some(format!("healing: ad ended — seeking back to {:.2}", seek_to));
+                *slot = Some(format!(
+                    "healing: ad ended — seeking back to {:.2}",
+                    seek_to
+                ));
             }
         }
     }
@@ -2574,8 +3484,8 @@ fn native_youtube_sync(
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
 fn native_youtube_shutdown_on_exit(
-    mut app_exit: EventReader<bevy::app::AppExit>,
-    mut window_close: EventReader<bevy::window::WindowCloseRequested>,
+    mut app_exit: MessageReader<bevy::app::AppExit>,
+    mut window_close: MessageReader<bevy::window::WindowCloseRequested>,
     sync: Option<Res<NativeYoutubeSync>>,
 ) {
     if app_exit.is_empty() && window_close.is_empty() {
@@ -2598,13 +3508,36 @@ fn setup_scene(
     mut meshes: ResMut<Assets<Mesh>>,
     mut tube_materials: ResMut<Assets<TubeMaterial>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     assets: Res<BurnHumanAssets>,
 ) {
+    let polkadot = images.add(make_polkadot_texture());
+    commands.insert_resource(AppearanceTextures { polkadot });
+
     commands.insert_resource(AmbientLight {
         color: Color::srgb(1.0, 1.0, 1.0),
-        brightness: 0.25,
+        brightness: 0.15,
         affects_lightmapped_meshes: true,
     });
+
+    // Key + fill + rim lighting to help the subject read as 3D at all angles.
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 35_000.0,
+            shadows_enabled: true,
+            ..default()
+        },
+        Transform::from_xyz(10.0, 18.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
+
+    commands.spawn((
+        DirectionalLight {
+            illuminance: 8_000.0,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(-12.0, 10.0, 2.0).looking_at(Vec3::ZERO, Vec3::Y),
+    ));
 
     commands.spawn((
         DirectionalLight {
@@ -2612,7 +3545,7 @@ fn setup_scene(
             shadows_enabled: false,
             ..default()
         },
-        Transform::from_xyz(10.0, 18.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+        Transform::from_xyz(-6.0, 14.0, -16.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
     let curve = make_random_loop_curve(1337);
@@ -2658,19 +3591,55 @@ fn setup_scene(
             ..Default::default()
         },
         MeshMaterial3d(std_materials.add(StandardMaterial {
-            base_color: Color::srgb(0.72, 0.7, 0.68),
+            base_color: Color::srgb(0.95, 0.95, 0.95),
             metallic: 0.0,
             reflectance: 0.5,
             perceptual_roughness: 0.6,
-            emissive: Color::srgb(0.14, 0.12, 0.10).into(),
             cull_mode: None,
             ..default()
         })),
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
-            .with_scale(Vec3::splat(1.35)),
+            .with_scale(Vec3::splat(HUMAN_SCALE)),
         Visibility::default(),
         SubjectTag,
         Name::new("burn_human_subject"),
+    ));
+
+    // Optional alternate subject: a glossy, light-blue "glass" ball.
+    // (We keep it around and just toggle visibility.)
+    let ball_mesh = meshes.add(Mesh::from(bevy::math::primitives::Sphere::new(BALL_RADIUS)));
+    let ball_mat = std_materials.add(StandardMaterial {
+        base_color: Color::srgb(0.45, 0.82, 1.0).with_alpha(0.35),
+        metallic: 0.0,
+        reflectance: 0.95,
+        perceptual_roughness: 0.04,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
+
+    commands.spawn((
+        Mesh3d(ball_mesh),
+        MeshMaterial3d(ball_mat),
+        Transform::default(),
+        Visibility::Hidden,
+        BallTag,
+        Name::new("subject_ball"),
+    ));
+
+    // Local light that follows the subject; helps avoid "flat" shading when the tube
+    // occludes directional light contributions.
+    commands.spawn((
+        PointLight {
+            intensity: 2200.0,
+            range: 20.0,
+            radius: 0.2,
+            shadows_enabled: false,
+            ..default()
+        },
+        Transform::from_xyz(0.0, 0.0, 0.0),
+        SubjectLightTag,
+        Name::new("subject_fill_light"),
     ));
 
     commands.spawn((
@@ -2685,8 +3654,8 @@ fn setup_scene(
         DistanceFog {
             color: Color::srgb_u8(0x12, 0x00, 0x00),
             falloff: FogFalloff::Linear {
-                start: 10.0,
-                end: 260.0,
+                start: 40.0,
+                end: 300.0,
             },
             ..default()
         },
@@ -2701,6 +3670,113 @@ fn setup_scene(
     commands.insert_resource(OverlayState::default());
 }
 
+fn ensure_subject_normals(
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut done: ResMut<SubjectNormalsComputed>,
+    q: Query<&Mesh3d, With<SubjectTag>>,
+) {
+    for mesh3d in &q {
+        let id = mesh3d.0.id();
+        if done.0.contains(&id) {
+            continue;
+        }
+
+        let Some(mesh) = meshes.get_mut(&mesh3d.0) else {
+            continue;
+        };
+
+        if subject_mesh_has_usable_normals(mesh) {
+            done.0.insert(id);
+            continue;
+        }
+
+        if compute_smooth_normals(mesh) {
+            done.0.insert(id);
+        }
+    }
+}
+
+fn subject_mesh_has_usable_normals(mesh: &Mesh) -> bool {
+    let Some(values) = mesh.attribute(Mesh::ATTRIBUTE_NORMAL) else {
+        return false;
+    };
+
+    match values {
+        // Guard against the "present but zero" case.
+        bevy::mesh::VertexAttributeValues::Float32x3(ns) => ns.iter().any(|n| {
+            let v = Vec3::from(*n);
+            v.length_squared() > 1.0e-10
+        }),
+        _ => true,
+    }
+}
+
+fn compute_smooth_normals(mesh: &mut Mesh) -> bool {
+    if mesh.primitive_topology() != PrimitiveTopology::TriangleList {
+        return false;
+    }
+
+    let positions = match mesh.attribute(Mesh::ATTRIBUTE_POSITION) {
+        Some(bevy::mesh::VertexAttributeValues::Float32x3(ps)) => {
+            ps.iter().map(|p| Vec3::from(*p)).collect::<Vec<Vec3>>()
+        }
+        _ => return false,
+    };
+
+    if positions.len() < 3 {
+        return false;
+    }
+
+    let indices: Vec<u32> = match mesh.indices() {
+        Some(Indices::U16(is)) => is.iter().map(|&i| i as u32).collect(),
+        Some(Indices::U32(is)) => is.clone(),
+        None => (0..positions.len() as u32).collect(),
+    };
+
+    if indices.len() < 3 {
+        return false;
+    }
+
+    let mut normals = vec![Vec3::ZERO; positions.len()];
+
+    for tri in indices.chunks_exact(3) {
+        let i0 = tri[0] as usize;
+        let i1 = tri[1] as usize;
+        let i2 = tri[2] as usize;
+
+        if i0 >= positions.len() || i1 >= positions.len() || i2 >= positions.len() {
+            continue;
+        }
+
+        let p0 = positions[i0];
+        let p1 = positions[i1];
+        let p2 = positions[i2];
+
+        let e1 = p1 - p0;
+        let e2 = p2 - p0;
+        let n = e1.cross(e2);
+
+        if n.length_squared() <= 1.0e-20 {
+            continue;
+        }
+
+        normals[i0] += n;
+        normals[i1] += n;
+        normals[i2] += n;
+    }
+
+    let normals: Vec<[f32; 3]> = normals
+        .into_iter()
+        .map(|n| {
+            let n = n.normalize_or_zero();
+            [n.x, n.y, n.z]
+        })
+        .collect();
+
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    true
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn advance_time_native(
     time: Res<Time>,
@@ -2710,10 +3786,12 @@ fn advance_time_native(
 ) {
     #[cfg(feature = "native-youtube")]
     {
-        if let Some(yt) = _native_youtube.as_ref() {
-            if yt.enabled {
-                return;
-            }
+        if _native_youtube
+            .as_ref()
+            .map(|yt| yt.enabled)
+            .unwrap_or(false)
+        {
+            return;
         }
     }
 
@@ -2736,6 +3814,8 @@ fn native_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut playback: ResMut<Playback>,
     mut settings: ResMut<TubeSettings>,
+    mut scheme_mode: ResMut<ColorSchemeMode>,
+    mut pattern_mode: ResMut<TexturePatternMode>,
     _native_youtube: Option<Res<NativeYoutubeSync>>,
     _native_mpv: Option<Res<NativeMpvSync>>,
 ) {
@@ -2744,23 +3824,23 @@ fn native_controls(
 
         #[cfg(feature = "native-youtube")]
         {
-            if let Some(yt) = _native_youtube.as_ref() {
-                if yt.enabled {
-                    let _ = yt
-                        .tx
-                        .send(crate::native_youtube::Command::SetPlaying(playback.playing));
+            if let Some(yt) = _native_youtube.as_ref()
+                && yt.enabled
+            {
+                let _ = yt
+                    .tx
+                    .send(crate::native_youtube::Command::SetPlaying(playback.playing));
 
-                    if playback.playing && yt.sample_age_sec > 2.0 {
-                        let seek_to = if yt.last_good_time_sec > 0.01 {
-                            yt.last_good_time_sec
-                        } else {
-                            playback.time_sec
-                        };
-                        let _ = yt.tx.send(crate::native_youtube::Command::ReloadAndSeek {
-                            time_sec: seek_to,
-                            playing: true,
-                        });
-                    }
+                if playback.playing && yt.sample_age_sec > 2.0 {
+                    let seek_to = if yt.last_good_time_sec > 0.01 {
+                        yt.last_good_time_sec
+                    } else {
+                        playback.time_sec
+                    };
+                    let _ = yt.tx.send(crate::native_youtube::Command::ReloadAndSeek {
+                        time_sec: seek_to,
+                        playing: true,
+                    });
                 }
             }
         }
@@ -2777,18 +3857,22 @@ fn native_controls(
         }
     }
     if keys.just_pressed(KeyCode::Digit1) {
-        settings.scheme = (settings.scheme + 1) % 2;
+        settings.scheme = (settings.scheme + 1) % 4;
+        *scheme_mode = ColorSchemeMode::from_value(settings.scheme);
     }
     if keys.just_pressed(KeyCode::Digit2) {
-        settings.pattern = (settings.pattern + 1) % 2;
+        settings.pattern = (settings.pattern + 1) % 4;
+        *pattern_mode = TexturePatternMode::from_value(settings.pattern);
     }
     if keys.just_pressed(KeyCode::ArrowUp) {
         #[cfg(feature = "native-youtube")]
         {
-            if let Some(yt) = _native_youtube.as_ref() {
-                if yt.enabled {
-                    return;
-                }
+            if _native_youtube
+                .as_ref()
+                .map(|yt| yt.enabled)
+                .unwrap_or(false)
+            {
+                return;
             }
         }
         playback.speed = (playback.speed + 0.25).clamp(0.25, 3.0);
@@ -2796,10 +3880,12 @@ fn native_controls(
     if keys.just_pressed(KeyCode::ArrowDown) {
         #[cfg(feature = "native-youtube")]
         {
-            if let Some(yt) = _native_youtube.as_ref() {
-                if yt.enabled {
-                    return;
-                }
+            if _native_youtube
+                .as_ref()
+                .map(|yt| yt.enabled)
+                .unwrap_or(false)
+            {
+                return;
             }
         }
         playback.speed = (playback.speed - 0.25).clamp(0.25, 3.0);
@@ -2808,23 +3894,36 @@ fn native_controls(
 
 #[cfg(target_arch = "wasm32")]
 fn apply_js_input(
+    time: Res<Time>,
     mut playback: ResMut<Playback>,
     mut settings: ResMut<TubeSettings>,
+    mut scheme_mode: ResMut<ColorSchemeMode>,
+    mut pattern_mode: ResMut<TexturePatternMode>,
     mut overlay_vis: ResMut<OverlayVisibility>,
 ) {
     JS_INPUT.with(|s| {
         let mut st = s.borrow_mut();
+
+        st.sample_age_sec += time.delta_secs().min(0.1);
+
         if st.has_time {
             playback.time_sec = st.time_sec;
             playback.playing = st.playing;
             st.has_time = false;
+            st.sample_age_sec = 0.0;
+        } else if playback.playing && st.sample_age_sec > 0.35 {
+            // If the YouTube sampling loop stalls (rAF throttling / transient JS hiccups),
+            // keep the simulation timeline moving until the next sample arrives.
+            playback.time_sec += time.delta_secs();
         }
         if st.toggle_scheme {
-            settings.scheme = (settings.scheme + 1) % 2;
+            settings.scheme = (settings.scheme + 1) % 4;
+            *scheme_mode = ColorSchemeMode::from_value(settings.scheme);
             st.toggle_scheme = false;
         }
         if st.toggle_texture {
-            settings.pattern = (settings.pattern + 1) % 2;
+            settings.pattern = (settings.pattern + 1) % 4;
+            *pattern_mode = TexturePatternMode::from_value(settings.pattern);
             st.toggle_texture = false;
         }
         if st.speed_delta != 0 {
@@ -2840,20 +3939,173 @@ fn apply_js_input(
     });
 }
 
+#[derive(SystemParam)]
+struct TubeUpdateParams<'w> {
+    playback: Res<'w, Playback>,
+    time: Res<'w, Time>,
+    settings: ResMut<'w, TubeSettings>,
+    scheme_mode: Res<'w, ColorSchemeMode>,
+    pattern_mode: Res<'w, TexturePatternMode>,
+    auto_style: ResMut<'w, AutoTubeStyleState>,
+    tube_scene: Res<'w, TubeScene>,
+    tube_materials: ResMut<'w, Assets<TubeMaterial>>,
+    dyns: ResMut<'w, SubjectDynamics>,
+    subject_mode: Res<'w, SubjectMode>,
+    pose_mode: Res<'w, PoseMode>,
+    camera_preset: Res<'w, CameraPreset>,
+    auto_pose: ResMut<'w, AutoPoseState>,
+    auto_cam: ResMut<'w, AutoCameraState>,
+    auto_subject: ResMut<'w, AutoSubjectState>,
+}
+
+#[allow(clippy::type_complexity)]
 fn update_tube_and_subject(
-    playback: Res<Playback>,
-    settings: Res<TubeSettings>,
-    tube_scene: Res<TubeScene>,
-    mut tube_materials: ResMut<Assets<TubeMaterial>>,
-    mut subject: Query<&mut Transform, With<SubjectTag>>,
-    mut cam: Query<&mut Transform, (With<MainCamera>, Without<SubjectTag>)>,
+    TubeUpdateParams {
+        playback,
+        time,
+        mut settings,
+        scheme_mode,
+        pattern_mode,
+        mut auto_style,
+        tube_scene,
+        mut tube_materials,
+        mut dyns,
+        subject_mode,
+        pose_mode,
+        camera_preset,
+        mut auto_pose,
+        mut auto_cam,
+        mut auto_subject,
+    }: TubeUpdateParams,
+    mut subject: Query<
+        &mut Transform,
+        (
+            With<SubjectTag>,
+            Without<MainCamera>,
+            Without<SubjectLightTag>,
+            Without<BallTag>,
+        ),
+    >,
+    mut subject_light: Query<
+        &mut Transform,
+        (
+            With<SubjectLightTag>,
+            Without<SubjectTag>,
+            Without<MainCamera>,
+            Without<BallTag>,
+        ),
+    >,
+    mut ball: Query<
+        &mut Transform,
+        (
+            With<BallTag>,
+            Without<SubjectTag>,
+            Without<MainCamera>,
+            Without<SubjectLightTag>,
+        ),
+    >,
+    mut cam: Query<
+        &mut Transform,
+        (
+            With<MainCamera>,
+            Without<SubjectTag>,
+            Without<SubjectLightTag>,
+            Without<BallTag>,
+        ),
+    >,
 ) {
     let t = playback.time_sec;
+
+    // Keep smoothing behavior consistent across frame rates.
+    let dt = time.delta_secs().min(0.1);
+    let pos_alpha = 1.0 - (-12.0 * dt).exp();
+    let rot_alpha = 1.0 - (-12.0 * dt).exp();
+
+    // Resolve tube style (colors/texture) from explicit / auto timeline / random.
+    let scheme = match *scheme_mode {
+        ColorSchemeMode::Auto => timeline_color_scheme(t),
+        ColorSchemeMode::Random => {
+            auto_style.scheme_since_switch_sec += dt;
+            if auto_style.scheme_since_switch_sec >= auto_style.scheme_next_switch_sec {
+                auto_style.pick_next_scheme();
+                auto_style.schedule_next_scheme_switch();
+            }
+            auto_style.scheme_current % 4
+        }
+        ColorSchemeMode::OrangeWhite => 0,
+        ColorSchemeMode::Nin => 1,
+        ColorSchemeMode::BlackWhite => 2,
+        ColorSchemeMode::RandomGrey => 3,
+    };
+
+    let pattern = match *pattern_mode {
+        TexturePatternMode::Auto => {
+            // For the first 3 minutes, only use wireframe textures and switch quickly.
+            if t < 180.0 {
+                if auto_style.auto_wire_next_switch_sec == 0.0 {
+                    auto_style.schedule_next_auto_wire_pattern_switch();
+                }
+                if auto_style.pattern_current % 4 < 2 {
+                    auto_style.pick_next_wire_pattern();
+                    auto_style.schedule_next_auto_wire_pattern_switch();
+                }
+
+                auto_style.auto_wire_since_switch_sec += dt;
+                if auto_style.auto_wire_since_switch_sec >= auto_style.auto_wire_next_switch_sec {
+                    auto_style.pick_next_wire_pattern();
+                    auto_style.schedule_next_auto_wire_pattern_switch();
+                }
+
+                auto_style.pattern_current % 4
+            } else {
+                timeline_texture_pattern(t)
+            }
+        }
+        TexturePatternMode::Random => {
+            auto_style.pattern_since_switch_sec += dt;
+            if auto_style.pattern_since_switch_sec >= auto_style.pattern_next_switch_sec {
+                auto_style.pick_next_pattern();
+                auto_style.schedule_next_pattern_switch();
+            }
+            auto_style.pattern_current % 4
+        }
+        TexturePatternMode::Stripe => 0,
+        TexturePatternMode::Swirl => 1,
+        TexturePatternMode::StripeWire => 2,
+        TexturePatternMode::SwirlWire => 3,
+    };
+
+    auto_style.scheme_current = scheme;
+    auto_style.pattern_current = pattern;
+    settings.scheme = scheme;
+    settings.pattern = pattern;
+
+    // Resolve subject from explicit / auto timeline / random.
+    match *subject_mode {
+        SubjectMode::Auto => {
+            auto_subject.current = timeline_subject_mode(t);
+        }
+        SubjectMode::Random => {
+            auto_subject.since_switch_sec += dt;
+            if auto_subject.since_switch_sec >= auto_subject.next_switch_sec {
+                auto_subject.current = auto_subject.pick_next_subject();
+                auto_subject.schedule_next_switch();
+            }
+        }
+        SubjectMode::Human | SubjectMode::Ball => {
+            auto_subject.current = *subject_mode;
+        }
+    }
+
+    let active_subject_mode = match *subject_mode {
+        SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
+        _ => *subject_mode,
+    };
 
     // Update tube shader params.
     if let Some(mat) = tube_materials.get_mut(&tube_scene.tube_material) {
         mat.set_time(t);
-        mat.set_scheme(settings.scheme);
+        mat.set_scheme(settings.scheme, t);
         mat.set_pattern(settings.pattern);
     }
 
@@ -2867,53 +4119,622 @@ fn update_tube_and_subject(
     let cam_n = f.nor;
     let cam_b = f.bin;
 
-    let look_ahead = tube_scene.curve.point_at((progress + 0.003).min(0.99));
+    // Wrap instead of clamping to avoid a discontinuity at the loop boundary.
+    let look_ahead = tube_scene
+        .curve
+        .point_at((progress + 0.003).rem_euclid(1.0));
+
+    // Resolve the effective camera mode up-front so we can use it for both look-ahead and camera.
+    let selected_camera_mode = match *camera_preset {
+        CameraPreset::Auto => {
+            auto_cam.current = timeline_camera_mode(t);
+            auto_cam.current
+        }
+        CameraPreset::Random => {
+            auto_cam.since_switch_sec += dt;
+            if auto_cam.since_switch_sec >= auto_cam.next_switch_sec {
+                auto_cam.current = auto_cam.pick_next_mode();
+                auto_cam.schedule_next_switch();
+            }
+            auto_cam.current
+        }
+        CameraPreset::FollowActiveFirst => CameraMode::First,
+        CameraPreset::FollowActiveOver | CameraPreset::TubeOver => CameraMode::Over,
+        CameraPreset::FollowActiveBack => CameraMode::Back,
+        CameraPreset::FollowActiveSide => CameraMode::Side,
+        CameraPreset::FollowActiveChase
+        | CameraPreset::FollowHumanChase
+        | CameraPreset::FollowBallChase => CameraMode::BallChase,
+    };
 
     // Subject position on wall.
-    let ball_ahead = if camera_mode(t) == CameraMode::BallChase {
+    let ball_ahead = if selected_camera_mode == CameraMode::BallChase {
         0.020
     } else {
         0.010
     };
-    let s = (progress + ball_ahead).min(0.99);
+    // Wrap instead of clamping to avoid a discontinuity at the loop boundary.
+    let s = (progress + ball_ahead).rem_euclid(1.0);
     let center = tube_scene.curve.point_at(s);
     let bf = tube_scene.frames.frame_at(s);
 
-    let theta = theta_from_time(t);
+    // Tube-surface dynamics for motion around the tube wall.
+    // Treat the subject like a bead sliding on a ring (the tube cross-section), driven by
+    // an effective acceleration = gravity - (curve inertial acceleration).
+    let curve_param_speed = 0.0028; // must match progress_from_video_time
+    let ds = (curve_param_speed * dt).clamp(0.0, 0.01);
+    let center_prev = tube_scene.curve.point_at((s - ds).rem_euclid(1.0));
+    let center_next = tube_scene.curve.point_at((s + ds).rem_euclid(1.0));
+    let v_center = (center_next - center_prev) / (2.0 * dt.max(1e-4));
+    let a_center = (center_next - center * 2.0 + center_prev) / (dt.max(1e-4) * dt.max(1e-4));
+
+    // Time-varying gravity: blend real world-down with a rotating pull direction in the
+    // tube cross-section frame so the rider/ball doesn't feel "stuck at the top".
+    // This is intentionally artistic (not physically correct), but it creates the desired
+    // swirling + pose/collision variety.
+    let world_down = Vec3::new(0.0, -1.0, 0.0);
+    let swirl_rate = 2.2; // rad/s
+    let swirl_blend = 0.90; // 0..1 (higher = more swirl)
+    let phase = t * swirl_rate;
+    // Pull direction rotates around the tube axis (lies in the normal/binormal plane).
+    let swirl_pull_dir = -(bf.nor * phase.cos() + bf.bin * phase.sin()).normalize_or_zero();
+
+    let mut g_dir = world_down * (1.0 - swirl_blend) + swirl_pull_dir * swirl_blend;
+    if g_dir.length_squared() < 1e-6 {
+        g_dir = world_down;
+    }
+    let gravity_acc = g_dir.normalize_or_zero() * GRAVITY;
+    let eff_acc = gravity_acc - a_center;
+
+    let g_n = eff_acc.dot(bf.nor) / GRAVITY;
+    let g_b = eff_acc.dot(bf.bin) / GRAVITY;
+    let g_mag = (g_n * g_n + g_b * g_b).sqrt();
+    let theta_eq = g_b.atan2(g_n);
+
+    if !dyns.initialized {
+        dyns.theta = theta_eq;
+        dyns.omega = 0.0;
+        dyns.initialized = true;
+    }
+
+    let r_ring = match active_subject_mode {
+        SubjectMode::Human => dyns.human_r.max(0.25),
+        SubjectMode::Ball => dyns.ball_r.max(0.25),
+        SubjectMode::Auto | SubjectMode::Random => dyns.human_r.max(0.25),
+    };
+    let theta_rel = (dyns.theta - theta_eq + std::f32::consts::PI)
+        .rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+
+    // theta¨ = -(g/r) * sin(theta - theta_eq) - damping * theta˙
+    // Damping acts like friction along the tube wall.
+    let damping = match active_subject_mode {
+        SubjectMode::Human => 0.55,
+        SubjectMode::Ball => 0.35,
+        SubjectMode::Auto | SubjectMode::Random => 0.55,
+    };
+    // When the tangent is close to vertical, g_mag is small; add a small floor so it still
+    // responds during fast twists/loops (visual intent > strict physics).
+    let g_mag_eff = (g_mag + 0.12).min(4.0);
+    let theta_dd = -(GRAVITY * g_mag_eff / r_ring) * theta_rel.sin() - damping * dyns.omega;
+    dyns.omega += theta_dd * dt;
+    dyns.theta = (dyns.theta + dyns.omega * dt).rem_euclid(std::f32::consts::TAU);
+
+    let theta = dyns.theta;
     let offset = bf.nor * theta.cos() + bf.bin * theta.sin();
-    let subject_pos = center + offset * (WALL_R - SUBJECT_INSET);
+    // Tangent direction around the tube wall (d/dθ of offset).
+    let tube_wall_tangent = (-bf.nor * theta.sin() + bf.bin * theta.cos()).normalize_or_zero();
+
+    // Tube-wall contact + collision (radial) for both human and ball.
+    // Allow slight penetration (via spring), then bounce on collision.
+    // Use effective acceleration (gravity - inertial) so loops push/pull on the contact.
+    let a_out = eff_acc.dot(offset);
+
+    let human_r_max = (TUBE_RADIUS - HUMAN_RADIUS).max(0.25);
+    let human_r_rest = (human_r_max - CONTACT_EPS).max(0.25);
+    let k_h = 90.0;
+    let c_h = 14.0;
+
+    let human_r_prev = dyns.human_r;
+    let human_vr_prev = dyns.human_vr;
+    dyns.human_vr += (a_out - k_h * (dyns.human_r - human_r_rest) - c_h * dyns.human_vr) * dt;
+    dyns.human_r += dyns.human_vr * dt;
+    let mut human_hit_wall = false;
+    if dyns.human_r > human_r_max {
+        dyns.human_r = human_r_max;
+        if dyns.human_vr > 0.0 {
+            dyns.human_vr = -dyns.human_vr * 0.25;
+            human_hit_wall = true;
+        }
+    }
+    dyns.human_r = dyns.human_r.max(human_r_rest - 0.35);
+    // Also treat "slamming" into the limit as a hit even if the spring integration already
+    // flipped velocity before the clamp.
+    if !human_hit_wall {
+        let near_wall = dyns.human_r >= human_r_max - 0.0005;
+        let vr_flip = human_vr_prev > 0.6 && dyns.human_vr < -0.1;
+        let r_advanced = dyns.human_r > human_r_prev;
+        human_hit_wall = near_wall && vr_flip && r_advanced;
+    }
+
+    let ball_r_max = (TUBE_RADIUS - BALL_RADIUS).max(0.25);
+    let ball_r_rest = (ball_r_max - CONTACT_EPS).max(0.25);
+    let k_b = 60.0;
+    let c_b = 9.0;
+    dyns.ball_vr += (a_out - k_b * (dyns.ball_r - ball_r_rest) - c_b * dyns.ball_vr) * dt;
+    dyns.ball_r += dyns.ball_vr * dt;
+    if dyns.ball_r > ball_r_max {
+        dyns.ball_r = ball_r_max;
+        if dyns.ball_vr > 0.0 {
+            dyns.ball_vr = -dyns.ball_vr * 0.55;
+        }
+    }
+    dyns.ball_r = dyns.ball_r.max(ball_r_rest - 0.35);
+
+    let subject_pos_human = center + offset * dyns.human_r;
+    let subject_pos_ball = center + offset * dyns.ball_r;
 
     // The burn_human mesh is authored in a different basis than Bevy's default.
     // We apply the same corrective rotation used at spawn-time so the subject
     // doesn't end up edge-on ("flat") depending on where we are along the tube.
     let model_basis = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
 
-    let subject_up = (subject_pos - center).normalize_or_zero();
-    let subject_forward = bf.tan.normalize_or_zero();
+    let subject_up = offset.normalize_or_zero();
+    // Orientation should follow motion on the tube wall.
+    // Use the velocity computed above (curve advance) plus wall sliding.
+
+    let active_r = match active_subject_mode {
+        SubjectMode::Human => dyns.human_r,
+        SubjectMode::Ball => dyns.ball_r,
+        SubjectMode::Auto | SubjectMode::Random => dyns.human_r,
+    };
+    let v_wall = v_center + tube_wall_tangent * (dyns.omega * active_r);
+
+    // Use a tube-frame forward as the primary orientation anchor.
+    // Basing forward purely on instantaneous velocity makes the model/ball appear to
+    // "swim"/spin relative to the tube and camera when omega/velocity changes sign.
+    let tube_forward = (bf.tan - subject_up * bf.tan.dot(subject_up)).normalize_or_zero();
+    let vel_forward = (v_wall - subject_up * v_wall.dot(subject_up)).normalize_or_zero();
+
+    let mut subject_forward = tube_forward;
+    if subject_forward.length_squared() < 1e-6 {
+        subject_forward = tube_wall_tangent;
+    }
+    // Allow a small bias toward the actual motion direction when it's well-defined.
+    if vel_forward.length_squared() > 1e-6 {
+        subject_forward = tube_forward.lerp(vel_forward, 0.25).normalize_or_zero();
+        if subject_forward.length_squared() < 1e-6 {
+            subject_forward = vel_forward;
+        }
+    }
+
+    // Right/around direction on the surface.
+    let subject_around = subject_up.cross(subject_forward).normalize_or_zero();
+    // Re-orthonormalize.
+    subject_forward = subject_around.cross(subject_up).normalize_or_zero();
+
+    // Shared target orientation basis (surface frame).
+    let base_rot = Quat::from_mat3(&Mat3::from_cols(
+        subject_around,
+        subject_up,
+        subject_forward,
+    )) * model_basis;
+
+    // Bank into the sideways motion around the tube (visual "surfing" cue).
+    let bank = (dyns.omega * 0.22).clamp(-0.55, 0.55);
+    let desired_rot = Quat::from_axis_angle(subject_forward, bank) * base_rot;
+
+    // Human posture dynamics: allow the body to roll/pitch relative to the surface.
+    // This avoids the "always orthographic/upright" look (enables belly/back/sideways).
+    // Use effective acceleration components to drive posture, then smooth with critical damping.
+    match *pose_mode {
+        // Timeline pose: deterministic (not random).
+        PoseMode::Auto => {
+            auto_pose.current = timeline_pose_mode(t);
+        }
+        // Random pose controller:
+        // - randomly changes pose over time
+        // - on tube-wall impact, pick a pose based on which side hit (in model-local frame)
+        PoseMode::Random => {
+            auto_pose.since_switch_sec += dt;
+            auto_pose.collision_cooldown_sec = (auto_pose.collision_cooldown_sec - dt).max(0.0);
+
+            if human_hit_wall && auto_pose.collision_cooldown_sec <= 0.0 {
+                // "Hit direction" is outward from the tube center.
+                let world_hit_dir = subject_up;
+                // Convert to model-local using the current desired rotation (includes model basis).
+                let local_hit_dir = desired_rot.inverse() * world_hit_dir;
+                auto_pose.current = pose_from_local_hit_dir(local_hit_dir);
+                auto_pose.schedule_next_switch();
+                auto_pose.collision_cooldown_sec = 0.45;
+            } else if auto_pose.since_switch_sec >= auto_pose.next_switch_sec {
+                auto_pose.current = auto_pose.pick_random_pose();
+                auto_pose.schedule_next_switch();
+            }
+        }
+        _ => {}
+    }
+
+    let (posture_roll_target, posture_pitch_target) = match *pose_mode {
+        PoseMode::Auto | PoseMode::Random => pose_targets(auto_pose.current),
+        other => pose_targets(other),
+    };
+
+    let posture_rate = if matches!(*pose_mode, PoseMode::Auto | PoseMode::Random) {
+        16.0
+    } else {
+        14.0
+    };
+    let posture_alpha = 1.0 - (-posture_rate * dt).exp();
+    dyns.human_roll = dyns
+        .human_roll
+        .lerp(posture_roll_target, posture_alpha)
+        .clamp(-2.2, 2.2);
+    dyns.human_pitch = dyns
+        .human_pitch
+        .lerp(posture_pitch_target, posture_alpha)
+        .clamp(-1.2, 1.2);
+
+    // Roll about the direction of travel, pitch about the across-surface axis.
+    let human_posture = Quat::from_axis_angle(subject_forward, dyns.human_roll)
+        * Quat::from_axis_angle(subject_around, dyns.human_pitch);
+    // Mesh authored facing doesn't match our computed surface-forward; flip it so we
+    // don't end up watching the character's back the whole ride.
+    let human_facing_fix = Quat::from_axis_angle(subject_up, std::f32::consts::PI);
+    let desired_human_rot = human_facing_fix * (human_posture * desired_rot);
+
+    // Ball rolling: integrate roll based on surface speed.
+    let v_ball = v_center + tube_wall_tangent * (dyns.omega * dyns.ball_r);
+    let v_ball_plane = v_ball - subject_up * v_ball.dot(subject_up);
+    let mut ball_roll_axis = subject_around;
+    if v_ball_plane.length_squared() > 1e-6 {
+        let tangent_dir = v_ball_plane.normalize_or_zero();
+        let axis = subject_up.cross(tangent_dir).normalize_or_zero();
+        let sign = if axis.dot(subject_around) >= 0.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        let roll_rate = (v_ball_plane.length() / BALL_RADIUS) * sign;
+        dyns.ball_roll = (dyns.ball_roll + roll_rate * dt).rem_euclid(std::f32::consts::TAU);
+        if axis.length_squared() > 1e-6 {
+            ball_roll_axis = axis;
+        }
+    }
+    let desired_ball_rot = Quat::from_axis_angle(ball_roll_axis, dyns.ball_roll) * desired_rot;
 
     if let Ok(mut tr) = subject.single_mut() {
-        // Align forward to tangent, up to radial.
-        let up = subject_up;
-        let forward = subject_forward;
-        let right = forward.cross(up).normalize_or_zero();
-        let up = right.cross(forward).normalize_or_zero();
-        let rot = Quat::from_mat3(&Mat3::from_cols(right, up, forward));
+        let mut desired = desired_human_rot;
+        if tr.rotation.dot(desired) < 0.0 {
+            desired = -desired;
+        }
 
-        tr.translation = subject_pos;
-        tr.rotation = rot * model_basis;
+        tr.translation = tr.translation.lerp(subject_pos_human, pos_alpha);
+        tr.rotation = tr.rotation.slerp(desired, rot_alpha);
+    }
+
+    if let Ok(mut tr) = ball.single_mut() {
+        let mut desired = desired_ball_rot;
+        if tr.rotation.dot(desired) < 0.0 {
+            desired = -desired;
+        }
+        tr.translation = tr.translation.lerp(subject_pos_ball, pos_alpha);
+        tr.rotation = tr.rotation.slerp(desired, rot_alpha);
+    }
+
+    if let Ok(mut light_tr) = subject_light.single_mut() {
+        let active_pos = match active_subject_mode {
+            SubjectMode::Human => subject_pos_human,
+            SubjectMode::Ball => subject_pos_ball,
+            SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
+        };
+        let target = active_pos + subject_up * 0.9 - subject_forward * 0.6;
+        light_tr.translation = light_tr.translation.lerp(target, pos_alpha);
     }
 
     if let Ok(mut cam_tr) = cam.single_mut() {
-        let (pos, look, up) =
-            camera_pose(t, cam_center, look_ahead, cam_tangent, cam_n, cam_b, center, subject_pos, subject_forward, subject_up);
+        let (pos, look, up) = camera_pose(
+            t,
+            *camera_preset,
+            selected_camera_mode,
+            active_subject_mode,
+            cam_center,
+            look_ahead,
+            cam_tangent,
+            cam_n,
+            cam_b,
+            center,
+            subject_pos_human,
+            subject_pos_ball,
+            subject_forward,
+            subject_up,
+        );
 
-        // Smooth like the codepen.
-        cam_tr.translation = cam_tr.translation.lerp(pos, 0.20);
-        let mut desired = Transform::from_translation(pos).looking_at(look, up).rotation;
-        if cam_tr.rotation.dot(desired) < 0.0 {
-            desired = -desired;
+        let desired = Transform::from_translation(pos).looking_at(look, up);
+        let mut desired_rot = desired.rotation;
+        if cam_tr.rotation.dot(desired_rot) < 0.0 {
+            desired_rot = -desired_rot;
         }
-        cam_tr.rotation = cam_tr.rotation.slerp(desired, 0.20);
+
+        cam_tr.translation = cam_tr.translation.lerp(desired.translation, pos_alpha);
+        cam_tr.rotation = cam_tr.rotation.slerp(desired_rot, rot_alpha);
+    }
+}
+
+fn apply_subject_mode(
+    subject_mode: Res<SubjectMode>,
+    auto_subject: Res<AutoSubjectState>,
+    mut human_vis: Query<&mut Visibility, (With<SubjectTag>, Without<BallTag>)>,
+    mut ball_vis: Query<&mut Visibility, (With<BallTag>, Without<SubjectTag>)>,
+) {
+    if !subject_mode.is_changed() && !auto_subject.is_changed() {
+        return;
+    }
+
+    let active = match *subject_mode {
+        SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
+        _ => *subject_mode,
+    };
+
+    let (show_human, show_ball) = match active {
+        SubjectMode::Human => (true, false),
+        SubjectMode::Ball => (false, true),
+        SubjectMode::Auto | SubjectMode::Random => (true, false),
+    };
+
+    for mut v in &mut human_vis {
+        *v = if show_human {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+
+    for mut v in &mut ball_vis {
+        *v = if show_ball {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+}
+
+fn make_polkadot_texture() -> Image {
+    let size: u32 = 256;
+    let mut data = vec![0u8; (size * size * 4) as usize];
+
+    let spacing = 64.0_f32;
+    let radius = 18.0_f32;
+    let r2 = radius * radius;
+
+    for y in 0..size {
+        for x in 0..size {
+            let fx = x as f32 + 0.5;
+            let fy = y as f32 + 0.5;
+
+            // Nearest grid center.
+            let gx = (fx / spacing).round();
+            let gy = (fy / spacing).round();
+            let cx = gx * spacing;
+            let cy = gy * spacing;
+            let dx = fx - cx;
+            let dy = fy - cy;
+
+            let is_dot = dx * dx + dy * dy <= r2;
+            let (r, g, b) = if is_dot {
+                (40u8, 140u8, 255u8)
+            } else {
+                (255u8, 255u8, 255u8)
+            };
+
+            let i = ((y * size + x) * 4) as usize;
+            data[i] = r;
+            data[i + 1] = g;
+            data[i + 2] = b;
+            data[i + 3] = 255;
+        }
+    }
+
+    Image::new_fill(
+        Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    )
+}
+
+fn apply_appearance_preset(
+    mat: &mut StandardMaterial,
+    preset: AppearancePreset,
+    polkadot: &Handle<Image>,
+) {
+    mat.metallic = 0.0;
+    mat.cull_mode = None;
+    mat.base_color_texture = None;
+
+    match preset {
+        AppearancePreset::BlueGlass => {
+            mat.base_color = Color::srgb(0.45, 0.82, 1.0).with_alpha(0.35);
+            mat.reflectance = 0.95;
+            mat.perceptual_roughness = 0.04;
+            mat.alpha_mode = AlphaMode::Blend;
+        }
+        AppearancePreset::OpaqueWhite => {
+            mat.base_color = Color::srgb(0.95, 0.95, 0.95);
+            mat.reflectance = 0.45;
+            mat.perceptual_roughness = 0.65;
+            mat.alpha_mode = AlphaMode::Opaque;
+        }
+        AppearancePreset::Blue => {
+            mat.base_color = Color::srgb(0.12, 0.38, 1.0);
+            mat.reflectance = 0.60;
+            mat.perceptual_roughness = 0.35;
+            mat.alpha_mode = AlphaMode::Opaque;
+        }
+        AppearancePreset::Polkadot => {
+            mat.base_color = Color::srgb(1.0, 1.0, 1.0);
+            mat.base_color_texture = Some(polkadot.clone());
+            mat.reflectance = 0.40;
+            mat.perceptual_roughness = 0.60;
+            mat.alpha_mode = AlphaMode::Opaque;
+        }
+        AppearancePreset::MatteLightBlue => {
+            mat.base_color = Color::srgb(0.58, 0.80, 0.98);
+            mat.reflectance = 0.35;
+            mat.perceptual_roughness = 0.85;
+            mat.alpha_mode = AlphaMode::Opaque;
+        }
+        AppearancePreset::Wireframe => {
+            // Actual wireframe rendering is controlled via `Wireframe` component;
+            // keep a stable base color here.
+            mat.base_color = Color::srgb(0.95, 0.95, 0.95);
+            mat.reflectance = 0.40;
+            mat.perceptual_roughness = 0.65;
+            mat.alpha_mode = AlphaMode::Opaque;
+        }
+    }
+}
+
+fn timeline_human_appearance(video_time_sec: f32) -> AppearancePreset {
+    // Deterministic and simple.
+    let cycle = 14.0;
+    let u = video_time_sec.rem_euclid(cycle);
+    if u < 3.5 {
+        AppearancePreset::OpaqueWhite
+    } else if u < 7.0 {
+        AppearancePreset::MatteLightBlue
+    } else if u < 10.5 {
+        AppearancePreset::Polkadot
+    } else if u < 11.0 {
+        AppearancePreset::Blue
+    } else {
+        AppearancePreset::BlueGlass
+    }
+}
+
+fn timeline_ball_appearance(video_time_sec: f32) -> AppearancePreset {
+    // Keep the ball mostly "blue glass".
+    let cycle = 14.0;
+    let u = video_time_sec.rem_euclid(cycle);
+    if u > 11.0 {
+        AppearancePreset::BlueGlass
+    } else if u > 7.0 {
+        AppearancePreset::Polkadot
+    } else {
+        AppearancePreset::BlueGlass
+    }
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn update_subject_appearance(
+    mut commands: Commands,
+    playback: Res<Playback>,
+    time: Res<Time>,
+    textures: Res<AppearanceTextures>,
+    human_mode: Res<HumanAppearanceMode>,
+    ball_mode: Res<BallAppearanceMode>,
+    mut auto_human: ResMut<AutoHumanAppearanceState>,
+    mut auto_ball: ResMut<AutoBallAppearanceState>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    human_mat: Query<
+        (Entity, &MeshMaterial3d<StandardMaterial>),
+        (With<SubjectTag>, Without<BallTag>),
+    >,
+    ball_mat: Query<(Entity, &MeshMaterial3d<StandardMaterial>), With<BallTag>>,
+) {
+    let t = playback.time_sec;
+    let dt = time.delta_secs().min(0.1);
+
+    if human_mode.is_changed() && matches!(human_mode.0, AppearanceMode::Random) {
+        auto_human.0.schedule_next_switch();
+    }
+    if ball_mode.is_changed() && matches!(ball_mode.0, AppearanceMode::Random) {
+        auto_ball.0.schedule_next_switch();
+    }
+
+    let human_preset = match human_mode.0 {
+        AppearanceMode::Auto => {
+            auto_human.0.current = timeline_human_appearance(t);
+            auto_human.0.current
+        }
+        AppearanceMode::Random => {
+            auto_human.0.since_switch_sec += dt;
+            if auto_human.0.since_switch_sec >= auto_human.0.next_switch_sec {
+                auto_human.0.current = auto_human.0.pick_next_preset();
+                auto_human.0.schedule_next_switch();
+            }
+            auto_human.0.current
+        }
+        other => {
+            let p = other.preset().unwrap_or(AppearancePreset::OpaqueWhite);
+            auto_human.0.current = p;
+            p
+        }
+    };
+
+    let ball_preset = match ball_mode.0 {
+        AppearanceMode::Auto => {
+            auto_ball.0.current = timeline_ball_appearance(t);
+            auto_ball.0.current
+        }
+        AppearanceMode::Random => {
+            auto_ball.0.since_switch_sec += dt;
+            if auto_ball.0.since_switch_sec >= auto_ball.0.next_switch_sec {
+                auto_ball.0.current = auto_ball.0.pick_next_preset();
+                auto_ball.0.schedule_next_switch();
+            }
+            auto_ball.0.current
+        }
+        other => {
+            let p = other.preset().unwrap_or(AppearancePreset::BlueGlass);
+            auto_ball.0.current = p;
+            p
+        }
+    };
+
+    if let Some((e, h)) = human_mat.iter().next() {
+        if let Some(mat) = materials.get_mut(&h.0) {
+            apply_appearance_preset(mat, human_preset, &textures.polkadot);
+        }
+
+        if human_preset == AppearancePreset::Wireframe {
+            commands.entity(e).insert((
+                bevy::pbr::wireframe::Wireframe,
+                bevy::pbr::wireframe::WireframeColor {
+                    color: Color::srgb(0.95, 0.95, 0.95),
+                },
+            ));
+        } else {
+            commands.entity(e).remove::<(
+                bevy::pbr::wireframe::Wireframe,
+                bevy::pbr::wireframe::WireframeColor,
+            )>();
+        }
+    }
+
+    if let Some((e, h)) = ball_mat.iter().next() {
+        if let Some(mat) = materials.get_mut(&h.0) {
+            apply_appearance_preset(mat, ball_preset, &textures.polkadot);
+        }
+
+        if ball_preset == AppearancePreset::Wireframe {
+            commands.entity(e).insert((
+                bevy::pbr::wireframe::Wireframe,
+                bevy::pbr::wireframe::WireframeColor {
+                    color: Color::srgb(0.20, 0.60, 1.0),
+                },
+            ));
+        } else {
+            commands.entity(e).remove::<(
+                bevy::pbr::wireframe::Wireframe,
+                bevy::pbr::wireframe::WireframeColor,
+            )>();
+        }
     }
 }
 
@@ -2922,6 +4743,7 @@ fn update_overlays(
     mut state: ResMut<OverlayState>,
     mut overlay_text: ResMut<OverlayText>,
     overlay_vis: Res<OverlayVisibility>,
+    caption_vis: Res<CaptionVisibility>,
     #[cfg(not(target_arch = "wasm32"))] mut window: Query<&mut Window, With<PrimaryWindow>>,
 ) {
     let t = playback.time_sec;
@@ -2929,6 +4751,11 @@ fn update_overlays(
     let visible_changed = state.last_visible != overlay_vis.show;
     if visible_changed {
         state.last_visible = overlay_vis.show;
+    }
+
+    let caption_visible_changed = state.last_caption_visible != caption_vis.show;
+    if caption_visible_changed {
+        state.last_caption_visible = caption_vis.show;
     }
 
     let c_idx = find_opening_credit(t);
@@ -2992,39 +4819,86 @@ fn update_overlays(
     // On wasm we render overlays in the DOM (see `www/index.html`).
     #[cfg(target_arch = "wasm32")]
     {
-        if visible_changed || credit_changed || caption_changed {
-            // Note: if the overlay is hidden, send `show=false` so JS clears it.
-            let show = overlay_vis.show;
+        if visible_changed || caption_visible_changed || credit_changed || caption_changed {
+            // Credits are independent from the egui overlay UI.
+            let credit_show = true;
+            // Captions are independent from the egui overlay UI.
+            let caption_show = caption_vis.show;
 
             if c_idx < 0 {
                 mcbaise_set_credit("", false);
             } else {
-                mcbaise_set_credit(opening_credit_html(c_idx as usize), show);
+                mcbaise_set_credit(opening_credit_html(c_idx as usize), credit_show);
             }
 
             if l_idx < 0 {
                 mcbaise_set_caption("", false, false);
             } else {
                 let cue = &cues[l_idx as usize];
-                mcbaise_set_caption(&cue.text, show, cue.is_meta);
+                mcbaise_set_caption(&cue.text, caption_show, cue.is_meta);
             }
         }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
+#[derive(SystemParam)]
+struct UiOverlayParams<'w, 's> {
+    commands: Commands<'w, 's>,
+    egui_contexts: EguiContexts<'w, 's>,
+    overlay_text: Res<'w, OverlayText>,
+    overlay_vis: ResMut<'w, OverlayVisibility>,
+    caption_vis: ResMut<'w, CaptionVisibility>,
+    playback: ResMut<'w, Playback>,
+    settings: ResMut<'w, TubeSettings>,
+    scheme_mode: ResMut<'w, ColorSchemeMode>,
+    pattern_mode: ResMut<'w, TexturePatternMode>,
+    subject_mode: ResMut<'w, SubjectMode>,
+    human_appearance: ResMut<'w, HumanAppearanceMode>,
+    ball_appearance: ResMut<'w, BallAppearanceMode>,
+    pose_mode: ResMut<'w, PoseMode>,
+    camera_preset: ResMut<'w, CameraPreset>,
+    auto_pose: Res<'w, AutoPoseState>,
+    auto_cam: Res<'w, AutoCameraState>,
+    auto_subject: Res<'w, AutoSubjectState>,
+    auto_style: Res<'w, AutoTubeStyleState>,
+    auto_human_appearance: Res<'w, AutoHumanAppearanceState>,
+    auto_ball_appearance: Res<'w, AutoBallAppearanceState>,
+    overlay_state: Res<'w, OverlayState>,
+    _native_youtube: Option<Res<'w, NativeYoutubeSync>>,
+    _native_youtube_cfg: Option<Res<'w, NativeYoutubeConfig>>,
+    _native_mpv: Option<Res<'w, NativeMpvSync>>,
+    _native_mpv_cfg: Option<Res<'w, NativeMpvConfig>>,
+}
+
 fn ui_overlay(
-    mut commands: Commands,
-    mut egui_contexts: EguiContexts,
-    overlay_text: Res<OverlayText>,
-    mut overlay_vis: ResMut<OverlayVisibility>,
-    mut playback: ResMut<Playback>,
-    mut settings: ResMut<TubeSettings>,
-    overlay_state: Res<OverlayState>,
-    _native_youtube: Option<Res<NativeYoutubeSync>>,
-    _native_youtube_cfg: Option<Res<NativeYoutubeConfig>>,
-    _native_mpv: Option<Res<NativeMpvSync>>,
-    _native_mpv_cfg: Option<Res<NativeMpvConfig>>,
+    UiOverlayParams {
+        mut commands,
+        mut egui_contexts,
+        overlay_text,
+        mut overlay_vis,
+        mut caption_vis,
+        mut playback,
+        mut settings,
+        mut scheme_mode,
+        mut pattern_mode,
+        mut subject_mode,
+        mut human_appearance,
+        mut ball_appearance,
+        mut pose_mode,
+        mut camera_preset,
+        auto_pose,
+        auto_cam,
+        auto_subject,
+        auto_style,
+        auto_human_appearance,
+        auto_ball_appearance,
+        overlay_state,
+        _native_youtube,
+        _native_youtube_cfg,
+        _native_mpv,
+        _native_mpv_cfg,
+    }: UiOverlayParams,
 ) {
     let Ok(ctx) = egui_contexts.ctx_mut() else {
         return;
@@ -3039,91 +4913,452 @@ fn ui_overlay(
     #[cfg(not(any(feature = "native-youtube", feature = "native-mpv")))]
     let _ = &mut commands;
 
-    egui::Window::new("mcbaise_overlay")
-        .title_bar(false)
-        .resizable(false)
-        .collapsible(false)
-        .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
-        .show(ctx, |ui| {
-            ui.label(format!("{VIDEO_ID} • tube ride"));
+    if !overlay_vis.show {
+        egui::Area::new(egui::Id::new("mcbaise_overlay_restore_pi"))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+            .show(ctx, |ui| {
+                // Draw a simple pi glyph ourselves so we don't depend on font glyph availability.
+                let desired = egui::vec2(28.0, 28.0);
+                let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+                let stroke = egui::Stroke::new(
+                    2.2,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220),
+                );
+                let pad = 6.0;
+                let x0 = rect.left() + pad;
+                let x1 = rect.right() - pad;
+                let y0 = rect.top() + pad;
+                let y1 = rect.bottom() - pad;
+                let y_top = y0 + 3.0;
+                let y_bot = y1;
+                let leg_w = 3.5;
+                let left_leg_x = x0 + leg_w;
+                let right_leg_x = x1 - leg_w;
+                let painter = ui.painter();
+                painter.line_segment([egui::pos2(x0, y_top), egui::pos2(x1, y_top)], stroke);
+                painter.line_segment(
+                    [egui::pos2(left_leg_x, y_top), egui::pos2(left_leg_x, y_bot)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [
+                        egui::pos2(right_leg_x, y_top),
+                        egui::pos2(right_leg_x, y_bot),
+                    ],
+                    stroke,
+                );
 
-            let toggle_label = if overlay_vis.show {
-                "Hide overlay + captions"
-            } else {
-                "Show overlay + captions"
-            };
-            if ui.button(toggle_label).clicked() {
-                overlay_vis.show = !overlay_vis.show;
+                if resp.hovered() {
+                    painter.rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if resp.clicked() {
+                    overlay_vis.show = true;
 
-                #[cfg(target_arch = "wasm32")]
-                {
-                    // Keep JS in sync immediately (otherwise it would wait for the next
-                    // `update_overlays` state change).
-                    let show = overlay_vis.show;
-                    let t = playback.time_sec;
-                    let c_idx = find_opening_credit(t);
-                    if c_idx < 0 {
-                        mcbaise_set_credit("", false);
-                    } else {
-                        mcbaise_set_credit(opening_credit_html(c_idx as usize), show);
-                    }
-
-                    let cues = lyric_cues();
-                    let l_idx = find_cue_index(cues, t);
-                    if l_idx < 0 {
-                        mcbaise_set_caption("", false, false);
-                    } else {
-                        let cue = &cues[l_idx as usize];
-                        mcbaise_set_caption(&cue.text, show, cue.is_meta);
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        // Keep JS in sync immediately.
+                        let t = playback.time_sec;
+                        let cues = lyric_cues();
+                        let l_idx = find_cue_index(cues, t);
+                        let caption_show = caption_vis.show;
+                        if l_idx < 0 {
+                            mcbaise_set_caption("", false, false);
+                        } else {
+                            let cue = &cues[l_idx as usize];
+                            mcbaise_set_caption(&cue.text, caption_show, cue.is_meta);
+                        }
                     }
                 }
-            }
+            });
+    }
 
-            ui.separator();
+    if overlay_vis.show {
+        egui::Window::new("mcbaise_overlay")
+            .title_bar(false)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
+            .show(ctx, |ui| {
+                ui.label(format!("{VIDEO_ID} • tube ride"));
 
-            #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
-            {
-                if let Some(cfg) = _native_youtube_cfg.as_ref() {
-                    let connected = _native_youtube.as_ref().map(|yt| yt.enabled).unwrap_or(false);
+                ui.horizontal(|ui| {
+                    if ui.button("Hide overlay").clicked() {
+                        overlay_vis.show = false;
 
-                    if let Some(yt) = _native_youtube.as_ref() {
-                        if let Ok(slot) = yt.last_error.lock() {
-                            if let Some(err) = slot.as_ref() {
-                                ui.label(format!("YouTube: {err}"));
-                            }
-                        }
-
-                        ui.label(format!("t≈{:.2}s", playback.time_sec));
-                        if yt.in_ad {
-                            if let Some(label) = yt.ad_label.as_deref() {
-                                ui.label(format!("Ad: {label}"));
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            // Keep captions in sync immediately (credits are independent).
+                            let t = playback.time_sec;
+                            let cues = lyric_cues();
+                            let l_idx = find_cue_index(cues, t);
+                            if l_idx < 0 {
+                                mcbaise_set_caption("", false, false);
                             } else {
-                                ui.label("Ad: playing");
+                                let cue = &cues[l_idx as usize];
+                                mcbaise_set_caption(&cue.text, caption_vis.show, cue.is_meta);
                             }
                         }
                     }
 
-                    if !connected {
-                        let label = if _native_youtube.is_some() {
-                            "Restart Browser"
-                        } else {
-                            "Start Browser"
-                        };
+                    let caption_toggle_label = if caption_vis.show {
+                        "Hide captions"
+                    } else {
+                        "Show captions"
+                    };
 
-                        if ui.button(label).clicked() {
-                            if let Some(yt) = _native_youtube.as_ref() {
-                                let _ = yt.tx.send(crate::native_youtube::Command::Shutdown);
+                    if ui.button(caption_toggle_label).clicked() {
+                        caption_vis.show = !caption_vis.show;
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            // Keep JS in sync immediately.
+                            let t = playback.time_sec;
+                            let cues = lyric_cues();
+                            let l_idx = find_cue_index(cues, t);
+                            if l_idx < 0 {
+                                mcbaise_set_caption("", false, false);
+                            } else {
+                                let cue = &cues[l_idx as usize];
+                                mcbaise_set_caption(&cue.text, caption_vis.show, cue.is_meta);
+                            }
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Subject")
+                        .selected_text(match *subject_mode {
+                            SubjectMode::Auto => {
+                                format!("Subject: auto ({})", auto_subject.current.short_label())
+                            }
+                            SubjectMode::Random => {
+                                format!("Subject: random ({})", auto_subject.current.short_label())
+                            }
+                            _ => subject_mode.label().to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::Auto,
+                                SubjectMode::Auto.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::Random,
+                                SubjectMode::Random.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::Human,
+                                SubjectMode::Human.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::Ball,
+                                SubjectMode::Ball.label(),
+                            );
+                        });
+
+                    egui::ComboBox::from_label("Pose")
+                        .selected_text(match *pose_mode {
+                            PoseMode::Auto => {
+                                format!("Pose: auto ({})", auto_pose.current.short_label())
+                            }
+                            PoseMode::Random => {
+                                format!("Pose: random ({})", auto_pose.current.short_label())
+                            }
+                            _ => pose_mode.label().to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::Auto,
+                                PoseMode::Auto.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::Random,
+                                PoseMode::Random.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::Standing,
+                                PoseMode::Standing.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::Belly,
+                                PoseMode::Belly.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::Back,
+                                PoseMode::Back.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::LeftSide,
+                                PoseMode::LeftSide.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pose_mode,
+                                PoseMode::RightSide,
+                                PoseMode::RightSide.label(),
+                            );
+                        });
+
+                    egui::ComboBox::from_label("Camera")
+                        .selected_text(match *camera_preset {
+                            CameraPreset::Auto => {
+                                format!("Camera: auto ({})", auto_cam.current.label())
+                            }
+                            CameraPreset::Random => {
+                                format!("Camera: random ({})", auto_cam.current.label())
+                            }
+                            _ => camera_preset.label().to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            let before = *camera_preset;
+                            for (value, label) in CameraPreset::choices() {
+                                ui.selectable_value(&mut *camera_preset, value, label);
                             }
 
-                            let (tx, rx, join) = crate::native_youtube::spawn(
-                                VIDEO_ID,
-                                &cfg.webdriver_url,
-                                cfg.launch_webdriver,
-                                cfg.chrome_user_data_dir.clone(),
-                                cfg.chrome_profile_dir.clone(),
-                            );
+                            // Only these presets imply switching the active subject.
+                            if *camera_preset != before {
+                                match *camera_preset {
+                                    CameraPreset::FollowHumanChase => {
+                                        *subject_mode = SubjectMode::Human
+                                    }
+                                    CameraPreset::FollowBallChase => {
+                                        *subject_mode = SubjectMode::Ball
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        });
+                });
 
-                            commands.insert_resource(NativeYoutubeSync {
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Human")
+                        .selected_text(match human_appearance.0 {
+                            AppearanceMode::Auto => {
+                                format!("Human: auto ({})", auto_human_appearance.0.current.label())
+                            }
+                            AppearanceMode::Random => format!(
+                                "Human: random ({})",
+                                auto_human_appearance.0.current.label()
+                            ),
+                            m => format!("Human: {}", m.label()),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::Auto,
+                                "auto",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::Random,
+                                "random",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::BlueGlass,
+                                "blue glass",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::OpaqueWhite,
+                                "opaque white",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::Blue,
+                                "blue",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::Polkadot,
+                                "polkadot",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::MatteLightBlue,
+                                "matte light blue",
+                            );
+                            ui.selectable_value(
+                                &mut human_appearance.0,
+                                AppearanceMode::Wireframe,
+                                "wireframe",
+                            );
+                        });
+
+                    egui::ComboBox::from_label("Ball")
+                        .selected_text(match ball_appearance.0 {
+                            AppearanceMode::Auto => {
+                                format!("Ball: auto ({})", auto_ball_appearance.0.current.label())
+                            }
+                            AppearanceMode::Random => {
+                                format!("Ball: random ({})", auto_ball_appearance.0.current.label())
+                            }
+                            m => format!("Ball: {}", m.label()),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::Auto,
+                                "auto",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::Random,
+                                "random",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::BlueGlass,
+                                "blue glass",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::OpaqueWhite,
+                                "opaque white",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::Blue,
+                                "blue",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::Polkadot,
+                                "polkadot",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::MatteLightBlue,
+                                "matte light blue",
+                            );
+                            ui.selectable_value(
+                                &mut ball_appearance.0,
+                                AppearanceMode::Wireframe,
+                                "wireframe",
+                            );
+                        });
+                });
+
+                ui.separator();
+
+                #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+                {
+                    if let Some(cfg) = _native_youtube_cfg.as_ref() {
+                        let connected = _native_youtube
+                            .as_ref()
+                            .map(|yt| yt.enabled)
+                            .unwrap_or(false);
+
+                        if let Some(yt) = _native_youtube.as_ref() {
+                            if let Ok(slot) = yt.last_error.lock()
+                                && let Some(err) = slot.as_ref()
+                            {
+                                ui.label(format!("YouTube: {err}"));
+                            }
+
+                            ui.label(format!("t≈{:.2}s", playback.time_sec));
+                            if yt.in_ad {
+                                if let Some(label) = yt.ad_label.as_deref() {
+                                    ui.label(format!("Ad: {label}"));
+                                } else {
+                                    ui.label("Ad: playing");
+                                }
+                            }
+                        }
+
+                        if !connected {
+                            let label = if _native_youtube.is_some() {
+                                "Restart Browser"
+                            } else {
+                                "Start Browser"
+                            };
+
+                            if ui.button(label).clicked() {
+                                if let Some(yt) = _native_youtube.as_ref() {
+                                    let _ = yt.tx.send(crate::native_youtube::Command::Shutdown);
+                                }
+
+                                let (tx, rx, join) = crate::native_youtube::spawn(
+                                    VIDEO_ID,
+                                    &cfg.webdriver_url,
+                                    cfg.launch_webdriver,
+                                    cfg.chrome_user_data_dir.clone(),
+                                    cfg.chrome_profile_dir.clone(),
+                                );
+
+                                commands.insert_resource(NativeYoutubeSync {
+                                    enabled: true,
+                                    tx,
+                                    rx: std::sync::Mutex::new(rx),
+                                    join: std::sync::Mutex::new(Some(join)),
+                                    last_error: std::sync::Mutex::new(None),
+
+                                    has_remote: false,
+                                    last_remote_time_sec: 0.0,
+                                    last_remote_playing: false,
+                                    sample_age_sec: 0.0,
+                                    remote_age_sec: 0.0,
+                                    interp_time_sec: 0.0,
+
+                                    in_ad: false,
+                                    ad_label: None,
+                                    last_good_time_sec: 0.0,
+                                    pending_seek_after_ad: false,
+                                    ad_nudge_cooldown_sec: 0.0,
+
+                                    heal_cooldown_sec: 0.0,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
+                {
+                    if let Some(cfg) = _native_mpv_cfg.as_ref() {
+                        let connected = _native_mpv.as_ref().map(|m| m.has_remote).unwrap_or(false);
+
+                        if let Some(mpv) = _native_mpv.as_ref() {
+                            if let Ok(slot) = mpv.last_error.lock() {
+                                if let Some(err) = slot.as_ref() {
+                                    ui.label(format!("mpv: {err}"));
+                                }
+                            }
+                            ui.label(format!("t≈{:.2}s", playback.time_sec));
+                        }
+
+                        let label = if connected {
+                            "Restart mpv"
+                        } else {
+                            "Start/Restart mpv"
+                        };
+                        if ui.button(label).clicked() {
+                            if let Some(mpv) = _native_mpv.as_ref() {
+                                let _ = mpv.tx.send(crate::native_mpv::Command::Shutdown);
+                            }
+
+                            let (tx, rx, join) = crate::native_mpv::spawn(
+                                cfg.url.clone(),
+                                cfg.mpv_path.clone(),
+                                cfg.extra_args.clone(),
+                            );
+                            commands.insert_resource(NativeMpvSync {
                                 enabled: true,
                                 tx,
                                 rx: std::sync::Mutex::new(rx),
@@ -3134,104 +5369,60 @@ fn ui_overlay(
                                 last_remote_time_sec: 0.0,
                                 last_remote_playing: false,
                                 sample_age_sec: 0.0,
-                                remote_age_sec: 0.0,
                                 interp_time_sec: 0.0,
-
-                                in_ad: false,
-                                ad_label: None,
-                                last_good_time_sec: 0.0,
-                                pending_seek_after_ad: false,
-                                ad_nudge_cooldown_sec: 0.0,
-
-                                heal_cooldown_sec: 0.0,
                             });
                         }
                     }
                 }
-            }
 
-            #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
-            {
-                if let Some(cfg) = _native_mpv_cfg.as_ref() {
-                    let connected = _native_mpv.as_ref().map(|m| m.has_remote).unwrap_or(false);
-
-                    if let Some(mpv) = _native_mpv.as_ref() {
-                        if let Ok(slot) = mpv.last_error.lock() {
-                            if let Some(err) = slot.as_ref() {
-                                ui.label(format!("mpv: {err}"));
-                            }
+                ui.horizontal(|ui| {
+                    let yt_authoritative = {
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+                        {
+                            _native_youtube
+                                .as_ref()
+                                .map(|yt| yt.enabled)
+                                .unwrap_or(false)
                         }
-                        ui.label(format!("t≈{:.2}s", playback.time_sec));
-                    }
+                        #[cfg(not(all(not(target_arch = "wasm32"), feature = "native-youtube")))]
+                        {
+                            false
+                        }
+                    };
 
-                    let label = if connected { "Restart mpv" } else { "Start/Restart mpv" };
+                    let mpv_authoritative = {
+                        #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
+                        {
+                            _native_mpv
+                                .as_ref()
+                                .map(|m| m.enabled && m.has_remote)
+                                .unwrap_or(false)
+                        }
+                        #[cfg(not(all(
+                            windows,
+                            not(target_arch = "wasm32"),
+                            feature = "native-mpv"
+                        )))]
+                        {
+                            false
+                        }
+                    };
+
+                    let authoritative = yt_authoritative || mpv_authoritative;
+
+                    let desired_playing = !playback.playing;
+                    let label = if playback.playing { "Pause" } else { "Play" };
                     if ui.button(label).clicked() {
-                        if let Some(mpv) = _native_mpv.as_ref() {
-                            let _ = mpv.tx.send(crate::native_mpv::Command::Shutdown);
-                        }
+                        playback.playing = desired_playing;
 
-                        let (tx, rx, join) = crate::native_mpv::spawn(
-                            cfg.url.clone(),
-                            cfg.mpv_path.clone(),
-                            cfg.extra_args.clone(),
-                        );
-                        commands.insert_resource(NativeMpvSync {
-                            enabled: true,
-                            tx,
-                            rx: std::sync::Mutex::new(rx),
-                            join: std::sync::Mutex::new(Some(join)),
-                            last_error: std::sync::Mutex::new(None),
-
-                            has_remote: false,
-                            last_remote_time_sec: 0.0,
-                            last_remote_playing: false,
-                            sample_age_sec: 0.0,
-                            interp_time_sec: 0.0,
-                        });
-                    }
-                }
-            }
-
-            ui.horizontal(|ui| {
-                let yt_authoritative = {
-                    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
-                    {
-                        _native_youtube.as_ref().map(|yt| yt.enabled).unwrap_or(false)
-                    }
-                    #[cfg(not(all(not(target_arch = "wasm32"), feature = "native-youtube")))]
-                    {
-                        false
-                    }
-                };
-
-                let mpv_authoritative = {
-                    #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
-                    {
-                        _native_mpv
-                            .as_ref()
-                            .map(|m| m.enabled && m.has_remote)
-                            .unwrap_or(false)
-                    }
-                    #[cfg(not(all(windows, not(target_arch = "wasm32"), feature = "native-mpv")))]
-                    {
-                        false
-                    }
-                };
-
-                let authoritative = yt_authoritative || mpv_authoritative;
-
-                let desired_playing = !playback.playing;
-                let label = if playback.playing { "Pause" } else { "Play" };
-                if ui.button(label).clicked() {
-                    playback.playing = desired_playing;
-
-                    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
-                    {
-                        if let Some(yt) = _native_youtube.as_ref() {
-                            if yt.enabled {
-                                let _ = yt
-                                    .tx
-                                    .send(crate::native_youtube::Command::SetPlaying(desired_playing));
+                        #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+                        {
+                            if let Some(yt) = _native_youtube.as_ref()
+                                && yt.enabled
+                            {
+                                let _ = yt.tx.send(crate::native_youtube::Command::SetPlaying(
+                                    desired_playing,
+                                ));
 
                                 // If the page is stuck (no fresh samples), pressing Play should attempt recovery.
                                 if desired_playing && yt.sample_age_sec > 2.0 {
@@ -3240,59 +5431,193 @@ fn ui_overlay(
                                     } else {
                                         playback.time_sec
                                     };
-                                    let _ = yt.tx.send(crate::native_youtube::Command::ReloadAndSeek {
-                                        time_sec: seek_to,
-                                        playing: true,
-                                    });
+                                    let _ =
+                                        yt.tx.send(crate::native_youtube::Command::ReloadAndSeek {
+                                            time_sec: seek_to,
+                                            playing: true,
+                                        });
                                 }
                             }
                         }
-                    }
 
-                    #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
-                    {
-                        if let Some(mpv) = _native_mpv.as_ref() {
-                            if mpv.enabled {
-                                let _ = mpv
-                                    .tx
-                                    .send(crate::native_mpv::Command::SetPlaying(desired_playing));
+                        #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
+                        {
+                            if let Some(mpv) = _native_mpv.as_ref() {
+                                if mpv.enabled {
+                                    let _ = mpv.tx.send(crate::native_mpv::Command::SetPlaying(
+                                        desired_playing,
+                                    ));
+                                }
                             }
+                        }
+
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            mcbaise_request_playing(desired_playing);
                         }
                     }
 
-                    #[cfg(target_arch = "wasm32")]
-                    {
-                        mcbaise_request_playing(desired_playing);
-                    }
-                }
-
-                if authoritative {
-                    ui.label(if yt_authoritative {
-                        "Speed: YouTube (authoritative)"
+                    if authoritative {
+                        ui.label(if yt_authoritative {
+                            "Speed: YouTube (authoritative)"
+                        } else {
+                            "Speed: mpv (authoritative)"
+                        });
+                        playback.speed = 1.0;
                     } else {
-                        "Speed: mpv (authoritative)"
-                    });
-                    playback.speed = 1.0;
-                } else {
-                    ui.label(format!("Speed: {:.2}x", playback.speed));
-                    if ui.button("-").clicked() {
-                        playback.speed = (playback.speed - 0.25).clamp(0.25, 3.0);
+                        ui.label(format!("Speed: {:.2}x", playback.speed));
+                        if ui.button("-").clicked() {
+                            playback.speed = (playback.speed - 0.25).clamp(0.25, 3.0);
+                        }
+                        if ui.button("+").clicked() {
+                            playback.speed = (playback.speed + 0.25).clamp(0.25, 3.0);
+                        }
                     }
-                    if ui.button("+").clicked() {
-                        playback.speed = (playback.speed + 0.25).clamp(0.25, 3.0);
-                    }
-                }
-            });
+                });
 
-            ui.horizontal(|ui| {
-                if ui.button("Toggle Colors").clicked() {
-                    settings.scheme = (settings.scheme + 1) % 2;
-                }
-                if ui.button("Toggle Texture").clicked() {
-                    settings.pattern = (settings.pattern + 1) % 2;
-                }
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_label("Colors")
+                        .selected_text(match *scheme_mode {
+                            ColorSchemeMode::Auto => format!(
+                                "Colors: auto ({})",
+                                ColorSchemeMode::short_label_from_value(auto_style.scheme_current)
+                            ),
+                            ColorSchemeMode::Random => format!(
+                                "Colors: random ({})",
+                                ColorSchemeMode::short_label_from_value(auto_style.scheme_current)
+                            ),
+                            _ => scheme_mode.label().to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut *scheme_mode,
+                                ColorSchemeMode::Auto,
+                                ColorSchemeMode::Auto.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *scheme_mode,
+                                ColorSchemeMode::Random,
+                                ColorSchemeMode::Random.label(),
+                            );
+
+                            if ui
+                                .selectable_value(
+                                    &mut *scheme_mode,
+                                    ColorSchemeMode::OrangeWhite,
+                                    ColorSchemeMode::OrangeWhite.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.scheme = 0;
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut *scheme_mode,
+                                    ColorSchemeMode::Nin,
+                                    ColorSchemeMode::Nin.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.scheme = 1;
+                            }
+
+                            if ui
+                                .selectable_value(
+                                    &mut *scheme_mode,
+                                    ColorSchemeMode::BlackWhite,
+                                    ColorSchemeMode::BlackWhite.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.scheme = 2;
+                            }
+
+                            if ui
+                                .selectable_value(
+                                    &mut *scheme_mode,
+                                    ColorSchemeMode::RandomGrey,
+                                    ColorSchemeMode::RandomGrey.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.scheme = 3;
+                            }
+                        });
+
+                    egui::ComboBox::from_label("Texture")
+                        .selected_text(match *pattern_mode {
+                            TexturePatternMode::Auto => format!(
+                                "Texture: auto ({})",
+                                TexturePatternMode::short_label_from_value(
+                                    auto_style.pattern_current
+                                )
+                            ),
+                            TexturePatternMode::Random => format!(
+                                "Texture: random ({})",
+                                TexturePatternMode::short_label_from_value(
+                                    auto_style.pattern_current
+                                )
+                            ),
+                            _ => pattern_mode.label().to_string(),
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut *pattern_mode,
+                                TexturePatternMode::Auto,
+                                TexturePatternMode::Auto.label(),
+                            );
+                            ui.selectable_value(
+                                &mut *pattern_mode,
+                                TexturePatternMode::Random,
+                                TexturePatternMode::Random.label(),
+                            );
+
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Stripe,
+                                    TexturePatternMode::Stripe.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.pattern = 0;
+                            }
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Swirl,
+                                    TexturePatternMode::Swirl.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.pattern = 1;
+                            }
+
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::StripeWire,
+                                    TexturePatternMode::StripeWire.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.pattern = 2;
+                            }
+
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::SwirlWire,
+                                    TexturePatternMode::SwirlWire.label(),
+                                )
+                                .clicked()
+                            {
+                                settings.pattern = 3;
+                            }
+                        });
+                });
             });
-        });
+    }
 
     // Non-wasm: draw the captions/credits as an egui overlay over the Bevy view.
     #[cfg(not(target_arch = "wasm32"))]
@@ -3304,132 +5629,127 @@ fn ui_overlay(
         let credit_color = egui::Color32::from_rgb(0xF2, 0xB1, 0x00);
         let caption_color = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 240);
 
-        if overlay_vis.show {
-            if overlay_state.last_credit_idx >= 0 {
-                egui::Area::new(egui::Id::new("mcbaise_credit_area"))
-                    .anchor(egui::Align2::CENTER_TOP, egui::vec2(wobble_x, 26.0 + wobble_y))
-                    .show(ctx, |ui| {
-                        ui.vertical_centered(|ui| {
-                            // Approximate the original styled HTML credits.
-                            match overlay_state.last_credit_idx {
-                                0 => {
+        if overlay_state.last_credit_idx >= 0 {
+            egui::Area::new(egui::Id::new("mcbaise_credit_area"))
+                .anchor(
+                    egui::Align2::CENTER_TOP,
+                    egui::vec2(wobble_x, 26.0 + wobble_y),
+                )
+                .show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        // Approximate the original styled HTML credits.
+                        match overlay_state.last_credit_idx {
+                            0 => {
+                                ui.label(
+                                    egui::RichText::new("DIRTY")
+                                        .strong()
+                                        .size(52.0)
+                                        .color(credit_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new("MELODY")
+                                        .strong()
+                                        .size(52.0)
+                                        .color(credit_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new("RECORDS")
+                                        .strong()
+                                        .size(52.0)
+                                        .color(credit_color),
+                                );
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new("Owns All Rights")
+                                        .strong()
+                                        .size(34.0)
+                                        .color(credit_color),
+                                );
+                            }
+                            1 => {
+                                ui.label(
+                                    egui::RichText::new("MCBAISE")
+                                        .strong()
+                                        .size(52.0)
+                                        .color(credit_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new("PALE REGARD")
+                                        .strong()
+                                        .size(36.0)
+                                        .color(credit_color),
+                                );
+                            }
+                            2 => {
+                                ui.label(
+                                    egui::RichText::new("ABSURDIA")
+                                        .strong()
+                                        .size(70.0)
+                                        .color(credit_color),
+                                );
+                                ui.label(
+                                    egui::RichText::new("FANTASMAGORIA")
+                                        .strong()
+                                        .size(64.0)
+                                        .color(credit_color),
+                                );
+                            }
+                            _ => {
+                                // Fallback.
+                                if !overlay_text.credit.is_empty() {
                                     ui.label(
-                                        egui::RichText::new("DIRTY")
-                                            .strong()
-                                            .size(52.0)
-                                            .color(credit_color),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("MELODY")
-                                            .strong()
-                                            .size(52.0)
-                                            .color(credit_color),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("RECORDS")
-                                            .strong()
-                                            .size(52.0)
-                                            .color(credit_color),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new("Owns All Rights")
+                                        egui::RichText::new(&overlay_text.credit)
                                             .strong()
                                             .size(34.0)
                                             .color(credit_color),
                                     );
                                 }
-                                1 => {
-                                    ui.label(
-                                        egui::RichText::new("MCBAISE")
-                                            .strong()
-                                            .size(52.0)
-                                            .color(credit_color),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("PALE REGARD")
-                                            .strong()
-                                            .size(36.0)
-                                            .color(credit_color),
-                                    );
-                                }
-                                2 => {
-                                    ui.label(
-                                        egui::RichText::new("ABSURDIA")
-                                            .strong()
-                                            .size(70.0)
-                                            .color(credit_color),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new("FANTASMAGORIA")
-                                            .strong()
-                                            .size(64.0)
-                                            .color(credit_color),
-                                    );
-                                }
-                                _ => {
-                                    // Fallback.
-                                    if !overlay_text.credit.is_empty() {
-                                        ui.label(
-                                            egui::RichText::new(&overlay_text.credit)
-                                                .strong()
-                                                .size(34.0)
-                                                .color(credit_color),
-                                        );
-                                    }
-                                }
                             }
+                        }
+                    });
+                });
+        }
+
+        if caption_vis.show && !overlay_text.caption.is_empty() {
+            egui::Area::new(egui::Id::new("mcbaise_caption_area"))
+                .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -26.0))
+                .show(ctx, |ui| {
+                    let frame = egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(14))
+                        .inner_margin(egui::Margin::symmetric(14, 10));
+
+                    frame.show(ui, |ui| {
+                        ui.set_max_width(900.0);
+                        ui.vertical_centered(|ui| {
+                            let mut text = egui::RichText::new(&overlay_text.caption)
+                                .size(22.0)
+                                .color(caption_color);
+                            if overlay_text.caption_is_meta {
+                                text = text.italics().color(egui::Color32::from_rgba_unmultiplied(
+                                    255, 255, 255, 150,
+                                ));
+                            }
+                            ui.label(text);
                         });
                     });
-            }
-
-            if !overlay_text.caption.is_empty() {
-                egui::Area::new(egui::Id::new("mcbaise_caption_area"))
-                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -26.0))
-                    .show(ctx, |ui| {
-                        let frame = egui::Frame::NONE
-                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                            ))
-                            .corner_radius(egui::CornerRadius::same(14))
-                            .inner_margin(egui::Margin::symmetric(14, 10));
-
-                        frame.show(ui, |ui| {
-                            ui.set_max_width(900.0);
-                            ui.vertical_centered(|ui| {
-                                let mut text = egui::RichText::new(&overlay_text.caption)
-                                    .size(22.0)
-                                    .color(caption_color);
-                                if overlay_text.caption_is_meta {
-                                    text = text.italics().color(egui::Color32::from_rgba_unmultiplied(
-                                        255,
-                                        255,
-                                        255,
-                                        150,
-                                    ));
-                                }
-                                ui.label(text);
-                            });
-                        });
-                    });
-            }
+                });
         }
     }
-
 }
 
 // ---------------------------- time → curve progress ----------------------------
 
 fn progress_from_video_time(video_time_sec: f32) -> f32 {
     let speed = 0.0028;
-    (video_time_sec * speed).clamp(0.0, 0.985)
-}
-
-fn theta_from_time(t: f32) -> f32 {
-    // Simple periodic theta (the original code integrates dynamics; this is a stable approximation).
-    t * 1.35
+    // Loop around the closed curve instead of clamping to the end.
+    // The curve sampling is not stable at 1.0, so keep a small margin.
+    let cycle = 0.985;
+    (video_time_sec * speed).rem_euclid(cycle)
 }
 
 // ---------------------------- camera ----------------------------
@@ -3440,15 +5760,27 @@ enum CameraMode {
     Over,
     Back,
     BallChase,
+    Side,
 }
 
-fn camera_mode(video_time_sec: f32) -> CameraMode {
-    // Without the YouTube panel (native exe), prefer a camera that actually shows the subject.
-    if cfg!(not(target_arch = "wasm32")) {
-        return CameraMode::BallChase;
+impl CameraMode {
+    fn label(self) -> &'static str {
+        match self {
+            CameraMode::First => "first",
+            CameraMode::Over => "over",
+            CameraMode::Back => "back",
+            CameraMode::BallChase => "chase",
+            CameraMode::Side => "side",
+        }
     }
+}
+
+fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
+    // Deterministic timeline camera behavior matching the original CodePen.
+    // cycle=14s; if u>6..8.5 => Over; 8.5..11 => Back; >11 => BallChase; else => First.
     let cycle = 14.0;
     let u = video_time_sec.rem_euclid(cycle);
+
     if u > 6.0 && u <= 8.5 {
         CameraMode::Over
     } else if u > 8.5 && u <= 11.0 {
@@ -3460,18 +5792,148 @@ fn camera_mode(video_time_sec: f32) -> CameraMode {
     }
 }
 
+fn timeline_pose_mode(video_time_sec: f32) -> PoseMode {
+    // Deterministic pose cycle for timeline mode.
+    // Placeholder until the full scripted timeline is ported; guarantees Auto isn't random.
+    let cycle = 14.0;
+    let u = video_time_sec.rem_euclid(cycle);
+    let cycle_idx = (video_time_sec / cycle).floor() as i32;
+
+    if u < 3.5 {
+        PoseMode::Standing
+    } else if u < 7.0 {
+        PoseMode::Belly
+    } else if u < 10.5 {
+        PoseMode::Back
+    } else if (cycle_idx & 1) == 0 {
+        PoseMode::LeftSide
+    } else {
+        PoseMode::RightSide
+    }
+}
+
+fn timeline_subject_mode(video_time_sec: f32) -> SubjectMode {
+    // Deterministic subject timeline.
+    // Keep the rider as human for most of the cycle; switch to ball during the chase segment.
+    let cycle = 14.0;
+    let u = video_time_sec.rem_euclid(cycle);
+    if u > 11.0 {
+        SubjectMode::Ball
+    } else {
+        SubjectMode::Human
+    }
+}
+
+fn timeline_color_scheme(video_time_sec: f32) -> u32 {
+    // Deterministic color timeline (four schemes).
+    let cycle = 14.0;
+    let u = video_time_sec.rem_euclid(cycle);
+    if u < 3.5 {
+        0
+    } else if u < 7.0 {
+        1
+    } else if u < 10.5 {
+        2
+    } else {
+        3
+    }
+}
+
+fn timeline_texture_pattern(video_time_sec: f32) -> u32 {
+    // Deterministic texture timeline.
+    // pattern 0: stripe
+    // pattern 1: swirl
+    // Flip every 3.5s inside the 14s cycle.
+    let step = 3.5;
+    // Previously the shader treated 0 as swirl; we now treat 0 as stripe.
+    // So invert the old alternating sequence.
+    1 - ((((video_time_sec / step).floor() as i32) & 1) as u32)
+}
+
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
+enum CameraPreset {
+    #[default]
+    Auto,
+    Random,
+    FollowActiveChase,
+    FollowActiveBack,
+    FollowActiveFirst,
+    FollowActiveOver,
+    FollowActiveSide,
+    FollowHumanChase,
+    FollowBallChase,
+    TubeOver,
+}
+
+impl CameraPreset {
+    fn label(self) -> &'static str {
+        match self {
+            CameraPreset::Auto => "Camera: auto",
+            CameraPreset::Random => "Camera: random",
+            CameraPreset::FollowActiveChase => "Camera: follow active (chase)",
+            CameraPreset::FollowActiveBack => "Camera: follow active (back)",
+            CameraPreset::FollowActiveFirst => "Camera: follow active (first)",
+            CameraPreset::FollowActiveOver => "Camera: follow active (over)",
+            CameraPreset::FollowActiveSide => "Camera: follow active (side)",
+            CameraPreset::FollowHumanChase => "Camera: follow human (chase)",
+            CameraPreset::FollowBallChase => "Camera: follow ball (chase)",
+            CameraPreset::TubeOver => "Camera: tube overview",
+        }
+    }
+
+    fn choices() -> [(CameraPreset, &'static str); 10] {
+        [
+            (CameraPreset::Auto, CameraPreset::Auto.label()),
+            (CameraPreset::Random, CameraPreset::Random.label()),
+            (
+                CameraPreset::FollowActiveChase,
+                CameraPreset::FollowActiveChase.label(),
+            ),
+            (
+                CameraPreset::FollowActiveBack,
+                CameraPreset::FollowActiveBack.label(),
+            ),
+            (
+                CameraPreset::FollowActiveFirst,
+                CameraPreset::FollowActiveFirst.label(),
+            ),
+            (
+                CameraPreset::FollowActiveOver,
+                CameraPreset::FollowActiveOver.label(),
+            ),
+            (
+                CameraPreset::FollowActiveSide,
+                CameraPreset::FollowActiveSide.label(),
+            ),
+            (
+                CameraPreset::FollowHumanChase,
+                CameraPreset::FollowHumanChase.label(),
+            ),
+            (
+                CameraPreset::FollowBallChase,
+                CameraPreset::FollowBallChase.label(),
+            ),
+            (CameraPreset::TubeOver, CameraPreset::TubeOver.label()),
+        ]
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn camera_pose(
     video_time_sec: f32,
+    camera_preset: CameraPreset,
+    selected_mode: CameraMode,
+    subject_mode: SubjectMode,
     cam_center: Vec3,
     look_ahead: Vec3,
     cam_tangent: Vec3,
     cam_n: Vec3,
     cam_b: Vec3,
     ball_center: Vec3,
-    subject_pos: Vec3,
+    subject_pos_human: Vec3,
+    subject_pos_ball: Vec3,
     subject_tangent: Vec3,
-    subject_up: Vec3,
+    _subject_up: Vec3,
 ) -> (Vec3, Vec3, Vec3) {
     let (intro_show_tube, intro_dive) = if cfg!(target_arch = "wasm32") {
         (2.2, 1.6)
@@ -3480,6 +5942,17 @@ fn camera_pose(
         (0.0, 0.0)
     };
     let in_intro = video_time_sec < (intro_show_tube + intro_dive);
+
+    let active_pos = match subject_mode {
+        SubjectMode::Human => subject_pos_human,
+        SubjectMode::Ball => subject_pos_ball,
+        SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
+    };
+    let target_pos = match camera_preset {
+        CameraPreset::FollowHumanChase => subject_pos_human,
+        CameraPreset::FollowBallChase => subject_pos_ball,
+        _ => active_pos,
+    };
 
     let cam_inner_pos = cam_center + cam_b * 0.10;
 
@@ -3495,16 +5968,25 @@ fn camera_pose(
     let back_look = cam_center + cam_tangent * 3.0;
     let back_up = cam_n;
 
-    // Use subject-local basis so the camera stays "attached" as the subject orbits the tube wall.
-    let chase_pos = subject_pos + subject_tangent * -4.8 + subject_up * 0.9;
-    let chase_look = subject_pos;
-    let chase_up = subject_up;
+    // Keep the chase camera stable in the tube frame.
+    // If we offset using subject_up, the camera orbits with the rider/ball and it can feel like
+    // the subject never changes its orientation relative to the camera/tube.
+    let chase_pos = target_pos + subject_tangent * -4.8 + cam_n * 0.9;
+    let chase_look = target_pos;
+    // Keep camera "upright" relative to the tube, not the subject.
+    // If we use subject_up here, the camera rolls with the rider/ball and it looks like
+    // we're always on the "top" of the tube.
+    let chase_up = cam_n;
+
+    let side_pos = target_pos + cam_b * 4.2 + cam_n * 1.0 + subject_tangent * -0.6;
+    let side_look = target_pos;
+    let side_up = cam_n;
 
     let mut pos;
     let mut look;
     let mut up;
 
-    match camera_mode(video_time_sec) {
+    match selected_mode {
         CameraMode::First => {
             pos = first_pos;
             look = first_look;
@@ -3512,7 +5994,11 @@ fn camera_pose(
         }
         CameraMode::Over => {
             pos = over_pos;
-            look = over_look;
+            look = if camera_preset == CameraPreset::TubeOver {
+                cam_center
+            } else {
+                over_look
+            };
             up = over_up;
         }
         CameraMode::Back => {
@@ -3524,6 +6010,11 @@ fn camera_pose(
             pos = chase_pos;
             look = chase_look;
             up = chase_up;
+        }
+        CameraMode::Side => {
+            pos = side_pos;
+            look = side_look;
+            up = side_up;
         }
     }
 
@@ -3551,17 +6042,19 @@ fn camera_pose(
     // Keep a steadier subject distance so it doesn't feel like it "flies away" as it rotates.
     // Only apply to the modes intended to feature the subject.
     if !in_intro {
-        match camera_mode(video_time_sec) {
+        match selected_mode {
             CameraMode::BallChase | CameraMode::Back => {
                 let desired_dist = 5.0;
-                let dir = (pos - subject_pos).normalize_or_zero();
+                let dir = (pos - target_pos).normalize_or_zero();
                 if dir.length_squared() > 0.0 {
-                    pos = subject_pos + dir * desired_dist;
+                    pos = target_pos + dir * desired_dist;
                 }
                 // Bias look toward the subject for a consistent 3D read.
-                look = look.lerp(subject_pos, 0.65);
-                // Prefer a stable up aligned to the subject's radial direction.
-                up = up.lerp(subject_up, 0.85).normalize_or_zero();
+                look = look.lerp(target_pos, 0.65);
+                // Keep a stable up aligned to the tube frame.
+                // Blending toward subject_up reintroduces camera roll and makes the subject
+                // appear locked to the "top" of the tube.
+                up = up.lerp(cam_n, 0.85).normalize_or_zero();
             }
             _ => {}
         }
@@ -3641,8 +6134,12 @@ impl Frames {
         let i = i.min(self.samples - 2);
         let t = i_f - i as f32;
 
-        let tan = self.tangents[i].lerp(self.tangents[i + 1], t).normalize_or_zero();
-        let nor = self.normals[i].lerp(self.normals[i + 1], t).normalize_or_zero();
+        let tan = self.tangents[i]
+            .lerp(self.tangents[i + 1], t)
+            .normalize_or_zero();
+        let nor = self.normals[i]
+            .lerp(self.normals[i + 1], t)
+            .normalize_or_zero();
         let bin = self.binormals[i]
             .lerp(self.binormals[i + 1], t)
             .normalize_or_zero();
@@ -3813,7 +6310,10 @@ fn build_tube_mesh(
         }
     }
 
-    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
     mesh.insert_indices(Indices::U32(indices));
     mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
     mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
@@ -3851,34 +6351,55 @@ impl TubeMaterial {
         self.u[0].x = t;
     }
 
-    fn set_scheme(&mut self, scheme: u32) {
-        match scheme % 2 {
+    fn set_scheme(&mut self, scheme: u32, time_sec: f32) {
+        match scheme % 4 {
             0 => {
+                // Orange/white.
                 self.u[2] = Color::srgb_u8(0xD2, 0x6B, 0x11).to_linear().to_vec4();
                 self.u[3] = Color::srgb_u8(0xFF, 0xF8, 0xF0).to_linear().to_vec4();
             }
-            _ => {
-                // Alt scheme: cyan/pink.
+            1 => {
+                // NIN (legacy alt palette): cyan/pink.
                 self.u[2] = Color::srgb_u8(0x18, 0xC5, 0xC5).to_linear().to_vec4();
                 self.u[3] = Color::srgb_u8(0xFF, 0xC2, 0xF0).to_linear().to_vec4();
+            }
+            2 => {
+                // Pure black/white.
+                self.u[2] = Color::srgb_u8(0x06, 0x06, 0x06).to_linear().to_vec4();
+                self.u[3] = Color::srgb_u8(0xFD, 0xFD, 0xFD).to_linear().to_vec4();
+            }
+            _ => {
+                // "Random grey": deterministic grey pairs that change every ~1.5s.
+                let tick = (time_sec * 0.666_666_7).floor().max(0.0) as u32;
+                let mut x = tick ^ 0xA5A5_5A5A;
+                x ^= x >> 16;
+                x = x.wrapping_mul(0x7FEB_352D);
+                x ^= x >> 15;
+                x = x.wrapping_mul(0x846C_A68B);
+                x ^= x >> 16;
+
+                let g1 = 0.15 + 0.70 * ((x & 0xFFFF) as f32 / 65535.0);
+                let g2 = (g1 * 0.55 + 0.25).clamp(0.05, 0.95);
+                self.u[2] = Color::srgb(g1, g1, g1).to_linear().to_vec4();
+                self.u[3] = Color::srgb(g2, g2, g2).to_linear().to_vec4();
             }
         }
     }
 
     fn set_pattern(&mut self, pattern: u32) {
-        self.u[1].w = (pattern % 2) as f32;
+        self.u[1].w = (pattern % 4) as f32;
     }
 }
 
 impl Material for TubeMaterial {
     fn fragment_shader() -> ShaderRef {
-    // Construct the embedded path at compile-time so it exactly matches
-    // what `embedded_asset!` registered. `embedded_path!` returns a PathBuf
-    // like: `<crate>/.../mcbaise_tube.wgsl` so prefix with `embedded://`.
-    let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
-    // Create an owned AssetPath from the PathBuf and mark it to load from the `embedded` source.
-    let ap = bevy::asset::AssetPath::from_path_buf(p).with_source("embedded");
-    ShaderRef::from(ap)
+        // Construct the embedded path at compile-time so it exactly matches
+        // what `embedded_asset!` registered. `embedded_path!` returns a PathBuf
+        // like: `<crate>/.../mcbaise_tube.wgsl` so prefix with `embedded://`.
+        let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
+        // Create an owned AssetPath from the PathBuf and mark it to load from the `embedded` source.
+        let ap = bevy::asset::AssetPath::from_path_buf(p).with_source("embedded");
+        ShaderRef::from(ap)
     }
 }
 
@@ -3949,25 +6470,16 @@ fn find_opening_credit(t: f32) -> i32 {
 }
 #[allow(dead_code)]
 fn opening_credit_html(idx: usize) -> &'static str {
-    opening_credits()
-        .get(idx)
-        .map(|c| c.html)
-        .unwrap_or("")
+    opening_credits().get(idx).map(|c| c.html).unwrap_or("")
 }
 
 #[allow(dead_code)]
 fn opening_credit_plain(idx: usize) -> &'static str {
-    opening_credits()
-        .get(idx)
-        .map(|c| c.plain)
-        .unwrap_or("")
+    opening_credits().get(idx).map(|c| c.plain).unwrap_or("")
 }
 
 fn opening_credit_overlay(idx: usize) -> &'static str {
-    opening_credits()
-        .get(idx)
-        .map(|c| c.overlay)
-        .unwrap_or("")
+    opening_credits().get(idx).map(|c| c.overlay).unwrap_or("")
 }
 #[derive(Clone)]
 struct Cue {
@@ -4228,7 +6740,11 @@ fn find_cue_index(cues: &[Cue], t: f32) -> i32 {
 }
 fn parse_srt(srt: &str) -> Vec<Cue> {
     let srt = srt.replace('\r', "");
-    let blocks: Vec<&str> = srt.split("\n\n").map(str::trim).filter(|b| !b.is_empty()).collect();
+    let blocks: Vec<&str> = srt
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .collect();
     let mut out = Vec::new();
 
     for block in blocks {
