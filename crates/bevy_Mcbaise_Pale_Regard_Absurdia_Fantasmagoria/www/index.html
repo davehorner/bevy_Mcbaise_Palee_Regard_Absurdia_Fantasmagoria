@@ -109,29 +109,7 @@
       font-style: italic;
     }
 
-    #controls {
-      position: absolute;
-      right: 15px;
-      top: 15px;
-      background: rgba(255, 255, 255, 0.8);
-      border-radius: 8px;
-      padding: 8px;
-      pointer-events: auto;
-    }
-
-    #controls button {
-      margin: 4px;
-      padding: 6px;
-      color: #000;
-      background-color: #F2B100;
-      border: none;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-
-    #controls button:hover {
-      background-color: #D26B11;
-    }
+  /* controls removed — use egui overlay from wasm instead */
   </style>
 </head>
 <body>
@@ -152,13 +130,7 @@
         <div class="caption" id="caption"></div>
       </div>
 
-      <div id="controls">
-        <button id="btn-overlay">Toggle Overlay</button>
-        <button id="btn-colors">Toggle Colors</button>
-        <button id="btn-texture">Toggle Texture</button>
-        <button id="btn-speed-up">Speed Up</button>
-        <button id="btn-speed-down">Slow Down</button>
-      </div>
+  <!-- DOM controls removed — interactive UI is provided by Egui overlay inside the wasm app -->
     </div>
   </div>
 
@@ -289,18 +261,10 @@
       });
     };
 
-    // Hook buttons to wasm exports.
-    function hookControls() {
-      document.getElementById('btn-overlay').onclick = () => wasm?.toggle_overlay?.();
-      document.getElementById('btn-colors').onclick = () => wasm?.toggle_color_scheme?.();
-      document.getElementById('btn-texture').onclick = () => wasm?.toggle_texture?.();
-      document.getElementById('btn-speed-up').onclick = () => wasm?.speed_up?.();
-      document.getElementById('btn-speed-down').onclick = () => wasm?.slow_down?.();
-    }
 
     async function main() {
       await bootWasm();
-      hookControls();
+      // DOM controls were removed; the wasm app uses an egui overlay for runtime controls.
       await loadScript("https://www.youtube.com/iframe_api");
     }
 

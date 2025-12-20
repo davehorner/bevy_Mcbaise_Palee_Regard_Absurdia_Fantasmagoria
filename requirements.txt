@@ -1,0 +1,10 @@
+# Python requirements for the exporter and tools
+# Note: some packages (e.g. torch) may prefer platform-specific wheels; adjust if needed.
+packaging
+numpy
+torch
+roma
+safetensors
+anny
+pyyaml
+pillow

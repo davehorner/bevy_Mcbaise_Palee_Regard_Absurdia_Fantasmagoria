@@ -7,6 +7,8 @@ use bevy::prelude::*;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::reflect::TypePath;
 use bevy::shader::ShaderRef;
+use bevy::asset::embedded_asset;
+use bevy::asset::io::embedded::EmbeddedAssetRegistry;
 use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::PrimaryWindow;
@@ -1935,6 +1937,26 @@ pub fn main() {
 
     let mut app = App::new();
 
+    // Ensure EmbeddedAssetRegistry exists in the World before embedding assets.
+    app.init_resource::<EmbeddedAssetRegistry>();
+
+    // Register a small local plugin that embeds the shader into the in-memory registry.
+    // We omit the crate path from the embedded URL by passing it as `omit_prefix` so
+    // the resulting asset URL becomes: embedded://<crate>/src/mcbaise_tube.wgsl
+    #[allow(non_camel_case_types)]
+    struct local_embedded_asset_plugin;
+
+    impl Plugin for local_embedded_asset_plugin {
+        fn build(&self, app: &mut App) {
+            // Register the shader file located alongside this source file.
+            embedded_asset!(app, "mcbaise_tube.wgsl");
+
+            // Embedded asset bytes were registered above. The embedded AssetSource
+            // is registered later at startup by `register_embedded_asset_source` so
+            // the AssetPlugin has been added and `AssetSourceBuilders` exists.
+        }
+    }
+
     app
         .insert_resource(ClearColor(Color::BLACK))
         .insert_resource(Playback {
@@ -1949,11 +1971,15 @@ pub fn main() {
         .insert_resource(OverlayVisibility { show: true })
         .insert_resource(OverlayText::default())
         .add_plugins(plugins)
-        .add_plugins(EguiPlugin::default())
-        .add_plugins(MaterialPlugin::<TubeMaterial>::default())
+    .add_plugins(EguiPlugin::default())
+    // Ensure embedded assets are registered before materials request shaders.
+    .add_plugins(local_embedded_asset_plugin)
+    .add_plugins(MaterialPlugin::<TubeMaterial>::default())
         .add_plugins(burn_plugin)
 
         .add_systems(Startup, setup_scene)
+    // Diagnostic: print embedded registry contents at startup to verify registered paths
+    .add_systems(Startup, (register_embedded_asset_source, print_embedded_registry))
         .add_systems(
             Update,
             (
@@ -3846,7 +3872,13 @@ impl TubeMaterial {
 
 impl Material for TubeMaterial {
     fn fragment_shader() -> ShaderRef {
-        "shaders/mcbaise_tube.wgsl".into()
+    // Construct the embedded path at compile-time so it exactly matches
+    // what `embedded_asset!` registered. `embedded_path!` returns a PathBuf
+    // like: `<crate>/.../mcbaise_tube.wgsl` so prefix with `embedded://`.
+    let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
+    // Create an owned AssetPath from the PathBuf and mark it to load from the `embedded` source.
+    let ap = bevy::asset::AssetPath::from_path_buf(p).with_source("embedded");
+    ShaderRef::from(ap)
     }
 }
 
@@ -3887,6 +3919,25 @@ fn opening_credits() -> &'static [Credit] {
             plain: "ABSURDIA FANTASMAGORIA",
         },
     ]
+}
+
+fn print_embedded_registry(registry: Res<EmbeddedAssetRegistry>) {
+    // Print the compile-time embedded path for the shader file so we can match the AssetServer lookup.
+    let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
+    info!("embedded_path for mcbaise_tube.wgsl = {}", p.display());
+
+    // We can't rely on Debug for the registry; just confirm the resource exists.
+    let _ = registry;
+    info!("embedded registry resource present");
+}
+
+/// Register the embedded AssetSource with the AssetServer's builders so loads
+/// from `embedded://...` succeed. Runs at startup.
+fn register_embedded_asset_source(
+    registry: Res<EmbeddedAssetRegistry>,
+    mut builders: ResMut<bevy::asset::io::AssetSourceBuilders>,
+) {
+    registry.register_source(&mut builders);
 }
 fn find_opening_credit(t: f32) -> i32 {
     for (i, c) in opening_credits().iter().enumerate() {

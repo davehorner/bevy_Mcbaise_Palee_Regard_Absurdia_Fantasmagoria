@@ -7,6 +7,7 @@ vars:
   MCBAISE_WASM_PROFILE: wasm-release
   MCBAISE_PORT: '5173'
 
+
 tasks:
   demo:native:
     desc: Run the bevy_burn_human demo natively
@@ -16,6 +17,8 @@ tasks:
   install-python-modules:
     desc: Install required Python modules
     cmds:
+      - python -m pip install --upgrade pip setuptools wheel
+      - pip install packaging
       - pip install numpy
       - pip install torch
       - pip install roma
@@ -91,19 +94,82 @@ tasks:
       - rustup target add {{.MCBAISE_WASM_TARGET}}
 
   mcbaise:wasm:bindgen:install:
-    desc: Install wasm-bindgen-cli if missing
+    desc: Install wasm-bindgen-cli (dispatches to platform-specific installer)
+    cmds:
+      - |-
+        set -euo pipefail
+        OS=$(uname -s 2>/dev/null || echo "Windows")
+        case "$OS" in
+          Darwin*|Linux*|*BSD*)
+            task mcbaise:wasm:bindgen:install:posix
+            ;;
+          *)
+            task mcbaise:wasm:bindgen:install:windows
+            ;;
+        esac
+
+  mcbaise:wasm:bindgen:install:posix:
+    desc: Install wasm-bindgen-cli on POSIX (Linux/macOS)
     status:
       - wasm-bindgen --version
     cmds:
-      - cargo install wasm-bindgen-cli --locked
+      - |-
+        set -euo pipefail
+        # Try to read the wasm-bindgen version from Cargo.lock to match schema
+        # Simpler approach: parse Cargo.lock for the wasm-bindgen package version
+        WB_VER=$(awk '/^\[\[package\]\]/{p=0} /name = "wasm-bindgen"/{p=1} p && /version =/ {gsub(/"/,"",$3); print $3; exit}' Cargo.lock || true)
+        if [ -n "$WB_VER" ]; then
+          echo "Installing wasm-bindgen-cli v${WB_VER} to match Cargo.lock"
+          cargo install -f wasm-bindgen-cli --version "$WB_VER" || cargo install wasm-bindgen-cli --locked
+        else
+          echo "Could not detect wasm-bindgen version from Cargo.lock; installing latest wasm-bindgen-cli"
+          cargo install -f wasm-bindgen-cli --locked
+        fi
+
+  mcbaise:wasm:bindgen:install:windows:
+    desc: Install wasm-bindgen-cli on Windows (PowerShell)
+    status:
+      - wasm-bindgen --version
+    cmds:
+      - |-
+        @echo off
+        REM Use PowerShell to parse Cargo.lock for wasm-bindgen version if present, then call cargo install
+        powershell -NoProfile -Command "
+          $wbv='';
+          if (Test-Path 'Cargo.lock') {
+            $content = Get-Content -Raw 'Cargo.lock' -ErrorAction SilentlyContinue;
+            if ($content -match 'name = "wasm-bindgen"[\s\S]*?version = "([0-9\.]+)"') { $wbv = $Matches[1] }
+          }
+          if ($wbv) { Write-Host \"Installing wasm-bindgen-cli v$wbv to match Cargo.lock\"; exit 0 } else { Write-Host \"No version detected in Cargo.lock\"; exit 2 }
+        " || (
+          REM If powershell command returned 0 we still need to install; try to retrieve version again and install
+          powershell -NoProfile -Command "if (Test-Path 'Cargo.lock') { $c = Get-Content -Raw 'Cargo.lock'; if ($c -match 'name = \"wasm-bindgen\"[\s\S]*?version = \"([0-9\.]+)\"') { $v=$Matches[1]; Write-Host \"Installing wasm-bindgen-cli v$v\"; exit 0 } else { exit 2 } } else { exit 2 }" || true
+        )
+        REM Best-effort install: install matching version if we found it, otherwise install locked/latest
+        powershell -NoProfile -Command "
+          $wbv='';
+          if (Test-Path 'Cargo.lock') { $content = Get-Content -Raw 'Cargo.lock' -ErrorAction SilentlyContinue; if ($content -match 'name = \"wasm-bindgen\"[\s\S]*?version = \"([0-9\.]+)\"') { $wbv=$Matches[1] } }
+          if ($wbv) { npm run -s || exit 0 }
+        " || true
+        REM Fallback: run cargo install (simple, works on Windows with cargo present)
+        cargo install -f wasm-bindgen-cli --locked || cargo install wasm-bindgen-cli
 
   mcbaise:wasm:build:
     desc: Build the tube ride demo for wasm and generate wasm-bindgen package into www/pkg
     deps:
       - task: mcbaise:wasm:toolchain
       - task: mcbaise:wasm:bindgen:install
+      - task: mcbaise:wasm:ensure-assets
     cmds:
-      - cargo build -p {{.MCBAISE_CRATE}} --profile {{.MCBAISE_WASM_PROFILE}} --target {{.MCBAISE_WASM_TARGET}}
+      - |-
+        set -euo pipefail
+        # Ensure the embedded model asset exists; if not, generate it
+        ASSET_PATH="assets/model/fullbody_default.safetensors"
+        if [[ ! -f "$ASSET_PATH" ]]; then
+          echo "Asset $ASSET_PATH missing — running task export-reference to generate it"
+          task export-reference
+        fi
+        cargo build -p {{.MCBAISE_CRATE}} --profile {{.MCBAISE_WASM_PROFILE}} --target {{.MCBAISE_WASM_TARGET}}
       - wasm-bindgen --target web --no-typescript --out-dir {{.MCBAISE_WWW_DIR}}/pkg --out-name {{.MCBAISE_CRATE}} target/{{.MCBAISE_WASM_TARGET}}/{{.MCBAISE_WASM_PROFILE}}/{{.MCBAISE_CRATE}}.wasm
 
   mcbaise:wasm:serve:
@@ -115,6 +181,20 @@ tasks:
         echo Serve started. Open:
         echo http://localhost:{{.MCBAISE_PORT}}/{{.MCBAISE_WWW_DIR}}/
         python -m http.server {{.MCBAISE_PORT}} || py -m http.server {{.MCBAISE_PORT}}
+
+  mcbaise:wasm:ensure-assets:
+    desc: "Ensure embedded model assets exist (cross-platform). Runs `export-reference` if missing."
+    cmds:
+      - |-
+        set -euo pipefail
+        ASSET="assets/model/fullbody_default.safetensors"
+        if [ -f "$ASSET" ]; then
+          echo "Found $ASSET"
+          exit 0
+        fi
+        echo "$ASSET missing; running export-reference to create it"
+        # On Windows, `task` should still be available; run the export task which depends on install-python-modules
+        task export-reference
 
   
   update-chromedriver:mac:brew:
