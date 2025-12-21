@@ -2546,6 +2546,12 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_set_video_visible)]
     fn mcbaise_set_video_visible(show: bool);
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_set_loading)]
+    fn mcbaise_set_loading(show: bool, text: &str);
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_set_wasm_ready)]
+    fn mcbaise_set_wasm_ready();
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
@@ -3744,6 +3750,9 @@ fn setup_scene(
     });
 
     commands.insert_resource(OverlayState::default());
+
+    #[cfg(target_arch = "wasm32")]
+    mcbaise_set_wasm_ready();
 }
 
 fn ensure_subject_normals(

@@ -30,15 +30,53 @@
       background: #000;
     }
 
+    /* Landscape: hide video by collapsing width. */
     #root.hideVideo #left {
       flex: 0 0 0px;
       width: 0px;
       border-right: 0;
     }
 
+    /* Portrait (more tall than wide): stack vertically (video above, viz below). */
+    @media (max-aspect-ratio: 1/1) {
+      #root { flex-direction: column; }
+
+      #left {
+        border-right: 0;
+        border-bottom: 2px solid rgba(255,255,255,0.12);
+      }
+
+      /* Give the video a reasonable default height in portrait. */
+      #left { flex: 0 0 40%; }
+      #right { flex: 1 1 auto; }
+
+      /* Portrait: hide video by collapsing height. */
+      #root.hideVideo #left {
+        flex: 0 0 0px;
+        height: 0px;
+        width: auto;
+        border-bottom: 0;
+      }
+    }
+
     #playerWrap { position: absolute; inset: 0; background: #000; }
     #player { position: absolute; inset: 0; width: 100%; height: 100%; }
     #player iframe { width: 100% !important; height: 100% !important; display: block; }
+
+    #ytLoading {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(6px);
+      opacity: 0;
+      transition: opacity 200ms ease;
+      z-index: 5;
+    }
+
+    #ytLoading.show { opacity: 1; }
 
     #viz { position: absolute; inset: 0; }
     #bevy-canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
@@ -115,6 +153,73 @@
       font-style: italic;
     }
 
+    #loading {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      pointer-events: none;
+      background: rgba(0,0,0,0.70);
+      backdrop-filter: blur(6px);
+      opacity: 0;
+      transition: opacity 200ms ease;
+      z-index: 10;
+    }
+
+    #loading.show {
+      opacity: 1;
+    }
+
+    #loading .box {
+      width: min(92vw, 640px);
+      padding: 18px 18px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: rgba(255,255,255,0.92);
+      text-align: center;
+      line-height: 1.25;
+    }
+
+    #loading .title {
+      font-family: "Baloo 2", system-ui, sans-serif;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      color: #F2B100;
+      margin-bottom: 8px;
+      font-size: 22px;
+    }
+
+    #loading .msg {
+      font-size: 16px;
+      opacity: 0.9;
+    }
+
+    #ytLoading .box {
+      width: min(92vw, 520px);
+      padding: 16px 16px;
+      border-radius: 14px;
+      background: rgba(0,0,0,0.55);
+      border: 1px solid rgba(255,255,255,0.12);
+      color: rgba(255,255,255,0.92);
+      text-align: center;
+      line-height: 1.25;
+    }
+
+    #ytLoading .title {
+      font-family: "Baloo 2", system-ui, sans-serif;
+      font-weight: 800;
+      letter-spacing: 0.02em;
+      color: #F2B100;
+      margin-bottom: 6px;
+      font-size: 20px;
+    }
+
+    #ytLoading .msg {
+      font-size: 15px;
+      opacity: 0.9;
+    }
+
   /* controls removed — use egui overlay from wasm instead */
   </style>
 </head>
@@ -123,12 +228,26 @@
     <div id="left">
       <div id="playerWrap">
         <div id="player"></div>
+
+        <div id="ytLoading" class="show">
+          <div class="box">
+            <div class="title">Loading YouTube…</div>
+            <div class="msg" id="ytLoadingMsg">Preparing the player…</div>
+          </div>
+        </div>
       </div>
     </div>
 
     <div id="right">
       <div id="viz">
         <canvas id="bevy-canvas"></canvas>
+      </div>
+
+      <div id="loading" class="show">
+        <div class="box">
+          <div class="title">Hold on…</div>
+          <div class="msg" id="loadingMsg">Loading the app (the model is large; this can take a moment)…</div>
+        </div>
       </div>
 
       <div id="overlay">
@@ -146,6 +265,49 @@
     const creditEl = document.getElementById("credit");
     const captionEl = document.getElementById("caption");
     const rootEl = document.getElementById("root");
+    const loadingEl = document.getElementById("loading");
+    const loadingMsgEl = document.getElementById("loadingMsg");
+    const ytLoadingEl = document.getElementById("ytLoading");
+    const ytLoadingMsgEl = document.getElementById("ytLoadingMsg");
+    const PAGE_ORIGIN = window.location.origin;
+
+    let wasmReady = false;
+    let ytReady = false;
+    let bootFailed = false;
+
+    function setVizLoading(show, text) {
+      loadingEl.classList.toggle("show", !!show);
+      if (typeof text === "string" && text.length && loadingMsgEl) {
+        loadingMsgEl.textContent = text;
+      }
+    }
+
+    function setYoutubeLoading(show, text) {
+      ytLoadingEl.classList.toggle("show", !!show);
+      if (typeof text === "string" && text.length && ytLoadingMsgEl) {
+        ytLoadingMsgEl.textContent = text;
+      }
+    }
+
+    function refreshLoading() {
+      if (bootFailed) {
+        setVizLoading(true, "Failed to load the app. Check the console for details.");
+        setYoutubeLoading(true, "YouTube may also fail to load.");
+        return;
+      }
+      if (!wasmReady) {
+        setVizLoading(true, "Loading the app (this can take a moment)…");
+        return;
+      }
+      setVizLoading(false, "");
+
+      if (!ytReady) {
+        setYoutubeLoading(true, "Preparing the player…");
+        return;
+      }
+
+      setYoutubeLoading(false, "");
+    }
 
     // Called from Rust (wasm) to update overlays.
     // Important: wasm-bindgen glue runs in ES module scope; refer to these via `globalThis.*`.
@@ -176,6 +338,16 @@
       rootEl.classList.toggle("hideVideo", !show);
     };
 
+    // Loading overlay control. Called both from JS boot and from Rust (wasm) once ready.
+    // Back-compat: still allow wasm/JS to control the viz overlay directly.
+    globalThis.mcbaise_set_loading = (show, text) => setVizLoading(show, text);
+
+    // Called from Rust (wasm) once the startup scene has been created.
+    globalThis.mcbaise_set_wasm_ready = () => {
+      wasmReady = true;
+      refreshLoading();
+    };
+
     function loadScript(src) {
       return new Promise((resolve, reject) => {
         const s = document.createElement("script");
@@ -190,14 +362,21 @@
     // Boot wasm.
     let wasm = null;
     async function bootWasm() {
+      wasmReady = false;
+      bootFailed = false;
+      refreshLoading();
       // Bust cache for both the JS glue and the wasm binary.
       // This prevents running an older cached glue file that may still reference missing globals.
       const v = Date.now().toString();
+      setVizLoading(true, "Downloading WebAssembly…");
       const mod = await import(`./pkg/bevy_mcbaise_fantasmagoria.js?v=${v}`);
       // wasm-bindgen requires explicit initialization; otherwise exports will exist but call into
       // an uninitialized internal `wasm` instance.
-      await mod.default(`./pkg/bevy_mcbaise_fantasmagoria_bg.wasm?v=${v}`);
+      setVizLoading(true, "Initializing WebAssembly…");
+      await mod.default({ module_or_path: `./pkg/bevy_mcbaise_fantasmagoria_bg.wasm?v=${v}` });
       wasm = mod;
+      // The app will call `mcbaise_set_wasm_ready()` from Rust when it finishes startup.
+      refreshLoading();
     }
 
     // YouTube player.
@@ -254,14 +433,29 @@
     }
 
     window.onYouTubeIframeAPIReady = () => {
+      ytReady = false;
+      setYoutubeLoading(true, "Preparing the player…");
+      refreshLoading();
       player = new YT.Player("player", {
         videoId: VIDEO_ID,
         width: "100%",
         height: "100%",
-        playerVars: { autoplay: 0, controls: 1, rel: 0, modestbranding: 1, playsinline: 1 },
+        playerVars: {
+          autoplay: 0,
+          controls: 1,
+          rel: 0,
+          modestbranding: 1,
+          playsinline: 1,
+          enablejsapi: 1,
+          // Required on some browsers/devices to avoid postMessage origin mismatch.
+          origin: PAGE_ORIGIN,
+        },
         events: {
           onReady: () => {
             playerReady = true;
+            ytReady = true;
+            setYoutubeLoading(false, "");
+            refreshLoading();
             const t = player.getCurrentTime?.() ?? 0;
             wasm?.set_video_time?.(t, false);
 
@@ -305,8 +499,16 @@
 
 
     async function main() {
-      await bootWasm();
+      try {
+        await bootWasm();
+      } catch (err) {
+        console.error(err);
+        bootFailed = true;
+        refreshLoading();
+        throw err;
+      }
       // DOM controls were removed; the wasm app uses an egui overlay for runtime controls.
+      setYoutubeLoading(true, "Loading YouTube…");
       await loadScript("https://www.youtube.com/iframe_api");
     }
 
