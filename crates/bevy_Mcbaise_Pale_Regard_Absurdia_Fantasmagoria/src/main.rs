@@ -3797,7 +3797,7 @@ fn setup_scene(
     // This avoids anchoring egui to the first 3D camera's viewport when multiview is enabled.
     #[cfg(not(target_arch = "wasm32"))]
     commands.spawn((
-        Camera2d::default(),
+        Camera2d,
         Camera {
             viewport: None,
             order: 10_000,
@@ -3841,6 +3841,7 @@ fn setup_scene(
     mcbaise_set_wasm_ready();
 }
 
+#[allow(clippy::type_complexity)]
 fn sync_view_cameras(
     mut commands: Commands,
     multi_view: Res<MultiView>,
@@ -3879,7 +3880,7 @@ fn sync_view_cameras(
         let mut e = commands.spawn((
             Camera3d::default(),
             (*projection).clone(),
-            (*main_tr).clone(),
+            *main_tr,
             ViewCamera { index: idx },
         ));
 
@@ -5100,8 +5101,9 @@ fn update_overlays(
     mut overlay_text: ResMut<OverlayText>,
     overlay_vis: Res<OverlayVisibility>,
     caption_vis: Res<CaptionVisibility>,
-    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
-    native_youtube: Option<Res<NativeYoutubeSync>>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))] native_youtube: Option<
+        Res<NativeYoutubeSync>,
+    >,
     #[cfg(not(target_arch = "wasm32"))] mut window: Query<&mut Window, With<PrimaryWindow>>,
 ) {
     let t = playback.time_sec;
@@ -5151,9 +5153,9 @@ fn update_overlays(
     }
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
-    let waiting_for_play = native_youtube
-        .as_ref()
-        .is_some_and(|s| s.enabled && (!s.has_remote || (!playback.playing && playback.time_sec < 0.05)));
+    let waiting_for_play = native_youtube.as_ref().is_some_and(|s| {
+        s.enabled && (!s.has_remote || (!playback.playing && playback.time_sec < 0.05))
+    });
 
     #[cfg(target_arch = "wasm32")]
     let waiting_for_play = !playback.playing && playback.time_sec < 0.05;
@@ -5332,7 +5334,10 @@ fn ui_overlay(
                 for i in 0..=steps {
                     let t = i as f32 / steps as f32;
                     let a = a0 + (a1 - a0) * t;
-                    pts.push(egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin()));
+                    pts.push(egui::pos2(
+                        center.x + radius * a.cos(),
+                        center.y + radius * a.sin(),
+                    ));
                 }
                 painter.add(egui::Shape::convex_polygon(pts, fill, egui::Stroke::NONE));
             }
@@ -5356,14 +5361,10 @@ fn ui_overlay(
                 if !multi_view.increment() {
                     multi_view_hint.show(now_sec, "right click to remove");
                 }
-            } else if resp.clicked_by(egui::PointerButton::Secondary) {
-                if !multi_view.decrement() {
-                    multi_view_hint.show(now_sec, "left click to add more");
-                }
-            } else if resp.long_touched() {
-                if !multi_view.decrement() {
-                    multi_view_hint.show(now_sec, "left click to add more");
-                }
+            } else if (resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched())
+                && !multi_view.decrement()
+            {
+                multi_view_hint.show(now_sec, "left click to add more");
             }
         });
 
@@ -6700,14 +6701,14 @@ fn camera_pose(
     let a = (mode_age_sec / 0.9).clamp(0.0, 1.0);
     let a = a * a * (3.0 - 2.0 * a); // smoothstep
     let focused_dist = focused_base_dist * (1.25 - 0.55 * a);
-    let focused_chase_dir = (-subject_tangent * 0.90 + cam_n * 0.28 + cam_b * 0.22)
-        .normalize_or_zero();
+    let focused_chase_dir =
+        (-subject_tangent * 0.90 + cam_n * 0.28 + cam_b * 0.22).normalize_or_zero();
     let focused_chase_pos = target_pos + focused_chase_dir * focused_dist;
     let focused_chase_look = target_pos + subject_tangent * 1.8;
     let focused_chase_up = cam_n;
 
-    let focused_side_dir = (cam_b * 0.95 + cam_n * 0.20 - subject_tangent * 0.18)
-        .normalize_or_zero();
+    let focused_side_dir =
+        (cam_b * 0.95 + cam_n * 0.20 - subject_tangent * 0.18).normalize_or_zero();
     let focused_side_pos = target_pos + focused_side_dir * focused_dist;
     let focused_side_look = target_pos + subject_tangent * 1.6;
     let focused_side_up = cam_n;
@@ -7253,7 +7254,7 @@ fn opening_credits() -> &'static [Credit] {
     ]
 }
 
-fn print_embedded_registry(registry: Res<EmbeddedAssetRegistry>) {
+fn print_embedded_registry(_registry: Res<EmbeddedAssetRegistry>) {
     // Print the compile-time embedded path for the shader file so we can match the AssetServer lookup.
     // let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
     // info!("embedded_path for mcbaise_tube.wgsl = {}", p.display());
