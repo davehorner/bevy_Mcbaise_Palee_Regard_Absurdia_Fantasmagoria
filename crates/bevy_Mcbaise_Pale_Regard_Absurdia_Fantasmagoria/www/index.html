@@ -31,7 +31,11 @@
     .vizOnly #left { display: none !important; }
     .vizOnly #ytLoading,
     .vizOnly #playerWrap,
-    .vizOnly #videoPi { display: none !important; }
+     /* vizOnly: don't hide the cardinal pi container — viz-only frames shouldn't show the player, but
+       the control overlay must remain usable when present in the parent document. */
+
+    /* vizOnly: do not show captions; credits are allowed. */
+    .vizOnly #caption { display: none !important; }
 
     #left, #right {
       flex: 1;
@@ -83,43 +87,43 @@
       background: #000;
       isolation: isolate;
     }
+    /* When hiding video we only hide the player contents, not the entire left column,
+       so viz panes inserted above/below remain present. */
+     /* hide only the player contents and collapse the player area so it doesn't
+       take vertical space between N and S viz panes */
+     #playerWrap.hidePlayer { flex: 0 0 0px; height: 0px; min-height: 0; overflow: hidden; padding: 0; }
+     #playerWrap.hidePlayer #player { display: none !important; }
+     #playerWrap.hidePlayer #ytLoading { display: none !important; }
     #player { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; }
     #player iframe { width: 100% !important; height: 100% !important; display: block; }
 
-    #videoPi {
+    /* Legacy single-π CSS removed; use the cardinal buttons in #videoPiContainer. */
+
+    /* container for the 4 cardinal π buttons: top-level fixed overlay so it's always on top */
+    #videoPiContainer { position: fixed; inset: 0; pointer-events: none; z-index: 100000; }
+    .videoPi {
       position: absolute;
-      top: calc(env(safe-area-inset-top, 0px) + 44px);
-      left: 50%;
-      transform: translateX(-50%);
-      width: 28px;
-      height: 28px;
+      width: 34px;
+      height: 34px;
       display: grid;
       place-items: center;
-      z-index: 20;
-      pointer-events: auto;
-      cursor: pointer;
-      user-select: none;
-      -webkit-tap-highlight-color: transparent;
-      border-radius: 6px;
-      border: 1.5px solid rgba(255,255,255,0.65);
-      color: rgba(255,255,255,0.92);
+      border-radius: 8px;
+      border: 1.2px solid rgba(255,255,255,0.65);
       background: rgba(0,0,0,0.15);
-      font-family: system-ui, sans-serif;
+      color: rgba(255,255,255,0.95);
       font-weight: 800;
-      line-height: 1;
+      cursor: pointer;
+      pointer-events: auto;
+      z-index: 40;
     }
+    .videoPi[data-dir="top"] { left: 50%; transform: translateX(-50%); top: calc(env(safe-area-inset-top, 0px) + 8px); }
+    .videoPi[data-dir="bottom"] { left: 50%; transform: translateX(-50%); bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); }
+    .videoPi[data-dir="left"] { left: 8px; top: 50%; transform: translateY(-50%); }
+    .videoPi[data-dir="right"] { right: 8px; top: 50%; transform: translateY(-50%); }
 
-    #videoPi:active {
-      transform: translate(-50%, 0.5px);
-    }
-
-    @media (pointer: coarse) {
-      #videoPi {
-        width: 34px;
-        height: 34px;
-        font-size: 18px;
-      }
-    }
+    /* hidden by default; toggled by .show on container */
+    #videoPiContainer { opacity: 0; transition: opacity 140ms ease; }
+    #videoPiContainer.show { opacity: 1; }
 
     .extraViz {
       flex: 1 1 auto;
@@ -329,7 +333,7 @@
       <div id="playerWrap">
         <div id="player"></div>
 
-        <div id="videoPi" title="Add another viz">π</div>
+        <!-- videoPiContainer moved to top-level (inserted after #root) -->
 
         <div id="ytLoading" class="show">
           <div class="box">
@@ -361,6 +365,14 @@
     </div>
   </div>
 
+  <!-- Top-level cardinal π container: always fixed above all content. -->
+  <div id="videoPiContainer" aria-hidden="true">
+    <button class="videoPi" data-dir="top" title="Add viz above">N</button>
+    <button class="videoPi" data-dir="right" title="Add viz right">E</button>
+    <button class="videoPi" data-dir="bottom" title="Add viz below">S</button>
+    <button class="videoPi" data-dir="left" title="Add viz left">W</button>
+  </div>
+
   <script type="module">
     const VIDEO_ID = "v2hcW03gcus";
 
@@ -374,7 +386,8 @@
     const loadingMsgEl = document.getElementById("loadingMsg");
     const ytLoadingEl = document.getElementById("ytLoading");
     const ytLoadingMsgEl = document.getElementById("ytLoadingMsg");
-    const videoPiEl = document.getElementById("videoPi");
+    const videoPiContainer = document.getElementById("videoPiContainer");
+    const playerWrapEl = document.getElementById("playerWrap");
     const PAGE_ORIGIN = window.location.origin;
 
     // Small toast to confirm key detection (useful when DevTools shortcuts are blocked).
@@ -458,6 +471,11 @@
     let ytReady = false;
     let bootFailed = false;
 
+    function setVideoPiVisible(show) {
+      if (!videoPiContainer) return;
+      videoPiContainer.classList.toggle("show", !!show);
+    }
+
     function setVizLoading(show, text) {
       loadingEl.classList.toggle("show", !!show);
       if (typeof text === "string" && text.length && loadingMsgEl) {
@@ -473,6 +491,11 @@
     }
 
     function refreshLoading() {
+      // Only show the DOM π control when both halves are ready.
+      // (And never in vizOnly iframes.)
+      // Debug: log readiness to help diagnose premature visibility issues.
+      console.debug('refreshLoading:', { vizOnly, bootFailed, wasmReady, ytReady });
+      setVideoPiVisible(!vizOnly && !bootFailed && wasmReady && ytReady);
       if (bootFailed) {
         setVizLoading(true, "Failed to load the app. Check the console for details.");
         setYoutubeLoading(true, "YouTube may also fail to load.");
@@ -505,6 +528,12 @@
     };
 
     globalThis.mcbaise_set_caption = (text, show, isMeta) => {
+      if (vizOnly) {
+        // vizOnly iframes: captions are hidden by default.
+        captionEl.classList.remove("show", "meta");
+        captionEl.textContent = "";
+        return;
+      }
       if (!show) {
         captionEl.classList.remove("show", "meta");
         captionEl.textContent = "";
@@ -518,7 +547,14 @@
     // Called from Rust (wasm) to show/hide the YouTube pane.
     // "Hide" means collapse the left column to 0 width.
     globalThis.mcbaise_set_video_visible = (show) => {
-      rootEl.classList.toggle("hideVideo", !show);
+      if (vizOnly) {
+        // Forward to parent: only the parent actually owns the YouTube pane.
+        try {
+          window.parent?.postMessage({ type: "mcbaise_set_video_visible", show: !!show }, PAGE_ORIGIN);
+        } catch (_) {}
+        return;
+      }
+      setVideoVisibility(!!show);
     };
 
     // Loading overlay control. Called both from JS boot and from Rust (wasm) once ready.
@@ -572,23 +608,106 @@
 
     // Extra viz instances are injected as iframes so they can run a separate wasm app.
     // This avoids wasm-bindgen's single-instance limitation within one document.
+    // Track injected viz iframes as objects so we can retry/post-initialize reliably.
     const extraVizFrames = [];
 
+    function _postToFrame(frameLike, msg) {
+      try {
+        // support both raw iframe element and our { iframe, ready } objects
+        const win = frameLike?.contentWindow || frameLike?.iframe?.contentWindow;
+        console.debug('mcbaise:postToFrame', { msg, hasWindow: !!win, frameLike });
+        if (win) win.postMessage(msg, PAGE_ORIGIN);
+      } catch (_) {}
+    }
+
     function broadcastTime(timeSec, playing) {
-      for (const frame of extraVizFrames) {
-        try {
-          frame?.contentWindow?.postMessage({ type: "mcbaise_time", timeSec, playing: !!playing }, PAGE_ORIGIN);
-        } catch (_) {}
+      console.debug('mcbaise:broadcastTime', { timeSec, playing, count: extraVizFrames.length });
+      for (const f of extraVizFrames) {
+        _postToFrame(f, { type: "mcbaise_time", timeSec, playing: !!playing });
       }
     }
 
-    // Receive play/pause requests from child viz iframes.
-    window.addEventListener("message", (e) => {
-      if (e.origin !== PAGE_ORIGIN) return;
-      const data = e.data;
-      if (!data || typeof data !== "object") return;
-      if (data.type === "mcbaise_request_playing") {
-        globalThis.mcbaise_request_playing(!!data.playing);
+    function broadcastVisibility(show) {
+      console.debug('mcbaise:broadcastVisibility', { show, count: extraVizFrames.length });
+      for (const f of extraVizFrames) {
+        _postToFrame(f, { type: 'mcbaise_set_video_visible', show: !!show });
+      }
+      // Also inform wasm in this page (if it exposes a handler).
+      try {
+        wasm?.set_video_visible?.(!!show);
+      } catch (_) {}
+    }
+
+    // Set video visibility intelligently: if there are additional viz panes
+    // inserted above/below the player we hide only the player contents; if
+    // there are no extra viz panes we collapse the entire left column.
+    function setVideoVisibility(show) {
+      if (!rootEl) return;
+      const leftCol = document.getElementById('left');
+      const extras = leftCol ? leftCol.querySelectorAll('.extraViz') : [];
+      const hasExtras = extras && extras.length > 0;
+
+      if (show) {
+        if (playerWrapEl) playerWrapEl.classList.remove('hidePlayer');
+        rootEl.classList.remove('hideVideo');
+      } else {
+        if (hasExtras) {
+          // Preserve the left column (it contains extra viz panes); hide only the player area.
+          if (playerWrapEl) playerWrapEl.classList.add('hidePlayer');
+          rootEl.classList.remove('hideVideo');
+        } else {
+          // No extras — fully collapse the left column.
+          rootEl.classList.add('hideVideo');
+          if (playerWrapEl) playerWrapEl.classList.remove('hidePlayer');
+        }
+      }
+
+      try { broadcastVisibility(show); } catch (_) {}
+    }
+
+    // Apply visibility locally in this document (used by viz-only iframes
+    // when they receive a broadcast from the parent). This updates the DOM
+    // and notifies the local wasm instance if available.
+    function applyLocalVideoVisibility(show) {
+      try {
+        if (playerWrapEl) {
+          if (show) playerWrapEl.classList.remove('hidePlayer');
+          else playerWrapEl.classList.add('hidePlayer');
+        }
+      } catch (_) {}
+      try { wasm?.set_video_visible?.(!!show); } catch (_) {}
+    }
+
+    // Receive play/pause/visibility requests from child viz iframes.
+    // Accept both legacy `{ mcbaise_request_playing: 'play' }` shapes and
+    // the `{ type: 'mcbaise_request_playing', playing: true }` message style used by viz-only frames.
+    window.addEventListener('message', (ev) => {
+      console.debug('mcbaise:parent:message', { origin: ev.origin, data: ev.data });
+      const d = ev.data || {};
+      if (!d || typeof d !== 'object') return;
+
+      // Ignore child time pushes — parent is authoritative for time.
+      if (d.mcbaise_time !== undefined || d.type === 'mcbaise_time') return;
+
+      // Play/pause: support both shapes
+      if (d.type === 'mcbaise_request_playing') {
+        if (d.playing) player?.playVideo?.();
+        else player?.pauseVideo?.();
+      } else if (d.mcbaise_request_playing) {
+        if (d.mcbaise_request_playing === 'play') player?.playVideo?.();
+        if (d.mcbaise_request_playing === 'pause') player?.pauseVideo?.();
+      }
+
+      // Visibility: support both `{ type: 'mcbaise_set_video_visible', show }` and `{ mcbaise_set_video_visible: true }`.
+      if (d.type === 'mcbaise_set_video_visible' || d.mcbaise_set_video_visible !== undefined) {
+        const visible = d.type === 'mcbaise_set_video_visible' ? !!d.show : !!d.mcbaise_set_video_visible;
+        setVideoVisibility(visible);
+        return;
+      }
+
+      if (d.type === 'mcbaise_set_video_visible_ack') {
+        console.debug('mcbaise: child acked visibility change', { applied: d.applied });
+        return;
       }
     });
 
@@ -716,60 +835,84 @@
       });
     };
 
-    // In viz-only mode, receive time updates from the parent page.
+    // In viz-only mode, receive time/visibility/playback updates from the parent page.
     window.addEventListener("message", (e) => {
-      if (e.origin !== PAGE_ORIGIN) return;
+      if (e.origin !== PAGE_ORIGIN) {
+        console.debug('mcbaise:child:ignored-origin', { origin: e.origin, expected: PAGE_ORIGIN, data: e.data });
+        return;
+      }
+      console.debug('mcbaise:child:message', e.data);
       const data = e.data;
       if (!data || typeof data !== "object") return;
+
       if (data.type === "mcbaise_time") {
         wasm?.set_video_time?.(Number(data.timeSec) || 0, !!data.playing);
+        return;
+      }
+
+      if (data.type === 'mcbaise_set_video_visible') {
+        try { applyLocalVideoVisibility?.(!!data.show); } catch (_) {}
+        // Acknowledge back to the parent so it can confirm delivery (useful for debugging).
+        try { window.parent?.postMessage({ type: 'mcbaise_set_video_visible_ack', applied: !!data.show }, PAGE_ORIGIN); } catch (_) {}
+        return;
+      }
+
+      if (data.type === 'mcbaise_request_playing') {
+        try {
+          if (data.playing) wasm?.request_playing?.(true);
+          else wasm?.request_playing?.(false);
+        } catch (_) {}
+        return;
       }
     });
 
-    function injectExtraViz() {
+    function injectExtraViz(direction) {
       if (vizOnly) return;
+      direction = direction || 'right';
       // Keep it simple: only inject one extra viz per click.
-      // Additional clicks will inject another iframe.
-      const pane = document.createElement("div");
-      pane.className = "extraViz";
+      const pane = document.createElement('div');
+      pane.className = 'extraViz';
 
-      const iframe = document.createElement("iframe");
-      iframe.loading = "lazy";
-      iframe.title = "mcbaise viz";
-
+      const iframe = document.createElement('iframe');
+      iframe.loading = 'lazy';
+      iframe.title = 'mcbaise viz';
       const u = new URL(window.location.href);
-      u.searchParams.set("vizOnly", "1");
+      u.searchParams.set('vizOnly', '1');
       iframe.src = u.toString();
-
       pane.appendChild(iframe);
 
-      const left = document.getElementById("left");
-      const playerWrap = document.getElementById("playerWrap");
-      const right = document.getElementById("right");
+      const left = document.getElementById('left');
+      const playerWrap = document.getElementById('playerWrap');
+      const right = document.getElementById('right');
 
-      // Random placement:
-      // 0: new column left of the video
-      // 1: new column right of the video (between video and main viz)
-      // 2: inside video pane, above the player
-      // 3: inside video pane, below the player
-      const placement = Math.floor(Math.random() * 4);
-      if (placement === 0 && left) {
+      // Deterministic placement by direction
+      if (direction === 'left' && left) {
         rootEl.insertBefore(pane, left);
-      } else if (placement === 1 && right) {
+      } else if (direction === 'right' && right) {
         rootEl.insertBefore(pane, right);
-      } else if (placement === 2 && left && playerWrap) {
+      } else if ((direction === 'top' || direction === 'above') && left && playerWrap) {
         left.insertBefore(pane, playerWrap);
-      } else if (placement === 3 && left && playerWrap) {
-        // Guaranteed "bottom": append after the playerWrap.
+      } else if ((direction === 'bottom' || direction === 'below') && left && playerWrap) {
         left.appendChild(pane);
       } else {
-        // Fallback: keep the app usable even if the DOM changed.
-        (left || rootEl).appendChild(pane);
+        // fallback: append to right
+        (right || left || rootEl).appendChild(pane);
       }
 
-      extraVizFrames.push(iframe);
+      // Track frame with readiness flag and send initial messages on load.
+      const frameObj = { iframe, ready: false };
+      extraVizFrames.push(frameObj);
+      iframe.addEventListener('load', () => {
+        frameObj.ready = true;
+        // Send an initial time and visibility sample after load.
+        try {
+          const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+          _postToFrame(frameObj, { type: 'mcbaise_time', timeSec: t, playing: !!isPlaying });
+          _postToFrame(frameObj, { type: 'mcbaise_set_video_visible', show: !(playerWrapEl && playerWrapEl.classList.contains('hidePlayer')) });
+        } catch (_) {}
+      });
 
-      // Push an initial time sample as soon as possible.
+      // Push an initial time sample as soon as possible to already-loaded frames.
       const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
       broadcastTime(t, !!isPlaying);
     }
@@ -789,8 +932,7 @@
         ytReady = true;
         setYoutubeLoading(false, "");
         refreshLoading();
-        rootEl.classList.add("hideVideo");
-        if (videoPiEl) videoPiEl.style.display = "none";
+        if (videoPiContainer) videoPiContainer.style.display = "none";
         return;
       }
 
@@ -799,8 +941,15 @@
       await loadScript("https://www.youtube.com/iframe_api");
     }
 
-    if (videoPiEl) {
-      videoPiEl.addEventListener("click", () => injectExtraViz());
+    // Wire up directional pi buttons to inject viz in that cardinal direction.
+    if (videoPiContainer) {
+      const btns = videoPiContainer.querySelectorAll('.videoPi');
+      btns.forEach(b => {
+        b.addEventListener('click', (ev) => {
+          const dir = b.dataset.dir || 'right';
+          injectExtraViz(dir);
+        });
+      });
     }
 
     main().catch(err => console.error(err));
