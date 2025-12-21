@@ -6,6 +6,14 @@
   <link rel="icon" href="favicon.ico" sizes="any" />
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
   <title>MCBAISE • PALE REGARD • ABSURDIA FANTASMAGORIA</title>
+  <script>
+    // vizOnly iframes should never show the YouTube pane/loading UI.
+    // Do this in the head to avoid a flash before the module script runs.
+    try {
+      const p = new URLSearchParams(location.search);
+      if (p.get('vizOnly') === '1') document.documentElement.classList.add('vizOnly');
+    } catch (_) {}
+  </script>
   <style>
     @import url("https://fonts.googleapis.com/css2?family=Baloo+2:wght@700;800&display=swap");
 
@@ -19,6 +27,12 @@
 
     #root { height: 100%; display: flex; }
 
+    /* vizOnly iframes: hide the YouTube pane entirely (no flash). */
+    .vizOnly #left { display: none !important; }
+    .vizOnly #ytLoading,
+    .vizOnly #playerWrap,
+    .vizOnly #videoPi { display: none !important; }
+
     #left, #right {
       flex: 1;
       position: relative;
@@ -28,6 +42,9 @@
     #left {
       border-right: 2px solid rgba(255,255,255,0.12);
       background: #000;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
     }
 
     /* Landscape: hide video by collapsing width. */
@@ -59,9 +76,58 @@
       }
     }
 
-    #playerWrap { position: absolute; inset: 0; background: #000; }
+    #playerWrap {
+      position: relative;
+      flex: 1 1 auto;
+      min-height: 0;
+      background: #000;
+    }
     #player { position: absolute; inset: 0; width: 100%; height: 100%; }
     #player iframe { width: 100% !important; height: 100% !important; display: block; }
+
+    #videoPi {
+      position: absolute;
+      top: 44px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 28px;
+      height: 28px;
+      display: grid;
+      place-items: center;
+      z-index: 6;
+      pointer-events: auto;
+      cursor: pointer;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      border-radius: 6px;
+      border: 1.5px solid rgba(255,255,255,0.65);
+      color: rgba(255,255,255,0.92);
+      background: rgba(0,0,0,0.15);
+      font-family: system-ui, sans-serif;
+      font-weight: 800;
+      line-height: 1;
+    }
+
+    #videoPi:active {
+      transform: translate(-50%, 0.5px);
+    }
+
+    .extraViz {
+      flex: 1 1 auto;
+      position: relative;
+      min-width: 0;
+      min-height: 0;
+      background: #000;
+    }
+
+    .extraViz iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+      display: block;
+    }
 
     #ytLoading {
       position: absolute;
@@ -90,6 +156,31 @@
       align-items: center;
       justify-items: center;
       padding: 4vmin;
+    }
+
+    /* Debug toast (used to confirm key chords are being detected). */
+    #keyToast {
+      position: fixed;
+      right: 10px;
+      top: 10px;
+      z-index: 10000;
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(-6px);
+      transition: opacity 120ms ease, transform 120ms ease;
+      padding: 6px 9px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.35);
+      color: rgba(255,255,255,0.92);
+      background: rgba(0,0,0,0.65);
+      font: 600 12px/1.25 system-ui, sans-serif;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    #keyToast.show {
+      opacity: 1;
+      transform: translateY(0);
     }
 
     .title {
@@ -229,6 +320,8 @@
       <div id="playerWrap">
         <div id="player"></div>
 
+        <div id="videoPi" title="Add another viz">π</div>
+
         <div id="ytLoading" class="show">
           <div class="box">
             <div class="title">Loading YouTube…</div>
@@ -262,6 +355,9 @@
   <script type="module">
     const VIDEO_ID = "v2hcW03gcus";
 
+    const params = new URLSearchParams(window.location.search);
+    const vizOnly = params.get("vizOnly") === "1";
+
     const creditEl = document.getElementById("credit");
     const captionEl = document.getElementById("caption");
     const rootEl = document.getElementById("root");
@@ -269,7 +365,85 @@
     const loadingMsgEl = document.getElementById("loadingMsg");
     const ytLoadingEl = document.getElementById("ytLoading");
     const ytLoadingMsgEl = document.getElementById("ytLoadingMsg");
+    const videoPiEl = document.getElementById("videoPi");
     const PAGE_ORIGIN = window.location.origin;
+
+    // Small toast to confirm key detection (useful when DevTools shortcuts are blocked).
+    const keyToastEl = (() => {
+      const el = document.createElement("div");
+      el.id = "keyToast";
+      el.textContent = "";
+      document.body.appendChild(el);
+      return el;
+    })();
+
+    let keyToastTimer = null;
+    function showKeyToast(text) {
+      if (!keyToastEl) return;
+      keyToastEl.textContent = text;
+      keyToastEl.classList.add("show");
+      if (keyToastTimer) clearTimeout(keyToastTimer);
+      keyToastTimer = setTimeout(() => keyToastEl.classList.remove("show"), 900);
+    }
+
+    // Two-step devtools helper: first press focuses the page, second press triggers `debugger;`.
+    let devtoolsChordPrimedUntilMs = 0;
+    function focusForDevtools() {
+      // Make sure our targets can be focused programmatically.
+      // (tabIndex=-1 keeps them out of normal tab order.)
+      try {
+        rootEl.tabIndex = -1;
+      } catch (_) {}
+      const playerWrapEl = document.getElementById("playerWrap");
+      try {
+        if (playerWrapEl) playerWrapEl.tabIndex = -1;
+      } catch (_) {}
+
+      // Ask the window/document to focus, then focus a stable element.
+      try {
+        window.focus();
+      } catch (_) {}
+      try {
+        rootEl.focus({ preventScroll: true });
+      } catch (_) {
+        try {
+          rootEl.focus();
+        } catch (_) {}
+      }
+
+      // If we're not in vizOnly, also try focusing the player wrapper.
+      if (!vizOnly && playerWrapEl) {
+        try {
+          playerWrapEl.focus({ preventScroll: true });
+        } catch (_) {
+          try {
+            playerWrapEl.focus();
+          } catch (_) {}
+        }
+      }
+    }
+
+    // Best-effort: some embedded hosts (or focus states) may not open DevTools with Ctrl+Shift+I.
+    // Browsers do not expose an API to open DevTools directly, but a `debugger` statement often
+    // prompts DevTools to open when available.
+    window.addEventListener(
+      "keydown",
+      (e) => {
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "I" || e.key === "i")) {
+          // Do not preventDefault() here: in real browsers this is a built-in DevTools shortcut.
+          const now = Date.now();
+          if (now <= devtoolsChordPrimedUntilMs) {
+            showKeyToast("Ctrl+Shift+I again (debugger)");
+            debugger;
+          } else {
+            devtoolsChordPrimedUntilMs = now + 2000;
+            focusForDevtools();
+            showKeyToast("Ctrl+Shift+I (focused) — press again");
+          }
+        }
+      },
+      { capture: true }
+    );
 
     let wasmReady = false;
     let ytReady = false;
@@ -387,9 +561,39 @@
     let pollId = null;
     let pendingPlayingRequest = null;
 
+    // Extra viz instances are injected as iframes so they can run a separate wasm app.
+    // This avoids wasm-bindgen's single-instance limitation within one document.
+    const extraVizFrames = [];
+
+    function broadcastTime(timeSec, playing) {
+      for (const frame of extraVizFrames) {
+        try {
+          frame?.contentWindow?.postMessage({ type: "mcbaise_time", timeSec, playing: !!playing }, PAGE_ORIGIN);
+        } catch (_) {}
+      }
+    }
+
+    // Receive play/pause requests from child viz iframes.
+    window.addEventListener("message", (e) => {
+      if (e.origin !== PAGE_ORIGIN) return;
+      const data = e.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "mcbaise_request_playing") {
+        globalThis.mcbaise_request_playing(!!data.playing);
+      }
+    });
+
     // Called from Rust (wasm) to request play/pause.
     // Note: may be called before the YouTube player is ready.
     globalThis.mcbaise_request_playing = (playing) => {
+      if (vizOnly) {
+        // In a viz-only iframe: ask the parent to control the video.
+        try {
+          window.parent?.postMessage({ type: "mcbaise_request_playing", playing: !!playing }, PAGE_ORIGIN);
+        } catch (_) {}
+        return;
+      }
+
       const want = !!playing;
       pendingPlayingRequest = want;
 
@@ -409,6 +613,7 @@
         if (!wasm?.set_video_time || !playerReady || !player?.getCurrentTime) return;
         const t = player.getCurrentTime();
         wasm.set_video_time(t, !!isPlaying);
+        broadcastTime(t, !!isPlaying);
       };
       loop();
     }
@@ -424,6 +629,7 @@
         if (!wasm?.set_video_time || !playerReady || !player?.getCurrentTime) return;
         const t = player.getCurrentTime();
         wasm.set_video_time(t, !!isPlaying);
+        broadcastTime(t, !!isPlaying);
       }, 250);
     }
 
@@ -458,6 +664,7 @@
             refreshLoading();
             const t = player.getCurrentTime?.() ?? 0;
             wasm?.set_video_time?.(t, false);
+            broadcastTime(t, false);
 
             if (pendingPlayingRequest !== null) {
               try {
@@ -477,6 +684,7 @@
               isPlaying = false;
               const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
               wasm?.set_video_time?.(t, false);
+              broadcastTime(t, false);
               stopLoop();
               stopPoll();
             }
@@ -485,17 +693,77 @@
             // Keep wasm time/playing fresh when playback rate changes.
             const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
             wasm?.set_video_time?.(t, !!isPlaying);
+            broadcastTime(t, !!isPlaying);
           },
           onError: (err) => {
             console.warn('YouTube player error', err);
             const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
             wasm?.set_video_time?.(t, false);
+            broadcastTime(t, false);
             stopLoop();
             stopPoll();
           }
         }
       });
     };
+
+    // In viz-only mode, receive time updates from the parent page.
+    window.addEventListener("message", (e) => {
+      if (e.origin !== PAGE_ORIGIN) return;
+      const data = e.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "mcbaise_time") {
+        wasm?.set_video_time?.(Number(data.timeSec) || 0, !!data.playing);
+      }
+    });
+
+    function injectExtraViz() {
+      if (vizOnly) return;
+      // Keep it simple: only inject one extra viz per click.
+      // Additional clicks will inject another iframe.
+      const pane = document.createElement("div");
+      pane.className = "extraViz";
+
+      const iframe = document.createElement("iframe");
+      iframe.loading = "lazy";
+      iframe.title = "mcbaise viz";
+
+      const u = new URL(window.location.href);
+      u.searchParams.set("vizOnly", "1");
+      iframe.src = u.toString();
+
+      pane.appendChild(iframe);
+
+      const left = document.getElementById("left");
+      const playerWrap = document.getElementById("playerWrap");
+      const right = document.getElementById("right");
+
+      // Random placement:
+      // 0: new column left of the video
+      // 1: new column right of the video (between video and main viz)
+      // 2: inside video pane, above the player
+      // 3: inside video pane, below the player
+      const placement = Math.floor(Math.random() * 4);
+      if (placement === 0 && left) {
+        rootEl.insertBefore(pane, left);
+      } else if (placement === 1 && right) {
+        rootEl.insertBefore(pane, right);
+      } else if (placement === 2 && left && playerWrap) {
+        left.insertBefore(pane, playerWrap);
+      } else if (placement === 3 && left && playerWrap) {
+        // Guaranteed "bottom": append after the playerWrap.
+        left.appendChild(pane);
+      } else {
+        // Fallback: keep the app usable even if the DOM changed.
+        (left || rootEl).appendChild(pane);
+      }
+
+      extraVizFrames.push(iframe);
+
+      // Push an initial time sample as soon as possible.
+      const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+      broadcastTime(t, !!isPlaying);
+    }
 
 
     async function main() {
@@ -507,9 +775,23 @@
         refreshLoading();
         throw err;
       }
+      if (vizOnly) {
+        // Viz-only iframe: no YouTube; parent will drive time via postMessage.
+        ytReady = true;
+        setYoutubeLoading(false, "");
+        refreshLoading();
+        rootEl.classList.add("hideVideo");
+        if (videoPiEl) videoPiEl.style.display = "none";
+        return;
+      }
+
       // DOM controls were removed; the wasm app uses an egui overlay for runtime controls.
       setYoutubeLoading(true, "Loading YouTube…");
       await loadScript("https://www.youtube.com/iframe_api");
+    }
+
+    if (videoPiEl) {
+      videoPiEl.addEventListener("click", () => injectExtraViz());
     }
 
     main().catch(err => console.error(err));

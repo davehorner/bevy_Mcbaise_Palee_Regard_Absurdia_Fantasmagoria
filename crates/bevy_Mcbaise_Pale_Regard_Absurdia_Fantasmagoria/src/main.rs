@@ -2359,6 +2359,61 @@ fn pose_from_local_hit_dir(local_hit_dir: Vec3) -> PoseMode {
 #[derive(Component)]
 struct MainCamera;
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct OverlayUiCamera;
+
+#[derive(Component, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ViewCamera {
+    index: u8,
+}
+
+#[derive(Resource, Clone, Copy)]
+struct MultiView {
+    count: u8,
+}
+
+impl Default for MultiView {
+    fn default() -> Self {
+        Self { count: 1 }
+    }
+}
+
+impl MultiView {
+    const MAX_VIEWS: u8 = 4;
+
+    fn increment(&mut self) -> bool {
+        let prev = self.count;
+        self.count = (self.count + 1).clamp(1, Self::MAX_VIEWS);
+        self.count != prev
+    }
+
+    fn decrement(&mut self) -> bool {
+        let prev = self.count;
+        self.count = self.count.saturating_sub(1).clamp(1, Self::MAX_VIEWS);
+        self.count != prev
+    }
+}
+
+#[derive(Resource, Default, Clone)]
+struct MultiViewHint {
+    text: String,
+    until_sec: f64,
+}
+
+impl MultiViewHint {
+    const SHOW_FOR_SEC: f64 = 1.6;
+
+    fn show(&mut self, now_sec: f64, text: impl Into<String>) {
+        self.text = text.into();
+        self.until_sec = now_sec + Self::SHOW_FOR_SEC;
+    }
+
+    fn active(&self, now_sec: f64) -> bool {
+        !self.text.is_empty() && now_sec < self.until_sec
+    }
+}
+
 #[derive(Resource, Default)]
 struct SubjectNormalsComputed(std::collections::HashSet<bevy::asset::AssetId<Mesh>>);
 
@@ -2817,6 +2872,13 @@ pub fn main() {
         .insert_resource(OverlayVisibility { show: false })
         .insert_resource(CaptionVisibility { show: true })
         .insert_resource(OverlayText::default())
+        // Native: we create the primary egui context ourselves (on a dedicated overlay camera)
+        // so it isn't constrained by the first 3D camera's viewport.
+        // WASM: keep the default auto-created primary context.
+        .insert_resource(bevy_egui::EguiGlobalSettings {
+            auto_create_primary_context: cfg!(target_arch = "wasm32"),
+            ..default()
+        })
         .init_resource::<SubjectMode>()
         .init_resource::<PoseMode>()
         .init_resource::<CameraPreset>()
@@ -2832,6 +2894,8 @@ pub fn main() {
         .init_resource::<AutoBallAppearanceState>()
         .init_resource::<SubjectDynamics>()
         .init_resource::<SubjectNormalsComputed>()
+        .init_resource::<MultiView>()
+        .init_resource::<MultiViewHint>()
         .add_plugins(plugins)
         .add_plugins(bevy::pbr::wireframe::WireframePlugin::default());
 
@@ -2849,12 +2913,17 @@ pub fn main() {
             Startup,
             (register_embedded_asset_source, print_embedded_registry),
         )
+        .add_systems(Update, sync_view_cameras)
+        .add_systems(Update, update_multiview_viewports.after(sync_view_cameras))
         .add_systems(Update, ensure_subject_normals)
         .add_systems(Update, update_subject_appearance)
         .add_systems(Update, update_tube_and_subject)
         .add_systems(Update, apply_subject_mode)
         .add_systems(Update, update_overlays)
         .add_systems(EguiPrimaryContextPass, ui_overlay);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, update_overlay_ui_camera);
 
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, apply_js_input);
@@ -3724,6 +3793,22 @@ fn setup_scene(
         Name::new("subject_fill_light"),
     ));
 
+    // Native: a dedicated full-window overlay camera for egui captions/credits/UI.
+    // This avoids anchoring egui to the first 3D camera's viewport when multiview is enabled.
+    #[cfg(not(target_arch = "wasm32"))]
+    commands.spawn((
+        Camera2d::default(),
+        Camera {
+            viewport: None,
+            order: 10_000,
+            clear_color: ClearColorConfig::None,
+            ..default()
+        },
+        OverlayUiCamera,
+        bevy_egui::PrimaryEguiContext,
+        Name::new("overlay_ui_camera"),
+    ));
+
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
@@ -3733,6 +3818,7 @@ fn setup_scene(
         }),
         Transform::from_xyz(0.0, 0.0, -8.0).looking_at(Vec3::ZERO, Vec3::Y),
         MainCamera,
+        ViewCamera { index: 0 },
         DistanceFog {
             color: Color::srgb_u8(0x12, 0x00, 0x00),
             falloff: FogFalloff::Linear {
@@ -3753,6 +3839,131 @@ fn setup_scene(
 
     #[cfg(target_arch = "wasm32")]
     mcbaise_set_wasm_ready();
+}
+
+fn sync_view_cameras(
+    mut commands: Commands,
+    multi_view: Res<MultiView>,
+    main_cam: Query<(&Projection, &Transform, Option<&DistanceFog>), With<MainCamera>>,
+    extras: Query<(Entity, &ViewCamera), (With<ViewCamera>, Without<MainCamera>)>,
+) {
+    if !multi_view.is_changed() {
+        return;
+    }
+
+    let desired = multi_view.count.clamp(1, MultiView::MAX_VIEWS);
+    let Some((projection, main_tr, fog)) = main_cam.iter().next() else {
+        return;
+    };
+
+    // Remove any extra cameras beyond the desired count.
+    for (entity, vc) in &extras {
+        if vc.index >= desired {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // Spawn any missing cameras in 1..desired.
+    let mut present = vec![false; desired as usize];
+    for (_, vc) in &extras {
+        if (vc.index as usize) < present.len() {
+            present[vc.index as usize] = true;
+        }
+    }
+
+    for idx in 1..desired {
+        if present.get(idx as usize).copied().unwrap_or(false) {
+            continue;
+        }
+
+        let mut e = commands.spawn((
+            Camera3d::default(),
+            (*projection).clone(),
+            (*main_tr).clone(),
+            ViewCamera { index: idx },
+        ));
+
+        if let Some(fog) = fog {
+            e.insert((*fog).clone());
+        }
+    }
+}
+
+fn update_multiview_viewports(
+    multi_view: Res<MultiView>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    cam_ids: Query<(Entity, &ViewCamera), With<ViewCamera>>,
+    mut cameras: Query<&mut Camera>,
+) {
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+
+    let w = window.physical_width();
+    let h = window.physical_height();
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    let count = (multi_view.count.clamp(1, MultiView::MAX_VIEWS)) as u32;
+    let base_h = (h / count).max(1);
+
+    let mut ordered: Vec<(u8, Entity)> = cam_ids.iter().map(|(e, vc)| (vc.index, e)).collect();
+    ordered.sort_by_key(|(idx, _)| *idx);
+
+    let mut y = 0u32;
+    for (idx_u8, entity) in ordered {
+        let idx = idx_u8 as u32;
+        if idx >= count {
+            continue;
+        }
+
+        let view_h = if idx + 1 == count {
+            h.saturating_sub(y).max(1)
+        } else {
+            base_h
+        };
+
+        let Ok(mut cam) = cameras.get_mut(entity) else {
+            continue;
+        };
+
+        cam.viewport = Some(bevy::camera::Viewport {
+            physical_position: UVec2::new(0, y),
+            physical_size: UVec2::new(w, view_h),
+            ..default()
+        });
+
+        cam.order = idx as isize;
+        cam.clear_color = if idx == 0 {
+            ClearColorConfig::Default
+        } else {
+            ClearColorConfig::None
+        };
+
+        y = y.saturating_add(base_h);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn update_overlay_ui_camera(
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    mut q: Query<&mut Camera, With<OverlayUiCamera>>,
+) {
+    let Some(window) = windows.iter().next() else {
+        return;
+    };
+    let w = window.physical_width();
+    let h = window.physical_height();
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    for mut cam in &mut q {
+        cam.viewport = None;
+        cam.order = 10_000;
+        cam.clear_color = ClearColorConfig::None;
+    }
 }
 
 fn ensure_subject_normals(
@@ -4092,7 +4303,7 @@ fn update_tube_and_subject(
     mut cam: Query<
         &mut Transform,
         (
-            With<MainCamera>,
+            With<ViewCamera>,
             Without<SubjectTag>,
             Without<SubjectLightTag>,
             Without<BallTag>,
@@ -4558,43 +4769,44 @@ fn update_tube_and_subject(
         light_tr.translation = light_tr.translation.lerp(target, pos_alpha);
     }
 
-    if let Ok(mut cam_tr) = cam.single_mut() {
-        let random_subject_distance = if *camera_preset == CameraPreset::Random {
-            Some(auto_cam.subject_distance)
-        } else {
-            None
-        };
+    let random_subject_distance = if *camera_preset == CameraPreset::Random {
+        Some(auto_cam.subject_distance)
+    } else {
+        None
+    };
 
-        let pass_anchor = if selected_camera_mode.is_passing() && auto_cam.pass_anchor_valid {
-            let u = auto_cam.pass_anchor_progress;
-            let c = tube_scene.curve.point_at(u);
-            let fr = tube_scene.frames.frame_at(u);
-            Some((c, fr.tan, fr.nor, fr.bin))
-        } else {
-            None
-        };
+    let pass_anchor = if selected_camera_mode.is_passing() && auto_cam.pass_anchor_valid {
+        let u = auto_cam.pass_anchor_progress;
+        let c = tube_scene.curve.point_at(u);
+        let fr = tube_scene.frames.frame_at(u);
+        Some((c, fr.tan, fr.nor, fr.bin))
+    } else {
+        None
+    };
 
-        let (pos, look, up) = camera_pose(
-            t,
-            *camera_preset,
-            selected_camera_mode,
-            active_subject_mode,
-            auto_cam.mode_since_sec,
-            random_subject_distance,
-            pass_anchor,
-            cam_center,
-            look_ahead,
-            cam_tangent,
-            cam_n,
-            cam_b,
-            center,
-            subject_pos_human,
-            subject_pos_ball,
-            subject_forward,
-            subject_up,
-        );
+    let (pos, look, up) = camera_pose(
+        t,
+        *camera_preset,
+        selected_camera_mode,
+        active_subject_mode,
+        auto_cam.mode_since_sec,
+        random_subject_distance,
+        pass_anchor,
+        cam_center,
+        look_ahead,
+        cam_tangent,
+        cam_n,
+        cam_b,
+        center,
+        subject_pos_human,
+        subject_pos_ball,
+        subject_forward,
+        subject_up,
+    );
 
-        let desired = Transform::from_translation(pos).looking_at(look, up);
+    let desired = Transform::from_translation(pos).looking_at(look, up);
+
+    for mut cam_tr in &mut cam {
         let mut desired_rot = desired.rotation;
         if cam_tr.rotation.dot(desired_rot) < 0.0 {
             desired_rot = -desired_rot;
@@ -5017,7 +5229,10 @@ struct UiOverlayParams<'w, 's> {
     caption_vis: ResMut<'w, CaptionVisibility>,
     #[cfg(target_arch = "wasm32")]
     video_vis: ResMut<'w, VideoVisibility>,
+    multi_view: ResMut<'w, MultiView>,
+    multi_view_hint: ResMut<'w, MultiViewHint>,
     playback: ResMut<'w, Playback>,
+    time: Res<'w, Time>,
     settings: ResMut<'w, TubeSettings>,
     scheme_mode: ResMut<'w, ColorSchemeMode>,
     pattern_mode: ResMut<'w, TexturePatternMode>,
@@ -5048,7 +5263,10 @@ fn ui_overlay(
         mut caption_vis,
         #[cfg(target_arch = "wasm32")]
         mut video_vis,
+        mut multi_view,
+        mut multi_view_hint,
         mut playback,
+        time,
         mut settings,
         mut scheme_mode,
         mut pattern_mode,
@@ -5082,6 +5300,98 @@ fn ui_overlay(
 
     #[cfg(not(any(feature = "native-youtube", feature = "native-mpv")))]
     let _ = &mut commands;
+
+    // Top-right: add an additional synced view.
+    egui::Area::new(egui::Id::new("mcbaise_add_view_pie"))
+        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+        .show(ctx, |ui| {
+            let desired = egui::vec2(28.0, 28.0);
+            let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+            let painter = ui.painter();
+            let center = rect.center();
+            let radius = rect.width().min(rect.height()) * 0.36;
+            let red = egui::Color32::from_rgba_unmultiplied(235, 40, 40, 220);
+
+            painter.circle_stroke(center, radius, egui::Stroke::new(2.2, red));
+
+            // Fill the "pie" proportionally to the number of active views.
+            // 1 view -> 1/MAX filled, MAX views -> full circle.
+            let frac = (multi_view.count.clamp(1, MultiView::MAX_VIEWS) as f32)
+                / (MultiView::MAX_VIEWS as f32);
+            let fill = egui::Color32::from_rgba_unmultiplied(235, 40, 40, 110);
+            if frac >= 0.999 {
+                // A full-sweep wedge degenerates; draw a proper filled circle at max.
+                painter.circle_filled(center, radius, fill);
+            } else {
+                let a0 = -std::f32::consts::FRAC_PI_2;
+                let a1 = a0 + std::f32::consts::TAU * frac;
+                let steps = (12.0 * frac.max(0.25)).ceil() as usize;
+                let mut pts = Vec::with_capacity(steps + 2);
+                pts.push(center);
+                for i in 0..=steps {
+                    let t = i as f32 / steps as f32;
+                    let a = a0 + (a1 - a0) * t;
+                    pts.push(egui::pos2(center.x + radius * a.cos(), center.y + radius * a.sin()));
+                }
+                painter.add(egui::Shape::convex_polygon(pts, fill, egui::Stroke::NONE));
+            }
+
+            if resp.hovered() {
+                painter.rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(6),
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            // Left click adds a view; right click removes a view.
+            // On mobile: tap-and-hold removes a view.
+            let now_sec = time.elapsed().as_secs_f64();
+            if resp.clicked_by(egui::PointerButton::Primary) {
+                if !multi_view.increment() {
+                    multi_view_hint.show(now_sec, "right click to remove");
+                }
+            } else if resp.clicked_by(egui::PointerButton::Secondary) {
+                if !multi_view.decrement() {
+                    multi_view_hint.show(now_sec, "left click to add more");
+                }
+            } else if resp.long_touched() {
+                if !multi_view.decrement() {
+                    multi_view_hint.show(now_sec, "left click to add more");
+                }
+            }
+        });
+
+    // Small transient hint beside the view pie button.
+    {
+        let now_sec = time.elapsed().as_secs_f64();
+        if multi_view_hint.active(now_sec) {
+            egui::Area::new(egui::Id::new("mcbaise_add_view_pie_hint"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-46.0, 12.0))
+                .show(ctx, |ui| {
+                    egui::Frame::NONE
+                        .fill(egui::Color32::WHITE)
+                        .stroke(egui::Stroke::new(1.2, egui::Color32::BLACK))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .inner_margin(egui::Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&multi_view_hint.text)
+                                        .color(egui::Color32::BLACK)
+                                        .size(12.0),
+                                )
+                                .extend(),
+                            );
+                        });
+                });
+        }
+    }
 
     if !overlay_vis.show {
         egui::Area::new(egui::Id::new("mcbaise_overlay_restore_pi"))
@@ -6945,12 +7255,12 @@ fn opening_credits() -> &'static [Credit] {
 
 fn print_embedded_registry(registry: Res<EmbeddedAssetRegistry>) {
     // Print the compile-time embedded path for the shader file so we can match the AssetServer lookup.
-    let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
-    info!("embedded_path for mcbaise_tube.wgsl = {}", p.display());
+    // let p = bevy::asset::embedded_path!("mcbaise_tube.wgsl");
+    // info!("embedded_path for mcbaise_tube.wgsl = {}", p.display());
 
-    // We can't rely on Debug for the registry; just confirm the resource exists.
-    let _ = registry;
-    info!("embedded registry resource present");
+    // // We can't rely on Debug for the registry; just confirm the resource exists.
+    // let _ = registry;
+    // info!("embedded registry resource present");
 }
 
 /// Register the embedded AssetSource with the AssetServer's builders so loads
