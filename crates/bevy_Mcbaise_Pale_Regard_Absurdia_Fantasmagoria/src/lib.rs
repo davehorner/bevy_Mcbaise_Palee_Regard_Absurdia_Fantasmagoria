@@ -1799,6 +1799,7 @@ enum TexturePatternMode {
     HoopAlt,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AppearancePreset {
     BlueGlass,
@@ -1849,6 +1850,7 @@ impl AppearanceMode {
         }
     }
 
+    #[allow(dead_code)]
     fn preset(self) -> Option<AppearancePreset> {
         match self {
             AppearanceMode::BlueGlass => Some(AppearancePreset::BlueGlass),
@@ -1907,6 +1909,7 @@ impl AutoAppearanceState {
         self.next_switch_sec = self.rand_range(3.0, 6.0);
     }
 
+    #[allow(dead_code)]
     fn pick_next_preset(&mut self) -> AppearancePreset {
         let candidates = [
             AppearancePreset::BlueGlass,
@@ -1971,8 +1974,10 @@ impl Default for AutoBallAppearanceState {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Resource, Clone)]
 struct AppearanceTextures {
+    #[allow(dead_code)]
     polkadot: Handle<Image>,
 }
 
@@ -4244,11 +4249,17 @@ fn update_fluid_simulation(
     fluid_sim.update(time.delta_secs(), playback.time_sec);
 
     // Create or update velocity texture
-    let velocity_texture = create_fluid_texture(&fluid_sim.velocity_field, fluid_sim.width, fluid_sim.height, true);
+    let velocity_texture = create_fluid_texture(
+        &fluid_sim.velocity_field,
+        fluid_sim.width,
+        fluid_sim.height,
+        true,
+    );
     let velocity_handle = images.add(velocity_texture);
 
     // Create or update density texture
-    let density_texture = create_fluid_texture_density(&fluid_sim.density_field, fluid_sim.width, fluid_sim.height);
+    let density_texture =
+        create_fluid_texture_density(&fluid_sim.density_field, fluid_sim.width, fluid_sim.height);
     let density_handle = images.add(density_texture);
 
     // Update tube material with fluid textures
@@ -4258,7 +4269,12 @@ fn update_fluid_simulation(
     }
 }
 
-fn create_fluid_texture(velocity_field: &[Vec2], width: usize, height: usize, is_velocity: bool) -> Image {
+fn create_fluid_texture(
+    velocity_field: &[Vec2],
+    width: usize,
+    height: usize,
+    is_velocity: bool,
+) -> Image {
     let mut data = Vec::with_capacity(width * height * 4);
 
     for &vel in velocity_field {
@@ -5224,6 +5240,7 @@ fn make_polkadot_texture() -> Image {
     )
 }
 
+#[allow(dead_code)]
 fn apply_appearance_preset(
     mat: &mut StandardMaterial,
     preset: AppearancePreset,
@@ -5276,6 +5293,7 @@ fn apply_appearance_preset(
     }
 }
 
+#[allow(dead_code)]
 fn timeline_human_appearance(video_time_sec: f32) -> AppearancePreset {
     // Deterministic and simple.
     let cycle = 14.0;
@@ -5293,6 +5311,7 @@ fn timeline_human_appearance(video_time_sec: f32) -> AppearancePreset {
     }
 }
 
+#[allow(dead_code)]
 fn timeline_ball_appearance(video_time_sec: f32) -> AppearancePreset {
     // Keep the ball mostly "blue glass".
     let cycle = 14.0;
@@ -5306,7 +5325,7 @@ fn timeline_ball_appearance(video_time_sec: f32) -> AppearancePreset {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+#[allow(dead_code, clippy::too_many_arguments, clippy::type_complexity)]
 fn update_subject_appearance(
     mut commands: Commands,
     playback: Res<Playback>,
@@ -6558,72 +6577,99 @@ fn ui_overlay(
                                 settings.pattern = 3;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::Fluid,
-                                TexturePatternMode::Fluid.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Fluid,
+                                    TexturePatternMode::Fluid.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 4;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::FluidStripe,
-                                TexturePatternMode::FluidStripe.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::FluidStripe,
+                                    TexturePatternMode::FluidStripe.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 5;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::FluidSwirl,
-                                TexturePatternMode::FluidSwirl.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::FluidSwirl,
+                                    TexturePatternMode::FluidSwirl.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 6;
                             }
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::Wave,
-                                TexturePatternMode::Wave.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Wave,
+                                    TexturePatternMode::Wave.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 7;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::Fractal,
-                                TexturePatternMode::Fractal.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Fractal,
+                                    TexturePatternMode::Fractal.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 8;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::Particle,
-                                TexturePatternMode::Particle.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Particle,
+                                    TexturePatternMode::Particle.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 9;
                             }
 
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::Grid,
-                                TexturePatternMode::Grid.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::Grid,
+                                    TexturePatternMode::Grid.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 10;
                             }
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::HoopWire,
-                                TexturePatternMode::HoopWire.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::HoopWire,
+                                    TexturePatternMode::HoopWire.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 11;
                             }
-                            if ui.selectable_value(
-                                &mut *pattern_mode,
-                                TexturePatternMode::HoopAlt,
-                                TexturePatternMode::HoopAlt.label(),
-                            ).clicked() {
+                            if ui
+                                .selectable_value(
+                                    &mut *pattern_mode,
+                                    TexturePatternMode::HoopAlt,
+                                    TexturePatternMode::HoopAlt.label(),
+                                )
+                                .clicked()
+                            {
                                 settings.pattern = 12;
                             }
                         });
@@ -7620,7 +7666,7 @@ impl Default for FluidSimulation {
         let width = 64;
         let height = 64;
         let size = width * height;
-        
+
         let mut wave_field = vec![0.0; size];
         let mut wave_prev = vec![0.0; size];
         let mut wave2_field = vec![0.0; size];
@@ -7635,19 +7681,19 @@ impl Default for FluidSimulation {
                 let coord = Vec2::new(x as f32, y as f32);
                 let center = Vec2::new(width as f32 / 2.0, height as f32 / 2.0);
                 let center2 = Vec2::new(width as f32 / 3.0, height as f32 / 3.0);
-                
+
                 // Wave packet initialization
                 let dist1 = (coord - center).length();
                 let dist2 = (coord - center2).length();
-                
+
                 let k1 = (dist1 * 0.1).cos() * (-dist1 * dist1 * 0.01).exp();
                 let k2 = (dist2 * 0.1).cos() * (-dist2 * dist2 * 0.01).exp();
-                
+
                 wave_field[idx] = k1;
                 wave_prev[idx] = k1;
                 wave2_field[idx] = k2;
                 wave2_prev[idx] = k2;
-                
+
                 // Initialize derived fields
                 velocity_field.push(Vec2::ZERO);
                 density_field.push(0.5);
@@ -7673,46 +7719,64 @@ impl FluidSimulation {
     fn update(&mut self, dt: f32, playback_time: f32) {
         self.time = playback_time;
         self.frame += 1;
-        
+
         let c = 0.25; // Courant number
-        
+
         // Create new wave fields
         let mut new_wave = vec![0.0; self.wave_field.len()];
         let mut new_wave2 = vec![0.0; self.wave2_field.len()];
-        
+
         for y in 0..self.height {
             for x in 0..self.width {
                 let idx = y * self.width + x;
-                
+
                 // Boundary check
                 let border = 1;
-                let in_border = x < border || y < border || x >= self.width - border || y >= self.height - border;
-                
+                let in_border = x < border
+                    || y < border
+                    || x >= self.width - border
+                    || y >= self.height - border;
+
                 if in_border {
                     new_wave[idx] = 0.0;
                     new_wave2[idx] = 0.0;
                     continue;
                 }
-                
+
                 // Wave 1 computation
                 {
                     let center = self.wave_field[idx];
                     let prev = self.wave_prev[idx];
-                    
+
                     // Get neighbors
-                    let up = if y < self.height - 1 { self.wave_field[(y + 1) * self.width + x] } else { 0.0 };
-                    let down = if y > 0 { self.wave_field[(y - 1) * self.width + x] } else { 0.0 };
-                    let right = if x < self.width - 1 { self.wave_field[y * self.width + (x + 1)] } else { 0.0 };
-                    let left = if x > 0 { self.wave_field[y * self.width + (x - 1)] } else { 0.0 };
-                    
+                    let up = if y < self.height - 1 {
+                        self.wave_field[(y + 1) * self.width + x]
+                    } else {
+                        0.0
+                    };
+                    let down = if y > 0 {
+                        self.wave_field[(y - 1) * self.width + x]
+                    } else {
+                        0.0
+                    };
+                    let right = if x < self.width - 1 {
+                        self.wave_field[y * self.width + (x + 1)]
+                    } else {
+                        0.0
+                    };
+                    let left = if x > 0 {
+                        self.wave_field[y * self.width + (x - 1)]
+                    } else {
+                        0.0
+                    };
+
                     // Laplacian
                     let ddy = up - 2.0 * center + down;
                     let ddx = right - 2.0 * center + left;
-                    
-                    let next: f32;
-                    if self.frame <= 3 {
+
+                    let next: f32 = if self.frame <= 3 {
                         // Initial step
-                        next = center - 0.5 * c * (ddy + ddx);
+                        center - 0.5 * c * (ddy + ddx)
                     } else {
                         // Wave equation with coupling
                         let m2 = 1.0;
@@ -7721,37 +7785,52 @@ impl FluidSimulation {
                         let mut uv = (coord / resolution) * 2.0 - 1.0;
                         uv.x *= resolution.x / resolution.y;
                         let potential = uv.dot(uv);
-                        
+
                         let del = ddy + ddx;
                         let other_wave = self.wave2_field[idx];
                         let coupling = other_wave * other_wave * 50.0;
-                        
+
                         let update = del - (m2 + potential + coupling) * center;
-                        next = -prev + 2.0 * center + 0.5 * c * update;
-                    }
-                    
+                        -prev + 2.0 * center + 0.5 * c * update
+                    };
+
                     new_wave[idx] = next;
                 }
-                
+
                 // Wave 2 computation (coupled)
                 {
                     let center = self.wave2_field[idx];
                     let prev = self.wave2_prev[idx];
-                    
+
                     // Get neighbors
-                    let up = if y < self.height - 1 { self.wave2_field[(y + 1) * self.width + x] } else { 0.0 };
-                    let down = if y > 0 { self.wave2_field[(y - 1) * self.width + x] } else { 0.0 };
-                    let right = if x < self.width - 1 { self.wave2_field[y * self.width + (x + 1)] } else { 0.0 };
-                    let left = if x > 0 { self.wave2_field[y * self.width + (x - 1)] } else { 0.0 };
-                    
+                    let up = if y < self.height - 1 {
+                        self.wave2_field[(y + 1) * self.width + x]
+                    } else {
+                        0.0
+                    };
+                    let down = if y > 0 {
+                        self.wave2_field[(y - 1) * self.width + x]
+                    } else {
+                        0.0
+                    };
+                    let right = if x < self.width - 1 {
+                        self.wave2_field[y * self.width + (x + 1)]
+                    } else {
+                        0.0
+                    };
+                    let left = if x > 0 {
+                        self.wave2_field[y * self.width + (x - 1)]
+                    } else {
+                        0.0
+                    };
+
                     // Laplacian
                     let ddy = up - 2.0 * center + down;
                     let ddx = right - 2.0 * center + left;
-                    
-                    let next: f32;
-                    if self.frame <= 3 {
+
+                    let next: f32 = if self.frame <= 3 {
                         // Initial step
-                        next = center - 0.5 * c * (ddy + ddx);
+                        center - 0.5 * c * (ddy + ddx)
                     } else {
                         // Wave equation with coupling
                         let m2 = 1.0;
@@ -7760,42 +7839,50 @@ impl FluidSimulation {
                         let mut uv = (coord / resolution) * 2.0 - 1.0;
                         uv.x *= resolution.x / resolution.y;
                         let potential = uv.dot(uv);
-                        
+
                         let del = ddy + ddx;
                         let other_wave = self.wave_field[idx];
                         let coupling = other_wave * other_wave * 50.0;
-                        
+
                         let update = del - (m2 + potential + coupling) * center;
-                        next = -prev + 2.0 * center + 0.5 * c * update;
-                    }
-                    
+                        -prev + 2.0 * center + 0.5 * c * update
+                    };
+
                     new_wave2[idx] = next;
                 }
             }
         }
-        
+
         // Update wave fields
         self.wave_prev.copy_from_slice(&self.wave_field);
         self.wave_field.copy_from_slice(&new_wave);
         self.wave2_prev.copy_from_slice(&self.wave2_field);
         self.wave2_field.copy_from_slice(&new_wave2);
-        
+
         // Compute derived velocity and density fields
         for y in 0..self.height {
             for x in 0..self.width {
                 let idx = y * self.width + x;
-                
+
                 // Compute velocity from wave gradients
                 let eps = 1.0;
                 let wave_center = self.wave_field[idx];
-                let wave_right = if x < self.width - 1 { self.wave_field[y * self.width + (x + 1)] } else { wave_center };
-                let wave_up = if y < self.height - 1 { self.wave_field[(y + 1) * self.width + x] } else { wave_center };
-                
+                let wave_right = if x < self.width - 1 {
+                    self.wave_field[y * self.width + (x + 1)]
+                } else {
+                    wave_center
+                };
+                let wave_up = if y < self.height - 1 {
+                    self.wave_field[(y + 1) * self.width + x]
+                } else {
+                    wave_center
+                };
+
                 let grad_x = (wave_right - wave_center) / eps;
                 let grad_y = (wave_up - wave_center) / eps;
-                
+
                 self.velocity_field[idx] = Vec2::new(grad_x, grad_y) * 0.1;
-                
+
                 // Compute density from wave amplitudes
                 let wave1_amp = wave_center.abs();
                 let wave2_amp = self.wave2_field[idx].abs();
@@ -7856,9 +7943,9 @@ impl FluidSimulation {
         let y = y.min(self.height - 1);
 
         // Apply force in a small radius around the position
-        let radius = 4;
-        for dy in -(radius as i32)..=(radius as i32) {
-            for dx in -(radius as i32)..=(radius as i32) {
+        let radius: i32 = 4;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
                 let nx = (x as i32 + dx).clamp(0, self.width as i32 - 1) as usize;
                 let ny = (y as i32 + dy).clamp(0, self.height as i32 - 1) as usize;
 
@@ -7868,8 +7955,10 @@ impl FluidSimulation {
                     let falloff = 1.0 - dist_sq / (radius * radius) as f32;
 
                     // Apply velocity impulse outward from center
-                    let impulse_x = (nx as f32 - x as f32) * 0.05 * force_strength * falloff * dt * 50.0;
-                    let impulse_y = (ny as f32 - y as f32) * 0.05 * force_strength * falloff * dt * 50.0;
+                    let impulse_x =
+                        (nx as f32 - x as f32) * 0.05 * force_strength * falloff * dt * 50.0;
+                    let impulse_y =
+                        (ny as f32 - y as f32) * 0.05 * force_strength * falloff * dt * 50.0;
 
                     self.velocity_field[idx] += Vec2::new(impulse_x, impulse_y);
 
@@ -7881,6 +7970,7 @@ impl FluidSimulation {
         }
     }
 
+    #[allow(dead_code)]
     fn get_velocity_at(&self, u: f32, v: f32) -> Vec2 {
         let x = (u * self.width as f32) as usize;
         let y = (v * self.height as f32) as usize;
@@ -7891,6 +7981,7 @@ impl FluidSimulation {
         self.velocity_field[y * self.width + x]
     }
 
+    #[allow(dead_code)]
     fn apply_force(&mut self, u: f32, v: f32, force_strength: f32, dt: f32) {
         let x = (u * self.width as f32) as usize;
         let y = (v * self.height as f32) as usize;
@@ -7899,9 +7990,9 @@ impl FluidSimulation {
         let y = y.min(self.height - 1);
 
         // Apply force in a small radius around the mouse position
-        let radius = 3;
-        for dy in -(radius as i32)..=(radius as i32) {
-            for dx in -(radius as i32)..=(radius as i32) {
+        let radius: i32 = 3;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
                 let nx = (x as i32 + dx).clamp(0, self.width as i32 - 1) as usize;
                 let ny = (y as i32 + dy).clamp(0, self.height as i32 - 1) as usize;
 
@@ -8007,12 +8098,12 @@ impl TubeMaterial {
                 let hue = (time_sec * 0.1) % 1.0;
                 let sat = 0.8;
                 let val = 0.8;
-                
+
                 // Simple HSV to RGB for dynamic colors
                 let c = val * sat;
                 let x = c * (1.0 - ((hue * 6.0) % 2.0 - 1.0).abs());
                 let m = val - c;
-                
+
                 let h_sector = (hue * 6.0).floor();
                 let rgb = if h_sector == 0.0 {
                     vec3(c, x, 0.0)
@@ -8027,7 +8118,7 @@ impl TubeMaterial {
                 } else {
                     vec3(c, 0.0, x)
                 } + vec3(m, m, m);
-                
+
                 self.u[2] = Color::srgb(rgb.x, rgb.y, rgb.z).to_linear().to_vec4();
                 self.u[3] = Color::srgb(1.0, 1.0, 1.0).to_linear().to_vec4(); // White
             }
