@@ -11,8 +11,7 @@ use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::shader::ShaderRef;
-#[cfg(not(target_arch = "wasm32"))]
-use bevy::window::PrimaryWindow;
+use bevy::window::{PrimaryWindow, Window};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 
 use bevy_burn_human::BurnHumanSource;
@@ -23,6 +22,9 @@ mod native_assets;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
+// wasm: no direct `Windows` import; use ECS `Query<&mut Window, With<PrimaryWindow>>` below.
+
+// Render-scale API is implemented later in the file as `render_scale_api`.
 
 #[cfg(target_arch = "wasm32")]
 const META_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.meta.json");
@@ -57,6 +59,7 @@ mod native_mpv {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     #[derive(Debug, Clone)]
+    #[allow(dead_code)]
     pub enum Command {
         SetPlaying(bool),
         SeekSeconds(f32),
@@ -157,8 +160,8 @@ mod native_mpv {
                 // Preflight: if we're going to rely on cookies-from-browser, run yt-dlp directly
                 // first to get a clear error (Windows Chrome cookie DB lock, bot-check, etc.).
                 // This avoids confusing mpv ytdl_hook failures like "NoneType has no attribute decode".
-                if looks_like_youtube {
-                    if has_ytdlp {
+                if looks_like_youtube
+                    && has_ytdlp {
                         // NOTE: `yt-dlp` preflight can sometimes be slow. Never block mpv launch
                         // indefinitely; time out and continue (especially when using cookies.txt).
                         let preflight_timeout_sec: u64 = std::env::var("MCBAISE_MPV_YTDLP_PREFLIGHT_TIMEOUT_SEC")
@@ -291,7 +294,6 @@ mod native_mpv {
                             }
                         }
                     }
-                }
 
                 let uniq = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -336,7 +338,7 @@ mod native_mpv {
                     let evt_tx2 = evt_tx.clone();
                     thread::spawn(move || {
                         let reader = StdBufReader::new(stderr);
-                        for line in reader.lines().flatten().take(400) {
+                        for line in reader.lines().map_while(Result::ok).take(400) {
                             let line = line.trim().to_string();
                             if line.is_empty() {
                                 continue;
@@ -1636,10 +1638,10 @@ struct NativeMpvConfig;
 impl Drop for NativeMpvSync {
     fn drop(&mut self) {
         let _ = self.tx.send(native_mpv::Command::Shutdown);
-        if let Ok(mut slot) = self.join.lock() {
-            if let Some(handle) = slot.take() {
-                let _ = handle.join();
-            }
+        if let Ok(mut slot) = self.join.lock()
+            && let Some(handle) = slot.take()
+        {
+            let _ = handle.join();
         }
     }
 }
@@ -2557,6 +2559,98 @@ pub fn set_video_time(time_sec: f32, playing: bool) {
     });
 }
 
+// Allow JS to set an internal render scale for the wasm app. We store it in an
+// AtomicU32 (bits of an f32) so it can be written from JS quickly and read by
+// a Bevy system without heavy synchronization.
+#[cfg(target_arch = "wasm32")]
+mod render_scale_api {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static RENDER_SCALE_BITS: AtomicU32 = AtomicU32::new(f32::to_bits(1.0));
+
+    #[wasm_bindgen]
+    pub fn set_render_scale(scale: f32) {
+        // sanitize input: must be finite and > 0
+        let s = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        RENDER_SCALE_BITS.store(f32::to_bits(s), Ordering::SeqCst);
+    }
+
+    // JS-visible getter (optional; useful for debugging from JS)
+    #[wasm_bindgen]
+    pub fn get_render_scale() -> f32 {
+        f32::from_bits(RENDER_SCALE_BITS.load(Ordering::SeqCst))
+    }
+
+    // Internal accessor used by Bevy systems.
+    pub fn current_render_scale() -> f32 {
+        f32::from_bits(RENDER_SCALE_BITS.load(Ordering::SeqCst))
+    }
+}
+
+// Resource to expose render scale inside ECS. Systems can read this and adapt
+// rendering accordingly (e.g. adjust render targets or camera scale).
+#[derive(Resource, Debug, Clone, Copy)]
+#[allow(dead_code)]
+struct RenderScale(f32);
+
+impl Default for RenderScale {
+    fn default() -> Self {
+        RenderScale(1.0)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn update_render_scale_resource(mut rs: ResMut<RenderScale>) {
+    rs.0 = render_scale_api::current_render_scale();
+}
+
+// Apply the requested render scale by adjusting the primary window's render
+// resolution on wasm. This avoids touching the DOM canvas directly; instead
+// Bevy will render at the smaller resolution and the browser will upscale it.
+#[cfg(target_arch = "wasm32")]
+fn apply_render_scale_to_window(
+    mut query: Query<&mut Window, With<PrimaryWindow>>,
+    rs: Res<RenderScale>,
+) {
+    // Local imports required only on wasm target
+    use wasm_bindgen::JsCast;
+    use web_sys::HtmlElement;
+
+    if !rs.is_changed() {
+        return;
+    }
+    // Query the primary window via Bevy's ECS query interface.
+    if let Ok(mut primary) = query.single_mut() {
+        // Query the canvas client size via web-sys.
+        if let Some(win) = web_sys::window() {
+            if let Some(doc) = win.document() {
+                if let Some(el) = doc.get_element_by_id("bevy-canvas") {
+                    // Cast to HtmlElement so we can query clientWidth/clientHeight
+                    if let Ok(html) = el.dyn_into::<HtmlElement>() {
+                        let clw = html.client_width() as f32;
+                        let clh = html.client_height() as f32;
+                        // devicePixelRatio gives the CSS->device pixel ratio
+                        let ratio = win.device_pixel_ratio() as f32;
+                        let target_w = (clw * rs.0 * ratio).max(1.0);
+                        let target_h = (clh * rs.0 * ratio).max(1.0);
+                        // Use Bevy 0.17 WindowResolution API to request the physical
+                        // resolution we want the renderer to target. `set_physical_resolution`
+                        // takes integer physical pixel dimensions.
+                        primary
+                            .resolution
+                            .set_physical_resolution(target_w as u32, target_h as u32);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 pub fn toggle_color_scheme() {
@@ -2872,6 +2966,7 @@ pub fn main() {
         .insert_resource(OverlayVisibility { show: false })
         .insert_resource(CaptionVisibility { show: true })
         .insert_resource(OverlayText::default())
+        .insert_resource(RenderScale::default())
         // Native: we create the primary egui context ourselves (on a dedicated overlay camera)
         // so it isn't constrained by the first 3D camera's viewport.
         // WASM: keep the default auto-created primary context.
@@ -2927,6 +3022,14 @@ pub fn main() {
 
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, apply_js_input);
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Update, update_render_scale_resource);
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        apply_render_scale_to_window.after(update_render_scale_resource),
+    );
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, (advance_time_native, native_controls));
@@ -3200,12 +3303,12 @@ fn init_native_mpv(app: &mut App) {
         ytdl_raw_options.push(format!("cookies={path}"));
     }
 
-    if cookie_file.is_none() {
-        if let Ok(v) = std::env::var("MCBAISE_MPV_COOKIES_FROM_BROWSER") {
-            let v = v.trim();
-            if !v.is_empty() {
-                ytdl_raw_options.push(format!("cookies-from-browser={v}"));
-            }
+    if cookie_file.is_none()
+        && let Ok(v) = std::env::var("MCBAISE_MPV_COOKIES_FROM_BROWSER")
+    {
+        let v = v.trim();
+        if !v.is_empty() {
+            ytdl_raw_options.push(format!("cookies-from-browser={v}"));
         }
     }
     if let Ok(v) = std::env::var("MCBAISE_MPV_YTDL_RAW_OPTIONS") {
@@ -3363,8 +3466,8 @@ fn native_mpv_sync(
 
 #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
 fn native_mpv_shutdown_on_exit(
-    mut app_exit: EventReader<bevy::app::AppExit>,
-    mut window_close: EventReader<bevy::window::WindowCloseRequested>,
+    app_exit: MessageReader<bevy::app::AppExit>,
+    window_close: MessageReader<bevy::window::WindowCloseRequested>,
     mpv: Option<Res<NativeMpvSync>>,
 ) {
     if app_exit.is_empty() && window_close.is_empty() {
@@ -4144,12 +4247,12 @@ fn native_controls(
 
         #[cfg(all(windows, feature = "native-mpv"))]
         {
-            if let Some(mpv) = _native_mpv.as_ref() {
-                if mpv.enabled {
-                    let _ = mpv
-                        .tx
-                        .send(crate::native_mpv::Command::SetPlaying(playback.playing));
-                }
+            if let Some(mpv) = _native_mpv.as_ref()
+                && mpv.enabled
+            {
+                let _ = mpv
+                    .tx
+                    .send(crate::native_mpv::Command::SetPlaying(playback.playing));
             }
         }
     }
@@ -5881,10 +5984,10 @@ fn ui_overlay(
                         let connected = _native_mpv.as_ref().map(|m| m.has_remote).unwrap_or(false);
 
                         if let Some(mpv) = _native_mpv.as_ref() {
-                            if let Ok(slot) = mpv.last_error.lock() {
-                                if let Some(err) = slot.as_ref() {
-                                    ui.label(format!("mpv: {err}"));
-                                }
+                            if let Ok(slot) = mpv.last_error.lock()
+                                && let Some(err) = slot.as_ref()
+                            {
+                                ui.label(format!("mpv: {err}"));
                             }
                             ui.label(format!("t≈{:.2}s", playback.time_sec));
                         }
@@ -5988,12 +6091,12 @@ fn ui_overlay(
 
                         #[cfg(all(windows, not(target_arch = "wasm32"), feature = "native-mpv"))]
                         {
-                            if let Some(mpv) = _native_mpv.as_ref() {
-                                if mpv.enabled {
-                                    let _ = mpv.tx.send(crate::native_mpv::Command::SetPlaying(
-                                        desired_playing,
-                                    ));
-                                }
+                            if let Some(mpv) = _native_mpv.as_ref()
+                                && mpv.enabled
+                            {
+                                let _ = mpv
+                                    .tx
+                                    .send(crate::native_mpv::Command::SetPlaying(desired_playing));
                             }
                         }
 

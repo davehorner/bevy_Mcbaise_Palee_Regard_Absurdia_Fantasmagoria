@@ -12,6 +12,63 @@
     try {
       const p = new URLSearchParams(location.search);
       if (p.get('vizOnly') === '1') document.documentElement.classList.add('vizOnly');
+      // Debug flag via query string: ?debug will enable verbose instrumentation.
+      const DEBUG_MCBAISE = p.get('debug') === '1' || p.get('debug') === 'true' || p.has('debug');
+      // Expose for other scripts
+      window.__MCBAISE_DEBUG = !!DEBUG_MCBAISE;
+      // If debug is not enabled, silence all console output to avoid noisy
+      // logs during normal usage and profiling. When debug is enabled, restore
+      // original console methods.
+      try {
+        const _orig = {
+          log: console.log && console.log.bind(console),
+          info: console.info && console.info.bind(console),
+          warn: console.warn && console.warn.bind(console),
+          error: console.error && console.error.bind(console),
+          debug: console.debug && console.debug.bind(console),
+        };
+        // Always keep warn/error available so runtime issues surface.
+        try { if (_orig.warn) console.warn = _orig.warn; } catch (_) {}
+        try { if (_orig.error) console.error = _orig.error; } catch (_) {}
+
+        // Wrap log/info/debug so they only emit when our debug flag is set.
+        const guarded = (orig) => function(...args) {
+          try {
+            if (window.__MCBAISE_DEBUG) return orig && orig(...args);
+          } catch (_) {}
+        };
+        try { console.log = guarded(_orig.log); } catch (_) {}
+        try { console.info = guarded(_orig.info); } catch (_) {}
+        try { console.debug = guarded(_orig.debug || _orig.log); } catch (_) {}
+      } catch (_) {}
+      // Notify the service worker to enable debug logs when requested.
+      try {
+        if (window.__MCBAISE_DEBUG && 'serviceWorker' in navigator) {
+          try {
+            // Prefer the active worker if ready.
+            navigator.serviceWorker.ready.then(reg => {
+              try { reg.active?.postMessage?.({ type: 'SW_DEBUG_ENABLE' }); } catch (_) {}
+            }).catch(() => {});
+            // Also attempt direct controller postMessage (if available earlier).
+            try { navigator.serviceWorker.controller?.postMessage?.({ type: 'SW_DEBUG_ENABLE' }); } catch (_) {}
+          } catch (_) {}
+        }
+      } catch (_) {}
+
+      // Long task observer: log heavy tasks when debug enabled.
+      try {
+        if (typeof PerformanceObserver !== 'undefined') {
+          const po = new PerformanceObserver((list) => {
+            if (!window.__MCBAISE_DEBUG) return;
+            for (const e of list.getEntries()) {
+              try {
+                if (e.duration && e.duration > 50) console.warn('mcbaise:longtask', { name: e.name, duration: e.duration, entry: e });
+              } catch (_) {}
+            }
+          });
+          try { po.observe({ type: 'longtask', buffered: true }); } catch (_) {}
+        }
+      } catch (_) {}
     } catch (_) {}
   </script>
   <style>
@@ -467,6 +524,48 @@
       { capture: true }
     );
 
+    // Ctrl/Cmd+D toggles MCBAISE debug mode (lightweight). Note: this
+    // overrides the browser's default bookmark shortcut. It persists the
+    // choice to localStorage and notifies the service worker.
+    function setDebugEnabled(enabled) {
+      try {
+        window.__MCBAISE_DEBUG = !!enabled;
+        try { localStorage.setItem('mcbaise_debug', window.__MCBAISE_DEBUG ? '1' : '0'); } catch (_) {}
+        // Notify SW
+        try {
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.ready.then(reg => { try { reg.active?.postMessage?.({ type: window.__MCBAISE_DEBUG ? 'SW_DEBUG_ENABLE' : 'SW_DEBUG_DISABLE' }); } catch (_) {} }).catch(() => {});
+            try { navigator.serviceWorker.controller?.postMessage?.({ type: window.__MCBAISE_DEBUG ? 'SW_DEBUG_ENABLE' : 'SW_DEBUG_DISABLE' }); } catch (_) {}
+          }
+        } catch (_) {}
+        try { showKeyToast(window.__MCBAISE_DEBUG ? 'Debug ON' : 'Debug OFF'); } catch (_) {}
+      } catch (_) {}
+    }
+
+    function toggleDebug() { setDebugEnabled(!window.__MCBAISE_DEBUG); }
+
+    window.addEventListener('keydown', (e) => {
+      try {
+        if ((e.ctrlKey || e.metaKey) && !e.shiftKey && (e.key === 'd' || e.key === 'D')) {
+          // Prevent default browser action (bookmark) only when we successfully toggle
+          try { e.preventDefault(); } catch (_) {}
+          toggleDebug();
+        }
+      } catch (_) {}
+    }, { capture: true });
+
+    // Respect persisted debug setting if querystring didn't explicitly enable debug.
+    try {
+      if (!window.__MCBAISE_DEBUG) {
+        try {
+          const s = localStorage.getItem('mcbaise_debug');
+          if (s === '1') {
+            setDebugEnabled(true);
+          }
+        } catch (_) {}
+      }
+    } catch (_) {}
+
     let wasmReady = false;
     let ytReady = false;
     let bootFailed = false;
@@ -542,6 +641,12 @@
       captionEl.textContent = text;
       captionEl.classList.add("show");
       captionEl.classList.toggle("meta", !!isMeta);
+      // Nudge child frames when captions change — this can unstick throttled
+      // or backgrounded iframes in some UAs. Best-effort authoritative sync.
+      try {
+        const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+        try { broadcastSync(t, !!isPlaying); } catch (_) {}
+      } catch (_) {}
     };
 
     // Called from Rust (wasm) to show/hide the YouTube pane.
@@ -598,32 +703,281 @@
       refreshLoading();
     }
 
+    // Rate-capped coalescer for `wasm.set_video_time`.
+    // - Coalesces rapid updates and only flushes the latest time.
+    // - Enforces a minimum interval (`WASM_MIN_INTERVAL_MS`) to avoid saturating
+    //   the main thread when many frames or messages arrive.
+    // - Uses `requestIdleCallback` when available to prefer idle time, falling
+    //   back to `setTimeout`.
+    let _wasmPending = null;
+    let _wasmPendingTimer = null;
+    let _wasmPendingIsIdle = false;
+    let _wasmLastFlush = 0;
+    const WASM_MIN_INTERVAL_MS = 33; // ~30Hz
+
+    function _flushWasmPending() {
+      try {
+        const args = _wasmPending || { timeSec: 0, playing: false };
+        _wasmPending = null;
+        // clear the timer id (either idle callback id or timeout id)
+        _wasmPendingTimer = null;
+        _wasmPendingIsIdle = false;
+        _wasmLastFlush = performance.now();
+        if (typeof wasm?.set_video_time === 'function') {
+          try { wasm.set_video_time(args.timeSec, !!args.playing); } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:schedule:flush:error', e); }
+        }
+      } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:schedule:flush:outer', e); }
+    }
+
+    function scheduleWasmSetVideoTime(timeSec, playing) {
+      try {
+        _wasmPending = { timeSec: Number(timeSec) || 0, playing: !!playing };
+        // If a flush is already scheduled, just coalesce into _wasmPending.
+        if (_wasmPendingTimer) return;
+
+        const now = performance.now();
+        const since = now - (_wasmLastFlush || 0);
+        const scheduleImmediately = since >= WASM_MIN_INTERVAL_MS;
+
+        const doSchedule = (delay) => {
+          try {
+            if (typeof requestIdleCallback !== 'undefined' && scheduleImmediately) {
+              // Try to use idle time but cap timeout so we don't delay too long.
+              try {
+                _wasmPendingIsIdle = true;
+                _wasmPendingTimer = requestIdleCallback(() => _flushWasmPending(), { timeout: 50 });
+              } catch (_) {
+                _wasmPendingIsIdle = false;
+                _wasmPendingTimer = setTimeout(() => _flushWasmPending(), 0);
+              }
+            } else {
+              // Either we are inside the min-interval window or RIC unavailable.
+              _wasmPendingIsIdle = false;
+              _wasmPendingTimer = setTimeout(() => _flushWasmPending(), delay);
+            }
+          } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:schedule:doSchedule:error', e); }
+        };
+
+        if (scheduleImmediately) {
+          doSchedule(0);
+        } else {
+          // schedule after remaining interval to enforce rate cap
+          const delay = Math.max(0, Math.ceil(WASM_MIN_INTERVAL_MS - since));
+          doSchedule(delay);
+        }
+      } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:schedule:error', e); }
+    }
+
     // YouTube player.
     let player = null;
     let playerReady = false;
     let isPlaying = false;
     let rafId = null;
     let pollId = null;
+    let lastBroadcastMs = 0;
+    // Throttle advisory 'tick' broadcasts to avoid saturating the renderer
+    // while keeping visuals reasonably smooth. Use ~100ms (≈10Hz) by default.
+    // Authoritative syncs remain controlled by `SYNC_THROTTLE_MS`.
+    const BROADCAST_THROTTLE_MS = 100; // ms between non-authoritative ticks (~10Hz)
+    let lastSyncSentMs = 0;
+    let SYNC_THROTTLE_MS = 5000; // send authoritative syncs at ~0.2Hz (visible divergence)
     let pendingPlayingRequest = null;
+
+    // Helper: schedule DOM writes on the next animation frame cycle (double-buffer)
+    function scheduleWrite(fn) {
+      requestAnimationFrame(() => requestAnimationFrame(fn));
+    }
+
+    // We always prefer local interpolation on children for smooth visuals.
+    // The parent will continue to send authoritative syncs at `SYNC_THROTTLE_MS`.
 
     // Extra viz instances are injected as iframes so they can run a separate wasm app.
     // This avoids wasm-bindgen's single-instance limitation within one document.
     // Track injected viz iframes as objects so we can retry/post-initialize reliably.
     const extraVizFrames = [];
+    // Observers and policy settings for priority/backoff
+    const MAX_FULL_QUALITY = 3; // keep top N frames at full quality
+    let io = null; // IntersectionObserver
+    try {
+      io = new IntersectionObserver((entries) => {
+        for (const ent of entries) {
+          const f = extraVizFrames.find(x => x.iframe === ent.target);
+          if (f) {
+            f._intersectionRatio = ent.intersectionRatio;
+            updateFramePolicy(f);
+          }
+        }
+        updateAllPolicies();
+      }, { threshold: [0, 0.01, 0.1, 0.25, 0.5, 0.75, 1] });
+    } catch (_) { io = null; }
+
+    function sendPolicyToFrame(f, policy) {
+      try {
+        if (f.port && typeof f.port.postMessage === 'function') {
+          f.port.postMessage({ type: 'policy', policy });
+        } else {
+          _postToFrame(f, { type: 'policy', policy });
+        }
+      } catch (e) { console.warn('mcbaise:sendPolicy failed', e); }
+    }
+
+    function computePriorityScore(f) {
+      // Higher is better. Use intersection ratio and size.
+      try {
+        const rect = f.iframe.getBoundingClientRect();
+        const area = Math.max(0, rect.width * rect.height);
+        const visible = (f._intersectionRatio || 0) > 0.01;
+        // Prefer larger visible frames.
+        return (visible ? 1 : 0) * (f._intersectionRatio || 0) + Math.log10(Math.max(1, area));
+      } catch (_) { return 0; }
+    }
+
+    function updateAllPolicies() {
+      // Rank frames by priority score and assign full quality to top N.
+      const ranked = Array.from(extraVizFrames).map(f => ({ f, score: computePriorityScore(f) }));
+      ranked.sort((a, b) => b.score - a.score);
+      for (let i = 0; i < ranked.length; i++) {
+        const f = ranked[i].f;
+        // If the parent requested precise mode, force full quality for all frames
+        // so they render frequently and stay tightly in sync.
+        const base = (i < MAX_FULL_QUALITY) ? { mode: 'high', fps: 60, scale: 1 } : (ranked[i].score > 0 ? { mode: 'medium', fps: 30, scale: 0.75 } : { mode: 'low', fps: 8, scale: 0.5 });
+        // Always allow interpolation on children for smooth local playback.
+        const policy = Object.assign({}, base, { interpolate: true });
+        // attach policy for later checks
+        f._policy = policy;
+        sendPolicyToFrame(f, policy);
+      }
+    }
+
+    function updateFramePolicy(f) {
+      // Called when an individual frame's visibility/size changes — just re-evaluate all.
+      try { updateAllPolicies(); } catch (_) {}
+    }
+
+    // Debounced resize handler to recompute policies when the viewport/layout changes.
+    (function() {
+      let _resizeTimer = null;
+      window.addEventListener('resize', () => {
+        try {
+          if (_resizeTimer) clearTimeout(_resizeTimer);
+          _resizeTimer = setTimeout(() => {
+            try { updateAllPolicies(); } catch (_) {}
+          }, 120);
+        } catch (_) {}
+      });
+    })();
 
     function _postToFrame(frameLike, msg) {
       try {
-        // support both raw iframe element and our { iframe, ready } objects
+        // support both raw iframe element and our { iframe, ready, port } objects
+        // If a MessagePort is attached to the frame, use it (more efficient).
+        if (frameLike?.port && typeof frameLike.port.postMessage === 'function') {
+          frameLike.port.postMessage(msg);
+          return true;
+        }
         const win = frameLike?.contentWindow || frameLike?.iframe?.contentWindow;
-        console.debug('mcbaise:postToFrame', { msg, hasWindow: !!win, frameLike });
-        if (win) win.postMessage(msg, PAGE_ORIGIN);
-      } catch (_) {}
+        console.debug('mcbaise:postToFrame', { msg, hasWindow: !!win, hasPort: !!frameLike?.port, frameLike });
+        if (!win) return false;
+        // Try with PAGE_ORIGIN first; for blob/opaque frames fall back to '*'.
+        try {
+          win.postMessage(msg, PAGE_ORIGIN);
+        } catch (e) {
+          try { win.postMessage(msg, '*'); } catch (e2) { return false; }
+        }
+        return true;
+      } catch (err) {
+        console.warn('mcbaise:postToFrame error', err);
+        return false;
+      }
     }
 
     function broadcastTime(timeSec, playing) {
-      console.debug('mcbaise:broadcastTime', { timeSec, playing, count: extraVizFrames.length });
-      for (const f of extraVizFrames) {
-        _postToFrame(f, { type: "mcbaise_time", timeSec, playing: !!playing });
+      if (window.__MCBAISE_DEBUG) console.debug('mcbaise:broadcastTime', { timeSec, playing, count: extraVizFrames.length });
+      // Iterate a copy since we may prune dead frames.
+      const nowMs = performance.now();
+      // Use the configured authoritative throttle for syncs.
+      const shouldSync = ((nowMs - lastSyncSentMs) >= SYNC_THROTTLE_MS);
+      for (const f of Array.from(extraVizFrames)) {
+        try {
+          // Prefer to send through a MessagePort if available (lower overhead).
+          if (f.port && typeof f.port.postMessage === 'function') {
+            try {
+              if (shouldSync) f.port.postMessage({ type: 'sync', timeSec, playing: !!playing, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+              else f.port.postMessage({ type: 'tick', timeSec, playing: !!playing });
+              try { f._lastSeen = nowMs; } catch (_) {}
+            } catch (e) { console.warn('mcbaise:port.postMessage failed', e); }
+          } else {
+            // fallback: only send authoritative syncs at a lower cadence via postMessage
+              if (shouldSync) {
+                const ok = _postToFrame(f, { type: 'sync', timeSec, playing: !!playing, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+                if (ok) try { f._lastSeen = nowMs; } catch (_) {}
+                if (!ok) continue;
+              }
+          }
+        } catch (e) {
+          console.warn('mcbaise:broadcastTime:postMessage failed', e);
+          // Remove problematic frame from list to avoid repeated failures.
+          const idx = extraVizFrames.indexOf(f);
+          if (idx !== -1) extraVizFrames.splice(idx, 1);
+        }
+      }
+      if (shouldSync) lastSyncSentMs = nowMs;
+    }
+
+    function broadcastSync(timeSec, playing) {
+      // Immediate authoritative sync to all frames (used on play/pause/seek)
+      for (const f of Array.from(extraVizFrames)) {
+        try {
+          if (f.port && typeof f.port.postMessage === 'function') {
+            try { f.port.postMessage({ type: 'sync', timeSec, playing: !!playing, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() }); } catch (e) { console.warn('mcbaise:port.postMessage failed', e); }
+          } else {
+            try { _postToFrame(f, { type: 'sync', timeSec, playing: !!playing, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() }); } catch (_) {}
+          }
+        } catch (_) {}
+      }
+      lastSyncSentMs = performance.now();
+    }
+
+    // Health-check: if any frame hasn't been seen by parent traffic for a while,
+    // try to nudge it by sending a targeted authoritative sync. This helps
+    // recover dynamically-added frames that failed to receive messages or
+    // whose event loop stalled.
+    try {
+      setInterval(() => {
+        try {
+          if (!isPlaying) return;
+          const now = Date.now();
+          for (const f of Array.from(extraVizFrames)) {
+            try {
+              const last = Number(f._lastSeen || 0);
+              if ((now - last) > 8000) {
+                // nudge this frame
+                const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+                try {
+                  if (f.port && typeof f.port.postMessage === 'function') {
+                    f.port.postMessage({ type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+                  } else {
+                    _postToFrame(f, { type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+                  }
+                } catch (_) {}
+                try { f._lastSeen = Date.now(); } catch (_) {}
+              }
+            } catch (_) {}
+          }
+        } catch (_) {}
+      }, 3000);
+    } catch (_) {}
+
+    // Send a short burst of authoritative syncs spaced a few ms apart to
+    // reduce visible snapping when toggling precise mode on.
+    function burstSync(count = 3, spacingMs = 16) {
+      for (let i = 0; i < count; i++) {
+        setTimeout(() => {
+          try {
+            const t = (player && typeof player.getCurrentTime === 'function') ? player.getCurrentTime() : 0;
+            broadcastSync(t, !!isPlaying);
+          } catch (_) {}
+        }, i * spacingMs);
       }
     }
 
@@ -686,6 +1040,25 @@
       const d = ev.data || {};
       if (!d || typeof d !== 'object') return;
 
+      // Child watchdog may ask for an immediate authoritative sync.
+      if (d.type === 'child_watchdog_request_sync') {
+        try {
+          const src = ev.source;
+          const f = extraVizFrames.find(x => (x.iframe && x.iframe.contentWindow) === src);
+          const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+          if (f) {
+            try {
+              if (f.port && typeof f.port.postMessage === 'function') f.port.postMessage({ type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1) });
+              else _postToFrame(f, { type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1) });
+            } catch (_) {}
+          } else {
+            // fallback: broadcast sync to all
+            broadcastSync(t, !!isPlaying);
+          }
+        } catch (_) {}
+        return;
+      }
+
       // Ignore child time pushes — parent is authoritative for time.
       if (d.mcbaise_time !== undefined || d.type === 'mcbaise_time') return;
 
@@ -738,10 +1111,38 @@
       if (rafId) return;
       const loop = () => {
         rafId = requestAnimationFrame(loop);
-        if (!wasm?.set_video_time || !playerReady || !player?.getCurrentTime) return;
-        const t = player.getCurrentTime();
-        wasm.set_video_time(t, !!isPlaying);
-        broadcastTime(t, !!isPlaying);
+        try {
+          const t0 = performance.now();
+          if (!playerReady || !player?.getCurrentTime) return;
+          const nowMs = performance.now();
+          if (nowMs - lastBroadcastMs < BROADCAST_THROTTLE_MS) return;
+          lastBroadcastMs = nowMs;
+          const t = player.getCurrentTime();
+
+          // Time sub-steps so we can tell whether wasm.set_video_time or
+          // broadcastTime/postMessage is responsible for long rAFs.
+          const stepStart = performance.now();
+          let afterSetVideo = stepStart;
+          if (typeof wasm?.set_video_time === 'function') {
+            // Schedule the wasm call asynchronously to avoid blocking the rAF.
+            try { scheduleWasmSetVideoTime(t, !!isPlaying); } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:parent:schedule:error', e); }
+            afterSetVideo = performance.now();
+          } else {
+            // no wasm yet; mark afterSetVideo equal to start so durations reflect only broadcast
+            afterSetVideo = performance.now();
+          }
+
+          const beforeBroadcast = performance.now();
+          try { broadcastTime(t, !!isPlaying); } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:parent:broadcastTime:error', e); }
+          const afterBroadcast = performance.now();
+
+          const dur_set = Math.round((afterSetVideo - stepStart));
+          const dur_broadcast = Math.round((afterBroadcast - beforeBroadcast));
+          const total = Math.round(afterBroadcast - t0);
+          if (window.__MCBAISE_DEBUG && total > 50) console.warn('mcbaise:parent:rAF:work', { total: total + 'ms', set_video_time_ms: dur_set + 'ms', broadcast_ms: dur_broadcast + 'ms' });
+        } catch (e) {
+          if (window.__MCBAISE_DEBUG) console.error('mcbaise:parent:rAF:error', e);
+        }
       };
       loop();
     }
@@ -754,11 +1155,12 @@
     function startPoll() {
       if (pollId) return;
       pollId = setInterval(() => {
-        if (!wasm?.set_video_time || !playerReady || !player?.getCurrentTime) return;
+        if (!playerReady || !player?.getCurrentTime) return;
         const t = player.getCurrentTime();
-        wasm.set_video_time(t, !!isPlaying);
-        broadcastTime(t, !!isPlaying);
-      }, 250);
+        // Use the scheduler to avoid synchronous wasm blocking inside the interval tick.
+          try { scheduleWasmSetVideoTime(t, !!isPlaying); } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:poll:schedule:error', e); }
+          broadcastTime(t, !!isPlaying);
+        }, 100);
     }
 
     function stopPoll() {
@@ -792,7 +1194,7 @@
             refreshLoading();
             const t = player.getCurrentTime?.() ?? 0;
             wasm?.set_video_time?.(t, false);
-            broadcastTime(t, false);
+            try { broadcastSync(t, false); } catch (_) { broadcastTime(t, false); }
 
             if (pendingPlayingRequest !== null) {
               try {
@@ -808,11 +1210,14 @@
               isPlaying = true;
               startLoop();
               startPoll();
+                // immediate authoritative sync when playback starts
+                try { const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0; broadcastSync(t, true); } catch (_) {}
             } else {
               isPlaying = false;
               const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
               wasm?.set_video_time?.(t, false);
-              broadcastTime(t, false);
+                // authoritative sync on pause/stop
+                try { broadcastSync(t, false); } catch (_) {}
               stopLoop();
               stopPoll();
             }
@@ -821,13 +1226,13 @@
             // Keep wasm time/playing fresh when playback rate changes.
             const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
             wasm?.set_video_time?.(t, !!isPlaying);
-            broadcastTime(t, !!isPlaying);
+              try { broadcastSync(t, !!isPlaying); } catch (_) {}
           },
           onError: (err) => {
             console.warn('YouTube player error', err);
             const t = playerReady ? (player.getCurrentTime?.() ?? 0) : 0;
             wasm?.set_video_time?.(t, false);
-            broadcastTime(t, false);
+              try { broadcastSync(t, false); } catch (_) {}
             stopLoop();
             stopPoll();
           }
@@ -836,35 +1241,290 @@
     };
 
     // In viz-only mode, receive time/visibility/playback updates from the parent page.
-    window.addEventListener("message", (e) => {
-      if (e.origin !== PAGE_ORIGIN) {
-        console.debug('mcbaise:child:ignored-origin', { origin: e.origin, expected: PAGE_ORIGIN, data: e.data });
-        return;
-      }
-      console.debug('mcbaise:child:message', e.data);
-      const data = e.data;
-      if (!data || typeof data !== "object") return;
+    // Support both window.postMessage and an attached MessagePort (preferred).
+    (function() {
+      let childPort = null;
+      let childLoopId = null;
+      let lastSync = { timeSec: 0, tsMs: 0, playing: false, rate: 1 };
+      // childPolicy controls local throttling and smoothing behavior. Default
+      // includes `interpolate: true` so children smooth between authoritative
+      // sync samples by default.
+      let childPolicy = { mode: 'high', fps: 60, scale: 1, interpolate: true };
+      let _lastAppliedMs = 0;
 
-      if (data.type === "mcbaise_time") {
-        wasm?.set_video_time?.(Number(data.timeSec) || 0, !!data.playing);
-        return;
-      }
-
-      if (data.type === 'mcbaise_set_video_visible') {
-        try { applyLocalVideoVisibility?.(!!data.show); } catch (_) {}
-        // Acknowledge back to the parent so it can confirm delivery (useful for debugging).
-        try { window.parent?.postMessage({ type: 'mcbaise_set_video_visible_ack', applied: !!data.show }, PAGE_ORIGIN); } catch (_) {}
-        return;
-      }
-
-      if (data.type === 'mcbaise_request_playing') {
+      function applyPolicy(policy) {
         try {
-          if (data.playing) wasm?.request_playing?.(true);
-          else wasm?.request_playing?.(false);
+          childPolicy = Object.assign({}, childPolicy, policy || {});
+          // If wasm exposes a render scale API, call it; otherwise we prefer to only throttle time updates.
+          try {
+            console.debug('mcbaise:child:applyPolicy', childPolicy);
+            // Prefer calling the wasm export `set_render_scale(scale)` if available.
+            // In many cases the wasm module may not yet be initialized when the
+            // first policy arrives; attempt a few short retries rather than
+            // failing silently so devs can toggle scale from the parent early.
+            function ensureRenderScale(scale, attemptsLeft = 6) {
+              try {
+                if (typeof wasm?.set_render_scale === 'function') {
+                  try { wasm.set_render_scale(scale); return true; } catch (e) { if (window.__MCBAISE_DEBUG) console.warn('mcbaise:child:set_render_scale:call_failed', e); }
+                }
+              } catch (_) {}
+              if (attemptsLeft <= 0) {
+                if (window.__MCBAISE_DEBUG) console.debug('mcbaise:child:applyPolicy - no wasm.set_render_scale after retries, skipping JS canvas resize');
+                return false;
+              }
+              // Retry after a short delay — keeps retry lightweight and bounded.
+              setTimeout(() => ensureRenderScale(scale, attemptsLeft - 1), 200);
+              return false;
+            }
+            ensureRenderScale(childPolicy.scale);
+          } catch (_) {}
         } catch (_) {}
-        return;
       }
-    });
+
+      // Recompute canvas/application sizing when the viewport or canvas element resizes.
+      try {
+        let _childResizeTimer = null;
+        window.addEventListener('resize', () => {
+          try {
+            if (_childResizeTimer) clearTimeout(_childResizeTimer);
+            _childResizeTimer = setTimeout(() => {
+              try { applyPolicy(childPolicy); } catch (_) {}
+            }, 120);
+          } catch (_) {}
+        });
+
+        // Also observe the canvas element for size changes so we can reapply or restore scale.
+        try {
+          const c = document.getElementById('bevy-canvas');
+          if (c && typeof ResizeObserver !== 'undefined') {
+            const ro = new ResizeObserver(() => {
+              try {
+                if (_childResizeTimer) clearTimeout(_childResizeTimer);
+                _childResizeTimer = setTimeout(() => { try { applyPolicy(childPolicy); } catch (_) {} }, 80);
+              } catch (_) {}
+            });
+            try { ro.observe(c); } catch (_) {}
+          }
+        } catch (_) {}
+      } catch (_) {}
+
+      // Correction state used to smoothly converge to authoritative time
+      // without visible jumps. `correctionVel` is seconds-per-second to add
+      // to the nominal playback rate for a short convergence window.
+      let _correctionVel = 0;
+      let _correctionUntil = 0;
+
+      function startChildLoop() {
+        if (childLoopId) return;
+        const step = () => {
+            childLoopId = requestAnimationFrame(step);
+            try {
+              const t0 = performance.now();
+              const now = performance.now();
+              let t = Number(lastSync.timeSec) || 0;
+            // If interpolation is enabled, locally integrate time forward from
+            // the last authoritative sync. If disabled, remain perfectly
+            // authoritative by using the last sync time directly.
+            if (childPolicy.interpolate && lastSync.playing) {
+              const dt = (now - (lastSync.tsMs || now)) / 1000;
+              // If we have an active correction velocity, blend it in and
+              // reduce it over time until the correction window expires.
+              let vel = Number(lastSync.rate || 1);
+              if (_correctionUntil > now) {
+                vel += _correctionVel;
+              }
+              t = t + dt * vel;
+            } else {
+              // stay exactly at authoritative time (no local extrapolation)
+              t = Number(lastSync.timeSec) || 0;
+            }
+            // Throttle actual wasm updates according to policy.fps
+            const minInterval = 1000 / (childPolicy.fps || 60);
+            if ((now - _lastAppliedMs) >= minInterval) {
+              const subStart = performance.now();
+              let afterSet = subStart;
+                if (typeof wasm?.set_video_time === 'function') {
+                  try { scheduleWasmSetVideoTime(t, !!lastSync.playing); } catch (e) { if (window.__MCBAISE_DEBUG) console.error('mcbaise:child:schedule:error', e); }
+                  afterSet = performance.now();
+                } else {
+                  afterSet = performance.now();
+                }
+              _lastAppliedMs = now;
+              const dur_total = Math.round(performance.now() - t0);
+              const dur_set = Math.round(afterSet - subStart);
+              if (window.__MCBAISE_DEBUG && dur_total > 50) console.warn('mcbaise:child:rAF:work', { total: dur_total + 'ms', set_video_time_ms: dur_set + 'ms' });
+            }
+          } catch (_) {}
+        };
+        step();
+      }
+
+      function stopChildLoop() {
+        if (!childLoopId) return;
+        cancelAnimationFrame(childLoopId);
+        childLoopId = null;
+      }
+
+      // child-side clock offset (ms) applied to parent timestamps: parent_ts + offset -> child clock
+      let childClockOffsetMs = 0;
+
+      function applySync(timeSec, playing, rate, parent_ts_ms) {
+        // Authoritative sync from parent. We implement latency compensation
+        // and a smooth phase-correction to reduce visible jumps while being
+        // more accurate than naive interpolation.
+        const nowPerf = performance.now();
+        const nowWall = Date.now();
+
+        // Predict current local playback time based on previous authoritative
+        // sample (if any) and local integration.
+        let predictedLocal = Number(lastSync.timeSec || 0);
+        if (childPolicy.interpolate && lastSync.playing) {
+          const prevTs = Number(lastSync.tsMs || nowPerf);
+          const dt = (nowPerf - prevTs) / 1000;
+          predictedLocal = predictedLocal + dt * (Number(lastSync.rate || 1) + (_correctionUntil > nowPerf ? _correctionVel : 0));
+        }
+
+        // Estimate one-way transport delay using parent_ts_ms corrected by any measured clock offset.
+        let transportMs = 0;
+        try {
+          const parentTs = Number(parent_ts_ms || nowWall);
+          const adjustedParentWall = parentTs + (childClockOffsetMs || 0);
+          transportMs = Math.max(0, nowWall - adjustedParentWall);
+        } catch (_) { transportMs = 0; }
+
+        // Compute adjusted authoritative time by accounting for transport delay.
+        const adjustedAuthoritative = Number(timeSec || 0) + (transportMs / 1000) * (Number(rate || 1));
+
+        // Error between authoritative and our predicted local time.
+        const err = adjustedAuthoritative - predictedLocal;
+
+        // Decide snap vs. smooth correction. If error is large, snap immediately.
+        const SNAP_THRESHOLD = 0.25; // seconds
+        const CONVERGENCE_MS = 300; // convergence window for phase correction (ms)
+
+        lastSync.timeSec = Number(timeSec) || 0;
+        lastSync.tsMs = nowPerf;
+        lastSync.playing = !!playing;
+        lastSync.rate = Number(rate) || 1;
+
+          if (Math.abs(err) > SNAP_THRESHOLD) {
+          // Large error — snap to adjusted authoritative time to avoid long drift.
+          try { requestAnimationFrame(() => { try { wasm?.set_video_time?.(adjustedAuthoritative, lastSync.playing); } catch (_) {} }); } catch (_) {}
+          // clear any small corrections
+          _correctionVel = 0;
+          _correctionUntil = 0;
+        } else {
+          // Small error — apply temporary correction velocity to converge smoothly.
+          // We compute a velocity (seconds/sec) that will remove `err` over CONVERGENCE_MS.
+          const convergenceSec = Math.max(0.05, CONVERGENCE_MS / 1000);
+          _correctionVel = err / convergenceSec; // this will be added to playback rate
+          // clamp correction to reasonable bounds to avoid crazy speeds
+          const MAX_CORRECTION = 1.0; // allow up to +1s/s additional speed
+          if (_correctionVel > MAX_CORRECTION) _correctionVel = MAX_CORRECTION;
+          if (_correctionVel < -MAX_CORRECTION) _correctionVel = -MAX_CORRECTION;
+          _correctionUntil = nowPerf + CONVERGENCE_MS;
+          // Apply an immediate small adjust to be responsive (but not a snap)
+          try { requestAnimationFrame(() => { try { wasm?.set_video_time?.(predictedLocal, lastSync.playing); } catch (_) {} }); } catch (_) {}
+        }
+
+        if (lastSync.playing) startChildLoop(); else stopChildLoop();
+      }
+
+      function handleChildMessage(data, origin) {
+        if (!data || typeof data !== 'object') return;
+        // Accept both legacy and new message shapes. Treat both as authoritative sync.
+        if (data.type === 'sync' || data.type === 'mcbaise_time') {
+          applySync(data.timeSec, data.playing, data.rate);
+          return;
+        }
+        if (data.type === 'policy') {
+          try { applyPolicy(data.policy); } catch (_) {}
+          return;
+        }
+        // Respond to ping messages from the parent for clock/Round-Trip Time estimation.
+        if (data.type === 'ping') {
+          try {
+            const t_child_recv_ms = Date.now();
+            // Reply on the same port to the parent with the timestamp we received it.
+            try { childPort.postMessage({ type: 'pong', id: data.id, t_parent_send_ms: data.t_parent_send_ms, t_child_recv_ms }); } catch (_) {}
+          } catch (_) {}
+          return;
+        }
+        // Parent may send a computed clock offset to the child to apply.
+        if (data.type === 'clock_offset') {
+          try { childClockOffsetMs = Number(data.offset_ms) || 0; } catch (_) { childClockOffsetMs = 0; }
+          console.debug('mcbaise:child:clock_offset', childClockOffsetMs);
+          return;
+        }
+        // Lightweight 'tick' messages are advisory; ignore for now to avoid thrash.
+        if (data.type === 'tick') {
+          return;
+        }
+        if (data.type === 'mcbaise_set_video_visible') {
+          try { applyLocalVideoVisibility?.(!!data.show); } catch (_) {}
+          try { window.parent?.postMessage({ type: 'mcbaise_set_video_visible_ack', applied: !!data.show }, PAGE_ORIGIN); } catch (_) {}
+          return;
+        }
+        if (data.type === 'mcbaise_request_playing') {
+          try {
+            if (data.playing) wasm?.request_playing?.(true);
+            else wasm?.request_playing?.(false);
+          } catch (_) {}
+          return;
+        }
+      }
+
+      window.addEventListener('message', (e) => {
+        // Special-case: attach a transferred MessagePort regardless of origin.
+        if (e.data && e.data.type === 'attachPort' && e.ports && e.ports[0]) {
+          childPort = e.ports[0];
+          try {
+            childPort.onmessage = (ev) => handleChildMessage(ev.data);
+            childPort.start?.();
+          } catch (_) {}
+          return;
+        }
+
+        // For other messages, perform origin check as before.
+        if (e.origin !== PAGE_ORIGIN) {
+          console.debug('mcbaise:child:ignored-origin', { origin: e.origin, expected: PAGE_ORIGIN, data: e.data });
+          return;
+        }
+        console.debug('mcbaise:child:message', e.data);
+        handleChildMessage(e.data, e.origin);
+      });
+
+      // Watchdog: if the child is supposed to be playing but the rAF loop isn't active,
+      // try to (re)start it occasionally — this helps recover from cases where the
+      // loop was paused by the UA and didn't resume.
+      try {
+        setInterval(() => {
+          try {
+            const now = performance.now();
+            const age = now - (lastSync.tsMs || 0);
+            if (lastSync.playing) {
+              if (!childLoopId) {
+                // If we've not received an authoritative sync for a while, nudge the parent.
+                if (age > 5000) {
+                  try {
+                    // Prefer MessagePort if attached, otherwise fallback to window.postMessage
+                    if (childPort && typeof childPort.postMessage === 'function') {
+                      try { childPort.postMessage({ type: 'child_watchdog_request_sync' }); } catch (_) {}
+                    } else {
+                      try { window.parent?.postMessage({ type: 'child_watchdog_request_sync' }, PAGE_ORIGIN); } catch (_) {}
+                    }
+                  } catch (_) {}
+                }
+                startChildLoop();
+              }
+            } else {
+              // if not playing, ensure loop is stopped
+              if (childLoopId) stopChildLoop();
+            }
+          } catch (_) {}
+        }, 1000);
+      } catch (_) {}
+    })();
 
     function injectExtraViz(direction) {
       if (vizOnly) return;
@@ -885,36 +1545,135 @@
       const playerWrap = document.getElementById('playerWrap');
       const right = document.getElementById('right');
 
-      // Deterministic placement by direction
-      if (direction === 'left' && left) {
-        rootEl.insertBefore(pane, left);
-      } else if (direction === 'right' && right) {
-        rootEl.insertBefore(pane, right);
-      } else if ((direction === 'top' || direction === 'above') && left && playerWrap) {
-        left.insertBefore(pane, playerWrap);
-      } else if ((direction === 'bottom' || direction === 'below') && left && playerWrap) {
-        left.appendChild(pane);
+      const isPortrait = window.matchMedia('(max-aspect-ratio: 1/1)').matches;
+      if (isPortrait && (direction === 'left' || direction === 'right')) {
+        // Place pane into persistent side slot so cardinal placement is preserved.
+        const leftSlot = document.getElementById('sideLeftSlot');
+        const rightSlot = document.getElementById('sideRightSlot');
+        const slot = direction === 'left' ? leftSlot : rightSlot;
+        if (slot) {
+          pane.dataset.placedIn = 'sideSlot';
+          pane.dataset.side = direction;
+          slot.appendChild(pane);
+          // Defer class additions to avoid layout thrash.
+          try {
+            scheduleWrite(() => {
+              slot.classList.add('hasPane');
+              try { rootEl.classList.add('hasPortraitExtras'); } catch (_) {}
+              try { void slot.offsetHeight; } catch (_) {}
+              requestAnimationFrame(() => { try { window.dispatchEvent(new Event('resize')); } catch (_) {} });
+            });
+          } catch (_) {
+            slot.classList.add('hasPane');
+            try { rootEl.classList.add('hasPortraitExtras'); } catch (_) {}
+          }
+        } else {
+          // fallback to DOM insertion
+          if (direction === 'left' && left) rootEl.insertBefore(pane, left);
+          else if (direction === 'right' && right) rootEl.insertBefore(pane, right);
+          else (right || left || rootEl).appendChild(pane);
+        }
       } else {
-        // fallback: append to right
-        (right || left || rootEl).appendChild(pane);
+        // Deterministic placement by direction (desktop / landscape behavior)
+        if (direction === 'left' && left) {
+          rootEl.insertBefore(pane, left);
+        } else if (direction === 'right' && right) {
+          rootEl.insertBefore(pane, right);
+        } else if ((direction === 'top' || direction === 'above') && left && playerWrap) {
+          left.insertBefore(pane, playerWrap);
+        } else if ((direction === 'bottom' || direction === 'below') && left && playerWrap) {
+          left.appendChild(pane);
+        } else {
+          // fallback: append to right
+          (right || left || rootEl).appendChild(pane);
+        }
       }
 
       // Track frame with readiness flag and send initial messages on load.
-      const frameObj = { iframe, ready: false };
-      extraVizFrames.push(frameObj);
-      iframe.addEventListener('load', () => {
-        frameObj.ready = true;
-        // Send an initial time and visibility sample after load.
+        const frameObj = { iframe, ready: false, port: null };
+        // Create a MessageChannel for this frame; we'll transfer port2 to child on load.
         try {
-          const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
-          _postToFrame(frameObj, { type: 'mcbaise_time', timeSec: t, playing: !!isPlaying });
-          _postToFrame(frameObj, { type: 'mcbaise_set_video_visible', show: !(playerWrapEl && playerWrapEl.classList.contains('hidePlayer')) });
-        } catch (_) {}
-      });
+          const mc = new MessageChannel();
+          frameObj._localPort = mc.port1; // parent-side port
+          frameObj._transferPort = mc.port2; // to be transferred to child
+        } catch (_) {
+          frameObj._localPort = null;
+          frameObj._transferPort = null;
+        }
+        extraVizFrames.push(frameObj);
+        // Start observing this iframe for visibility/size-based priority decisions.
+        try { if (io && iframe) io.observe(iframe); } catch (_) {}
+        try { updateAllPolicies(); } catch (_) {}
+        // Ensure the main RAF loop is running if the player is playing.
+        try { if (isPlaying) startLoop(); } catch (_) {}
+        iframe.addEventListener('load', () => {
+          frameObj.ready = true;
+          // Transfer MessagePort to child if available
+          try {
+            if (frameObj._transferPort && iframe.contentWindow) {
+              try {
+                iframe.contentWindow.postMessage({ type: 'attachPort' }, PAGE_ORIGIN, [frameObj._transferPort]);
+              } catch (e) {
+                try { iframe.contentWindow.postMessage({ type: 'attachPort' }, '*', [frameObj._transferPort]); } catch (_) {}
+              }
+              // start listening on parent-side port
+              try {
+                    frameObj._localPort.start?.();
+                    frameObj.port = frameObj._localPort;
+                    // Set up a simple ping/pong handshake to measure RTT and clock offset
+                    // so the child can correct for transport latency and any clock skew.
+                    frameObj.port.onmessage = (ev) => {
+                      try {
+                        const d = ev.data || {};
+                        if (d.type === 'pong' && typeof d.t_parent_send_ms !== 'undefined') {
+                          // Compute RTT and clock offset estimate (child_time - parent_time_at_midpoint)
+                          const rtt = Date.now() - Number(d.t_parent_send_ms || Date.now());
+                          const offset = Number(d.t_child_recv_ms || 0) - (Number(d.t_parent_send_ms || 0) + rtt / 2);
+                          frameObj._clockOffsetMs = offset;
+                          // Send the computed offset to the child so it can correct locally.
+                          try { frameObj.port.postMessage({ type: 'clock_offset', offset_ms: offset }); } catch (_) {}
+                          console.debug('mcbaise:ping', { rtt, offset, frame: frameObj });
+                        } else {
+                          // child -> parent messages on the port if needed
+                          console.debug('mcbaise:port:message', ev.data);
+                        }
+                      } catch (e) { console.debug('mcbaise:port:onmessage:error', e); }
+                    };
+                    // Send an immediate ping and then periodically refresh the estimate.
+                    const sendPing = () => {
+                      try {
+                        const id = Math.random().toString(36).slice(2);
+                        const t_parent_send_ms = Date.now();
+                        frameObj._lastPingId = id;
+                        frameObj._lastPingSentMs = t_parent_send_ms;
+                        try { frameObj.port.postMessage({ type: 'ping', id, t_parent_send_ms }); } catch (_) {}
+                      } catch (_) {}
+                    };
+                    // initial ping
+                    sendPing();
+                    try { frameObj._pingInterval = setInterval(sendPing, 5000); } catch (_) {}
+                  } catch (_) {}
+            }
+          } catch (_) {}
+          // Send an initial time and visibility sample after load.
+          try {
+            const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
+            // Prefer port-based delivery, fallback to postMessage
+              if (frameObj.port && typeof frameObj.port.postMessage === 'function') {
+                  frameObj.port.postMessage({ type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+                  try { frameObj._lastSeen = Date.now(); } catch (_) {}
+              frameObj.port.postMessage({ type: 'mcbaise_set_video_visible', show: !(playerWrapEl && playerWrapEl.classList.contains('hidePlayer')) });
+            } else {
+                  _postToFrame(frameObj, { type: 'sync', timeSec: t, playing: !!isPlaying, rate: (player?.getPlaybackRate?.() ?? 1), parent_ts_ms: Date.now() });
+                  try { frameObj._lastSeen = Date.now(); } catch (_) {}
+              _postToFrame(frameObj, { type: 'mcbaise_set_video_visible', show: !(playerWrapEl && playerWrapEl.classList.contains('hidePlayer')) });
+            }
+          } catch (_) {}
+        });
 
       // Push an initial time sample as soon as possible to already-loaded frames.
       const t = playerReady ? (player?.getCurrentTime?.() ?? 0) : 0;
-      broadcastTime(t, !!isPlaying);
+      try { broadcastSync(t, !!isPlaying); } catch (_) { broadcastTime(t, !!isPlaying); }
     }
 
 
@@ -940,6 +1699,8 @@
       setYoutubeLoading(true, "Loading YouTube…");
       await loadScript("https://www.youtube.com/iframe_api");
     }
+
+    // Parent-level precise UI removed: children always interpolate locally.
 
     // Wire up directional pi buttons to inject viz in that cardinal direction.
     if (videoPiContainer) {
