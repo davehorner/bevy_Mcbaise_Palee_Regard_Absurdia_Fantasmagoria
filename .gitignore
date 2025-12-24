@@ -7,3 +7,4 @@ crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www/assets/
 .cache/
 assets/model/fullbody_default.safetensors
 cookies.txt
+.tmp/

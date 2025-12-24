@@ -34,9 +34,10 @@ required-features = ["native-mpv"]
 
 [features]
 default = ["native"]
-native = ["bevy/multi_threaded"]
+native = ["bevy/multi_threaded", "capture_ui"]
 native-youtube = ["dep:fantoccini", "dep:tokio", "dep:serde_json", "dep:url", "dep:time"]
 native-mpv = ["dep:tokio", "dep:serde_json"]
+capture_ui = []
 
 [dependencies]
 bevy = { version = "0.17", default-features = false, features = [
@@ -70,11 +71,16 @@ bevy_egui = "0.38"
 bevy_burn_human = "0.2"
 fastrand = "2"
 
+# Used by wasm GPU readback (texture -> buffer copy + mapping).
+wgpu = "26"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2.106"
+wasm-bindgen-futures = "0.4"
 lz4_flex = { version = "0.11", default-features = false }
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement"] }
+web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "HtmlCanvasElement", "ImageBitmap", "CanvasRenderingContext2d", "ImageData"] }
+js-sys = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fantoccini = { version = "0.21", optional = true }
@@ -87,6 +93,10 @@ directories = "5"
 sha2 = "0.10"
 ureq = { version = "2", default-features = true, features = ["tls", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# Image encoding for native screenshots / GIF assembly
+image = { version = "0.24", features = ["png", "gif"] }
+open = "5.3"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

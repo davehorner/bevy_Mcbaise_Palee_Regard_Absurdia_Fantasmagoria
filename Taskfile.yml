@@ -75,6 +75,15 @@ tasks:
     cmds:
       - cargo run --bin bevy_mcbaise_fantasmagoria_youtube --features native-youtube
 
+  mcbaise:native:trace:
+    desc: Run the native demo with verbose tracing and full backtrace (debug logging)
+    env:
+      RUST_LOG: 'debug'
+      BEVY_BACKTRACE: 'full'
+      WGPU_ERROR_MODE: 'nonfatal'
+    cmds:
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native
+
   mcbaise:native:mpv:
     desc: Run native tube ride + sync playback from mpv (YouTube via yt-dlp)
     env:
@@ -386,3 +395,52 @@ tasks:
         else
           python tool/scripts/validate_wgsl.py "{{.file}}"
         fi
+
+  # Run with specific WGPU backend (env-driven). Example: `task mcbaise:run:backend -- backend=vulkan`
+  mcbaise:run:backend:
+    desc: Run native demo with a specified WGPU backend (set `backend` var)
+    vars:
+      backend: 'vulkan'
+    env:
+      WGPU_BACKEND: '{{.backend}}'
+      RUST_BACKTRACE: 'full'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_LOG: 'bevy_render=error,wgpu=error,wgpu_core=error'
+    cmds:
+      - cd crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria && cargo run --bin bevy_mcbaise_fantasmagoria_native
+
+  mcbaise:run:backend:vulkan:
+    desc: Run demo with Vulkan backend
+    cmds:
+      - task: mcbaise:run:backend -- backend=vulkan
+
+  mcbaise:run:backend:dx12:
+    desc: Run demo with DirectX 12 backend
+    cmds:
+      - task: mcbaise:run:backend -- backend=dx12
+
+  mcbaise:run:backend:dx11:
+    desc: Run demo with DirectX 11 backend
+    cmds:
+      - task: mcbaise:run:backend -- backend=dx11
+
+  mcbaise:run:backend:metal:
+    desc: Run demo with Metal backend (macOS)
+    cmds:
+      - task: mcbaise:run:backend -- backend=metal
+
+  mcbaise:run:backend:opengl:
+    desc: Run demo with OpenGL backend
+    cmds:
+      - task: mcbaise:run:backend -- backend=gl
+
+  # Tests
+  mcbaise:test:unit:
+    desc: Run unit tests for the main crate
+    cmds:
+      - cargo test -p bevy_mcbaise_fantasmagoria
+
+  mcbaise:test:workspace:
+    desc: Run all workspace tests
+    cmds:
+      - cargo test --workspace

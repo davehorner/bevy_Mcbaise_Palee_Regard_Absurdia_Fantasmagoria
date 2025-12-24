@@ -1,5 +1,6 @@
 // Simple runtime service worker for caching /pkg/ JS and wasm assets.
-const CACHE_NAME = 'mcbaise-assets-runtime-v1';
+// Bump the cache version when caching behavior changes.
+const CACHE_NAME = 'mcbaise-assets-runtime-v2';
 
 // Debug flag controllable by the client page via postMessage.
 let SW_DEBUG = false;
@@ -18,17 +19,30 @@ self.addEventListener('fetch', (event) => {
   // Only handle GETs
   if (event.request.method !== 'GET') return;
 
-  // Cache /pkg/ files and .wasm responses. Normalize cache keys to the
-  // pathname (ignore query params like `v=`) so different `v` tokens still
-  // hit the same cached asset during local development.
+  // Cache /pkg/ files and .wasm responses.
+  // We still normalize cache keys to the pathname, BUT when a request includes
+  // a cache-busting query (like `?v=`) we must bypass cache-first and refresh
+  // the normalized cache entry. Otherwise iframes can get stale wasm-bindgen
+  // glue that doesn't match the current Rust exports.
   if (url.pathname.includes('/pkg/') || url.pathname.endsWith('.wasm')) {
     event.respondWith(
       caches.open(CACHE_NAME).then(async (cache) => {
         const cacheKey = new Request(url.pathname);
+        const hasBustToken = url.searchParams.has('v');
         try {
           if (SW_DEBUG) console.debug('mcbaise:sw:fetch', { url: event.request.url, cacheKey: cacheKey.url });
         } catch (_) {}
         try {
+          if (hasBustToken) {
+            // Cache-busted request: always go to network and refresh the normalized cache.
+            const resp = await fetch(event.request);
+            if (resp && resp.status === 200) {
+              cache.put(cacheKey, resp.clone()).catch(() => {});
+              try { if (SW_DEBUG) console.debug('mcbaise:sw:refresh-cache', { url: event.request.url, cacheKey: cacheKey.url }); } catch (_) {}
+            }
+            return resp;
+          }
+
           const cached = await cache.match(cacheKey);
           if (cached) {
             try { if (SW_DEBUG) console.debug('mcbaise:sw:respond-from-cache', { url: event.request.url, cacheKey: cacheKey.url }); } catch (_) {}

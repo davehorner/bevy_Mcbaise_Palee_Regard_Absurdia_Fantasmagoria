@@ -7,24 +7,676 @@ use bevy::ecs::system::SystemParam;
 use bevy::mesh::{Indices, Mesh, PrimitiveTopology};
 use bevy::pbr::{DistanceFog, FogFalloff, Material, MaterialPlugin};
 use bevy::prelude::*;
+// Re-export the UI prelude to ensure `Node`, `Button`, `ImageNode`,
+// `FocusPolicy`, etc. are available.
+// `FocusPolicy` is now imported from its full path or moved out of the prelude.
+// use bevy::ui::FocusPolicy;
+// UI capture/preview is optional; gated behind `capture_ui` feature when enabled.
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use std::sync::atomic::{AtomicU32, Ordering};
+use bevy::render::texture::GpuImage;
 use bevy::shader::ShaderRef;
 use bevy::window::{PrimaryWindow, Window};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+// UI capture/preview is optional; gated behind `capture_ui` feature when enabled.
 
 use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native_assets;
+#[cfg(not(target_arch = "wasm32"))]
+use open;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
 // wasm: no direct `Windows` import; use ECS `Query<&mut Window, With<PrimaryWindow>>` below.
 
 // Render-scale API is implemented later in the file as `render_scale_api`.
+
+// Global readback request counter observed by the render/ECS systems.
+static READBACK_REQUEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+// GPU readback phase:
+// 0 = idle (do not copy)
+// 1 = armed this frame (wait for extraction/target to propagate)
+// 2 = wait one full render into the target
+// 3 = capture this frame
+static READBACK_GPU_PHASE: AtomicU32 = AtomicU32::new(0);
+
+// Whether a staging buffer is currently mapped (or mapping) for GPU readback.
+// When set, we poll the device each render tick to help drive mapping callbacks.
+static READBACK_MAP_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+// Debug: remember the last request sequence we logged about to avoid spamming.
+static READBACK_DEBUG_LAST_SEQ_ARM: AtomicU32 = AtomicU32::new(0);
+
+static READBACK_DEBUG_LAST_SEQ_RENDER: AtomicU32 = AtomicU32::new(0);
+
+#[allow(dead_code)]
+fn wasm_dbg(msg: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(msg));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        eprintln!("{}", msg);
+    }
+}
+
+fn wasm_dbg_kv(prefix: &str, value: &str) {
+    let s = format!("{prefix}{value}");
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&s));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        eprintln!("{}", s);
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmDebugFrameOnce {
+    did_log: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_debug_first_update_tick(mut st: ResMut<WasmDebugFrameOnce>) {
+    if st.did_log {
+        return;
+    }
+    st.did_log = true;
+    wasm_dbg("wasm: first Update tick");
+}
+
+// --- GPU readback (Bevy render target -> wgpu buffer map) ---
+// We render the scene into an offscreen Image with COPY_SRC enabled, then in
+// the RenderApp we copy that texture into a MAP_READ buffer and post the bytes
+// to the parent window.
+
+#[derive(Resource, Clone, Default)]
+struct GpuReadbackImage(pub Handle<Image>);
+
+impl bevy::render::extract_resource::ExtractResource for GpuReadbackImage {
+    type Source = GpuReadbackImage;
+
+    fn extract_resource(source: &Self::Source) -> Self {
+        source.clone()
+    }
+}
+
+#[derive(Resource, Default)]
+struct GpuReadbackPending {
+    active: bool,
+    just_armed: bool,
+    frames_left: u8,
+}
+
+#[derive(Component)]
+struct GpuReadbackCaptureCamera {
+    index: u8,
+}
+
+fn ensure_gpu_capture_camera_exists(
+    mut commands: Commands,
+    readback: Option<Res<GpuReadbackImage>>,
+    existing: Query<(Entity, &GpuReadbackCaptureCamera)>,
+    capture_state: Res<EguiCaptureState>,
+    multi_view: Res<MultiView>,
+) {
+    let Some(readback) = readback else { return; };
+    if readback.0 == Handle::default() {
+        return;
+    }
+
+    let desired_count = if capture_state.capture_multi {
+        multi_view.count as u8
+    } else {
+        1
+    };
+
+    // Despawn extras
+    for (entity, cap_cam) in &existing {
+        if cap_cam.index >= desired_count {
+            commands.entity(entity).despawn();
+        }
+    }
+
+    // Spawn missing
+    let mut present = vec![false; desired_count as usize];
+    for (_, cap_cam) in &existing {
+        if (cap_cam.index as usize) < present.len() {
+            present[cap_cam.index as usize] = true;
+        }
+    }
+
+    for i in 0..desired_count {
+        if present.get(i as usize).copied().unwrap_or(false) {
+            continue;
+        }
+
+        commands.spawn((
+            Camera3d::default(),
+            GpuReadbackCaptureCamera { index: i },
+            Name::new(format!("gpu_readback_capture_camera_{}", i)),
+        ));
+    }
+}
+
+fn update_gpu_capture_viewports(
+    readback: Option<Res<GpuReadbackImage>>,
+    capture_state: Res<EguiCaptureState>,
+    multi_view: Res<MultiView>,
+    images: Res<Assets<Image>>,
+    mut cap_cams: Query<(&GpuReadbackCaptureCamera, &mut Camera)>,
+) {
+    let Some(readback) = readback else { return; };
+    let Some(img) = images.get(&readback.0) else { return; };
+    let size = img.texture_descriptor.size;
+    let w = size.width;
+    let h = size.height;
+    if w == 0 || h == 0 { return; }
+
+    let count = if capture_state.capture_multi {
+        multi_view.count.clamp(1, MultiView::MAX_VIEWS) as u32
+    } else {
+        1
+    };
+    
+    let base_h = (h / count).max(1);
+    let mut y = 0u32;
+
+    for idx in 0..count {
+        let view_h = if idx + 1 == count {
+            h.saturating_sub(y).max(1)
+        } else {
+            base_h
+        };
+
+        for (cap_cam, mut cam) in &mut cap_cams {
+            if cap_cam.index as u32 == idx {
+                cam.viewport = Some(bevy::camera::Viewport {
+                    physical_position: UVec2::new(0, y),
+                    physical_size: UVec2::new(w, view_h),
+                    ..default()
+                });
+                break;
+            }
+        }
+        y = y.saturating_add(base_h);
+    }
+}
+
+fn sync_gpu_capture_cameras_from_views(
+    view_cams: Query<(&ViewCamera, &Projection, &Transform, Option<&DistanceFog>), Without<GpuReadbackCaptureCamera>>,
+    mut cap_cams: Query<(&GpuReadbackCaptureCamera, &mut Projection, &mut Transform, &mut Camera), Without<ViewCamera>>,
+) {
+    for (cap_cam, mut cap_proj, mut cap_tr, mut cam) in &mut cap_cams {
+        // Find matching view camera
+        let mut found = false;
+        for (view_cam, projection, transform, _) in &view_cams {
+            if view_cam.index == cap_cam.index {
+                *cap_proj = (*projection).clone();
+                *cap_tr = *transform;
+                found = true;
+                break;
+            }
+        }
+        // If no matching view camera, disable it (shouldn't happen with ensure system)
+        if !found {
+            cam.is_active = false;
+        }
+    }
+}
+
+fn sync_gpu_capture_camera_fog(
+    view_cams: Query<(&ViewCamera, Option<&DistanceFog>), Without<GpuReadbackCaptureCamera>>,
+    mut cap_cams: Query<(Entity, &GpuReadbackCaptureCamera), Without<ViewCamera>>,
+    mut commands: Commands,
+) {
+    for (entity, cap_cam) in &mut cap_cams {
+        for (view_cam, fog) in &view_cams {
+            if view_cam.index == cap_cam.index {
+                if let Some(fog) = fog {
+                    commands.entity(entity).insert((*fog).clone());
+                } else {
+                    commands.entity(entity).remove::<DistanceFog>();
+                }
+                break;
+            }
+        }
+    }
+}
+
+fn configure_gpu_capture_camera_settings(
+    readback: Option<Res<GpuReadbackImage>>,
+    pending: Res<GpuReadbackPending>,
+    mut cap_cams: Query<(&GpuReadbackCaptureCamera, &mut Camera)>,
+) {
+    let Some(readback) = readback else { return; };
+    if readback.0 == Handle::default() {
+        return;
+    }
+    for (cap_cam, mut cam) in &mut cap_cams {
+        cam.target = bevy::camera::RenderTarget::Image(readback.0.clone().into());
+        cam.output_mode = bevy::camera::CameraOutputMode::Write {
+            blend_state: None,
+            clear_color: if cap_cam.index == 0 {
+                ClearColorConfig::Default
+            } else {
+                ClearColorConfig::None
+            },
+        };
+        cam.order = cap_cam.index as isize;
+
+        // Keep disabled by default, but do NOT clobber the arming logic while
+        // a readback is pending.
+        if !pending.active {
+            cam.is_active = false;
+        }
+    }
+}
+
+// (Old sync function removed, replaced by sync_gpu_capture_cameras_from_views)
+
+fn ensure_readback_image_exists(
+    mut readback: ResMut<GpuReadbackImage>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if readback.0 != Handle::default() {
+        return;
+    }
+
+    // Start with a tiny image; it will be resized to the window size.
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+        | bevy::render::render_resource::TextureUsages::COPY_SRC
+        | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+
+    let handle = images.add(image);
+    readback.0 = handle;
+}
+
+fn resize_readback_image_to_window(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    readback: Option<Res<GpuReadbackImage>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    let Some(readback) = readback else { return; };
+    let Some(window) = windows.iter().next() else { return; };
+    let w = window.physical_width().max(1);
+    let h = window.physical_height().max(1);
+    let Some(image) = images.get_mut(&readback.0) else { return; };
+    let cur = image.texture_descriptor.size;
+    if cur.width == w && cur.height == h {
+        return;
+    }
+    image.resize(Extent3d {
+        width: w,
+        height: h,
+        depth_or_array_layers: 1,
+    });
+}
+
+fn arm_cameras_for_gpu_readback(
+    mut pending: ResMut<GpuReadbackPending>,
+    readback: Option<Res<GpuReadbackImage>>,
+    mut cap_cam: Query<&mut Camera, With<GpuReadbackCaptureCamera>>,
+) {
+    let seq = READBACK_REQUEST_SEQ.load(Ordering::SeqCst);
+    if seq == 0 {
+        return;
+    }
+
+    if pending.active {
+        return;
+    }
+
+    let Some(readback) = readback else {
+        // If this happens, extraction into the render world will also fail.
+        let last = READBACK_DEBUG_LAST_SEQ_ARM.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_ARM.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: cannot arm (missing GpuReadbackImage) seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    };
+
+    if readback.0 == Handle::default() {
+        let last = READBACK_DEBUG_LAST_SEQ_ARM.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_ARM.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: cannot arm (GpuReadbackImage not initialized) seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    }
+
+    // Enable ALL capture cameras for a few frames.
+    if cap_cam.is_empty() {
+        let last = READBACK_DEBUG_LAST_SEQ_ARM.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_ARM.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: cannot arm (missing capture camera) seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    }
+
+    for mut cam in &mut cap_cam {
+        cam.is_active = true;
+    }
+
+    pending.active = true;
+    pending.just_armed = true;
+    // Keep the capture camera alive long enough for extraction + one full render + copy.
+    pending.frames_left = 3;
+
+    // Advance the render-world readback state machine.
+    READBACK_GPU_PHASE.store(1, Ordering::SeqCst);
+
+    let last = READBACK_DEBUG_LAST_SEQ_ARM.load(Ordering::SeqCst);
+    if last != seq {
+        READBACK_DEBUG_LAST_SEQ_ARM.store(seq, Ordering::SeqCst);
+        wasm_dbg_kv(
+            "wasm:gpu_readback: armed capture cameras seq=",
+            &format!("{seq} count={} frames_left={}", cap_cam.iter().count(), pending.frames_left),
+        );
+    }
+}
+
+fn restore_cameras_after_gpu_readback(
+    mut pending: ResMut<GpuReadbackPending>,
+    mut cap_cam: Query<&mut Camera, With<GpuReadbackCaptureCamera>>,
+) {
+    if !pending.active {
+        return;
+    }
+
+    // We arm cameras during `Update` so extraction can see the new targets.
+    // If we restore in the same `Update`, the render world never sees the offscreen target.
+    // Skip one tick to allow a single frame to render into the readback image.
+    if pending.just_armed {
+        pending.just_armed = false;
+        return;
+    }
+
+    if pending.frames_left > 0 {
+        pending.frames_left -= 1;
+        return;
+    }
+
+    for mut cam in &mut cap_cam {
+        cam.is_active = false;
+    }
+    pending.active = false;
+}
+
+fn gpu_readback_render_system(
+    render_device: Res<bevy::render::renderer::RenderDevice>,
+    render_queue: Res<bevy::render::renderer::RenderQueue>,
+    gpu_images: Res<bevy::render::render_asset::RenderAssets<GpuImage>>,
+    readback: Option<Res<GpuReadbackImage>>,
+) {
+    let seq = READBACK_REQUEST_SEQ.load(Ordering::SeqCst);
+    if seq == 0 {
+        return;
+    }
+
+    let Some(readback) = readback else {
+        let last = READBACK_DEBUG_LAST_SEQ_RENDER.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_RENDER.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: render world missing GpuReadbackImage seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    };
+
+    let phase = READBACK_GPU_PHASE.load(Ordering::SeqCst);
+    if phase == 0 {
+        // Not armed yet (camera hasn't been retargeted).
+        let last = READBACK_DEBUG_LAST_SEQ_RENDER.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_RENDER.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: render sees seq but phase=0 seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    }
+    if phase == 1 {
+        // Wait one full render so the camera target size / view extraction settles.
+        READBACK_GPU_PHASE.store(2, Ordering::SeqCst);
+        return;
+    }
+    if phase == 2 {
+        // Wait an additional frame so we don't copy the freshly-cleared target
+        // before the capture camera has actually rendered into it.
+        READBACK_GPU_PHASE.store(3, Ordering::SeqCst);
+        return;
+    }
+
+    let Some(gpu_image) = gpu_images.get(readback.0.id()) else {
+        let last = READBACK_DEBUG_LAST_SEQ_RENDER.load(Ordering::SeqCst);
+        if last != seq {
+            READBACK_DEBUG_LAST_SEQ_RENDER.store(seq, Ordering::SeqCst);
+            wasm_dbg_kv(
+                "wasm:gpu_readback: render missing GpuImage for handle seq=",
+                &format!("{seq}"),
+            );
+        }
+        return;
+    };
+
+    wasm_dbg_kv(
+        "wasm:gpu_readback: have gpu_image ",
+        &format!("(size={}x{})", gpu_image.size.width, gpu_image.size.height),
+    );
+
+    // We may be called multiple times per frame; mark handled as soon as we schedule the copy.
+    READBACK_REQUEST_SEQ.store(0, Ordering::SeqCst);
+    READBACK_GPU_PHASE.store(0, Ordering::SeqCst);
+
+    // Determine texture size.
+    let size = gpu_image.size;
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    let bytes_per_pixel: u32 = 4;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+    let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+    let buffer = render_device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mcbaise_readback_staging"),
+        size: buffer_size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("mcbaise_readback_encoder"),
+    });
+
+    encoder.copy_texture_to_buffer(
+        gpu_image.texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded_bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    render_queue.submit(std::iter::once(encoder.finish()));
+
+    // On wasm/WebGPU, some browsers/drivers appear to need explicit polling to
+    // progress mapping callbacks reliably.
+    let _ = render_device.poll(wgpu::PollType::Poll);
+
+    // Map async and post to parent when ready.
+    let map_buffer = buffer.clone();
+    let map_slice = map_buffer.slice(..);
+    let buffer2 = buffer.clone();
+    READBACK_MAP_IN_FLIGHT.store(1, Ordering::SeqCst);
+    map_slice.map_async(wgpu::MapMode::Read, move |res| {
+        if let Err(e) = res {
+            wasm_dbg_kv("gpu_readback: map_async error ", &format!("{:?}", e));
+            READBACK_MAP_IN_FLIGHT.store(0, Ordering::SeqCst);
+            return;
+        }
+        // Re-slice after mapping to avoid capturing a non-'static slice in the callback.
+        let data = buffer2.slice(..).get_mapped_range();
+        let mut out = vec![0u8; (unpadded_bytes_per_row as usize) * (height as usize)];
+        for row in 0..(height as usize) {
+            let src_start = row * (padded_bytes_per_row as usize);
+            let dst_start = row * (unpadded_bytes_per_row as usize);
+            out[dst_start..dst_start + (unpadded_bytes_per_row as usize)]
+                .copy_from_slice(&data[src_start..src_start + (unpadded_bytes_per_row as usize)]);
+        }
+
+        // checksum/sample
+        let sample_len = out.len().min(64);
+        let mut checksum: u32 = 0;
+        for i in 0..sample_len {
+            checksum = checksum.wrapping_add(out[i] as u32);
+        }
+
+        wasm_dbg_kv(
+            "gpu_readback: mapped ",
+            &format!("{} bytes ({}x{}, checksum_sample={})", out.len(), width, height, checksum),
+        );
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let win = web_sys::window().unwrap();
+            let msg = js_sys::Object::new();
+            let uint8 = js_sys::Uint8Array::from(out.as_slice());
+            let pixels_buf = uint8.buffer();
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("type"), &wasm_bindgen::JsValue::from_str("wasm_pixels"));
+            // Send the ArrayBuffer itself for maximum interop.
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("pixels"), &pixels_buf);
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("width"), &wasm_bindgen::JsValue::from_f64(width as f64));
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("height"), &wasm_bindgen::JsValue::from_f64(height as f64));
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("checksum"), &wasm_bindgen::JsValue::from_f64(checksum as f64));
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("gpu"), &wasm_bindgen::JsValue::from_bool(true));
+            let sample_arr = js_sys::Array::new();
+            for i in 0..out.len().min(16) {
+                sample_arr.push(&wasm_bindgen::JsValue::from_f64(out[i] as f64));
+            }
+            let _ = js_sys::Reflect::set(&msg, &wasm_bindgen::JsValue::from_str("sample"), &sample_arr);
+
+            // If this wasm instance runs inside an iframe, transfer to parent.
+            // If it's top-level, avoid transferring to self (can yield 0-byte buffers).
+            let in_frame = win.frame_element().ok().flatten().is_some();
+            if in_frame {
+                if let Ok(Some(parent)) = win.parent() {
+                    let transfer = js_sys::Array::new();
+                    transfer.push(&pixels_buf);
+                    let _ = parent.post_message_with_transfer(&wasm_bindgen::JsValue::from(msg), "*", &transfer);
+                    wasm_dbg("wasm:gpu_readback: posted wasm_pixels to parent (transfer)");
+                } else {
+                    let _ = win.post_message(&wasm_bindgen::JsValue::from(msg), "*");
+                    wasm_dbg("wasm:gpu_readback: posted wasm_pixels to self (no parent)");
+                }
+            } else {
+                let _ = win.post_message(&wasm_bindgen::JsValue::from(msg), "*");
+                wasm_dbg("wasm:gpu_readback: posted wasm_pixels to self (no transfer)");
+            }
+        }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Native: write PNGs to disk if `MCBAISE_READBACK_OUTPUT` is set.
+            if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
+                let _ = std::fs::create_dir_all(&dir);
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let fname = format!("{}/frame_{}_{}x{}.png", dir, t, width, height);
+                // `out` is RGBA packed, width x height. Write atomically via tmp file + rename
+                let tmp = format!("{}.tmp", fname);
+                match std::fs::File::create(&tmp) {
+                    Ok(mut fout) => {
+                        use image::codecs::png::PngEncoder;
+                        use image::ColorType;
+                        use image::ImageEncoder;
+                        let encoder = PngEncoder::new(&mut fout);
+                        match encoder.write_image(&out, width as u32, height as u32, ColorType::Rgba8) {
+                            Ok(()) => {
+                                // ensure file is flushed/dropped before rename
+                                drop(fout);
+                                if let Err(e) = std::fs::rename(&tmp, &fname) {
+                                    eprintln!("failed to rename readback tmp file: {} -> {}: {}", tmp, fname, e);
+                                } else {
+                                    eprintln!("native: wrote PNG {}", fname);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("failed to encode PNG to tmp file {}: {}", tmp, e);
+                                let _ = std::fs::remove_file(&tmp);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("failed to create readback tmp file {}: {}", tmp, e);
+                    }
+                }
+
+                // If oneshot requested, clear the env var so subsequent frames aren't recorded.
+                if std::env::var("MCBAISE_READBACK_ONESHOT").as_deref().ok() == Some("1") {
+                    unsafe { let _ = std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
+                    unsafe { let _ = std::env::remove_var("MCBAISE_READBACK_ONESHOT"); }
+                }
+            }
+        }
+
+        drop(data);
+        buffer2.unmap();
+        READBACK_MAP_IN_FLIGHT.store(0, Ordering::SeqCst);
+    });
+}
+
+fn gpu_readback_poll_system(render_device: Res<bevy::render::renderer::RenderDevice>) {
+    if READBACK_MAP_IN_FLIGHT.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let _ = render_device.poll(wgpu::PollType::Poll);
+}
 
 #[cfg(target_arch = "wasm32")]
 const META_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.meta.json");
@@ -2757,6 +3409,151 @@ pub fn toggle_overlay() {
 }
 
 #[cfg(target_arch = "wasm32")]
+use wasm_bindgen_futures::JsFuture;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsValue;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
+use web_sys::{HtmlCanvasElement, ImageBitmap};
+
+// Request a readback of the primary `#bevy-canvas` from wasm and post an
+// ImageBitmap to the parent window. The returned Promise resolves when the
+// ImageBitmap has been transferred to the parent (or rejects on error).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn request_wasm_readback() -> Result<(), JsValue> {
+    let win = web_sys::window().ok_or(JsValue::from_str("no window"))?;
+    let doc = win.document().ok_or(JsValue::from_str("no document"))?;
+    let el = doc.get_element_by_id("bevy-canvas").ok_or(JsValue::from_str("no canvas"))?;
+    let canvas = el.dyn_into::<HtmlCanvasElement>().map_err(|_| JsValue::from_str("element not canvas"))?;
+
+    // Use `createImageBitmap(canvas)` which returns a Promise<ImageBitmap>.
+    let promise = win.create_image_bitmap_with_html_canvas_element(&canvas)
+        .map_err(|e| e)?;
+    let ib_val = JsFuture::from(promise).await?;
+    let ib = ib_val.dyn_into::<ImageBitmap>()?;
+
+    // Build a message containing the bitmap and transfer it to parent.
+    let msg = js_sys::Object::new();
+    js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("wasm_imagebitmap"))?;
+    js_sys::Reflect::set(&msg, &JsValue::from_str("bitmap"), &ib.clone().into())?;
+    let transfer = js_sys::Array::new();
+    transfer.push(&ib);
+    win.post_message_with_transfer(&JsValue::from(msg), "*", &transfer)
+        .map_err(|e| e)?;
+    Ok(())
+}
+
+// Pixel-buffer fallback: read RGBA pixels from the `#bevy-canvas` and post an
+// ArrayBuffer containing raw u8 RGBA pixels to the parent. This is more
+// interoperable across UAs when ImageBitmap transfers fail.
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub async fn request_wasm_readback_pixels() -> Result<(), JsValue> {
+    let win = web_sys::window().ok_or(JsValue::from_str("no window"))?;
+    let doc = win.document().ok_or(JsValue::from_str("no document"))?;
+    let el = doc.get_element_by_id("bevy-canvas").ok_or(JsValue::from_str("no canvas"))?;
+    let canvas = el.dyn_into::<HtmlCanvasElement>().map_err(|_| JsValue::from_str("element not canvas"))?;
+
+    // Create an ImageBitmap from the canvas so we get a stable snapshot.
+    let promise = win.create_image_bitmap_with_html_canvas_element(&canvas).map_err(|e| e)?;
+    let ib_val = JsFuture::from(promise).await?;
+    let ib = ib_val.dyn_into::<ImageBitmap>()?;
+
+    // Create a temporary canvas and draw the ImageBitmap into its 2D context.
+    let tmp = doc.create_element("canvas")?.dyn_into::<HtmlCanvasElement>()?;
+    let w = ib.width();
+    let h = ib.height();
+    tmp.set_width(w);
+    tmp.set_height(h);
+    let ctx = tmp.get_context("2d")?.ok_or(JsValue::from_str("no 2d context"))?;
+    let ctx2 = ctx.dyn_into::<web_sys::CanvasRenderingContext2d>()?;
+    // drawImage(ImageBitmap, 0, 0)
+    ctx2.draw_image_with_image_bitmap(&ib, 0.0, 0.0)?;
+
+    // Extract ImageData (RGBA u8 clamped) and copy into a Uint8Array for transfer.
+    let image_data = ctx2.get_image_data(0.0, 0.0, w as f64, h as f64)?;
+    let mut buf = image_data.data(); // Clamped<Vec<u8>>
+    let uint8 = js_sys::Uint8Array::new_with_length(buf.len() as u32);
+    uint8.copy_from(&buf[..]);
+    let pixels_buf = uint8.buffer();
+
+    // Build message and transfer the underlying ArrayBuffer.
+    let msg = js_sys::Object::new();
+    js_sys::Reflect::set(&msg, &JsValue::from_str("type"), &JsValue::from_str("wasm_pixels"))?;
+    // Send the ArrayBuffer itself for maximum interop.
+    js_sys::Reflect::set(&msg, &JsValue::from_str("pixels"), &pixels_buf)?;
+    js_sys::Reflect::set(&msg, &JsValue::from_str("width"), &JsValue::from_f64(w as f64))?;
+    js_sys::Reflect::set(&msg, &JsValue::from_str("height"), &JsValue::from_f64(h as f64))?;
+    // Diagnostic: compute a small checksum and sample of the first bytes so parent can verify pre-transfer contents.
+    let mut sample_len = std::cmp::min(64usize, buf.len());
+    let mut sum: u32 = 0;
+    for i in 0..sample_len {
+        sum = sum.wrapping_add(buf[i] as u32);
+    }
+    // If the initial ImageBitmap → canvas draw yields an all-zero sample, try
+    // drawing the source canvas directly into the temp canvas and re-sample.
+    // Some UAs/compositors may produce empty ImageBitmaps — this gives a
+    // fallback before we escalate to GPU readback.
+    let mut attempted_alt_draw = false;
+    if sum == 0 {
+        // Draw the original canvas directly
+        if ctx2.draw_image_with_html_canvas_element(&canvas, 0.0, 0.0).is_ok() {
+            if let Ok(new_image) = ctx2.get_image_data(0.0, 0.0, w as f64, h as f64) {
+                buf = new_image.data();
+                sample_len = std::cmp::min(64usize, buf.len());
+                sum = 0;
+                for i in 0..sample_len {
+                    sum = sum.wrapping_add(buf[i] as u32);
+                }
+                attempted_alt_draw = true;
+            }
+        }
+    }
+    js_sys::Reflect::set(&msg, &JsValue::from_str("checksum"), &JsValue::from_f64(sum as f64))?;
+    // Expose a short sample as a JS Array for quick inspection.
+    let sample_arr = js_sys::Array::new();
+    for i in 0..std::cmp::min(16usize, buf.len()) {
+        sample_arr.push(&JsValue::from_f64(buf[i] as f64));
+    }
+    js_sys::Reflect::set(&msg, &JsValue::from_str("sample"), &sample_arr)?;
+    js_sys::Reflect::set(&msg, &JsValue::from_str("attempted_alt_draw"), &JsValue::from_bool(attempted_alt_draw))?;
+
+    // If we are inside an iframe, transfer the buffer to the parent (fast, zero-copy).
+    // If we are top-level, DO NOT transfer to ourselves: some runtimes end up delivering
+    // a detached (0-byte) buffer to the receiver when sender==receiver.
+    let in_frame = win.frame_element().ok().flatten().is_some();
+    if in_frame {
+        if let Ok(Some(parent)) = win.parent() {
+            let transfer = js_sys::Array::new();
+            transfer.push(&pixels_buf);
+            parent
+                .post_message_with_transfer(&JsValue::from(msg), "*", &transfer)
+                .map_err(|e| e)?;
+        } else {
+            // Fallback: no parent available; post locally without transfer.
+            win.post_message(&JsValue::from(msg), "*").map_err(|e| e)?;
+        }
+    } else {
+        win.post_message(&JsValue::from(msg), "*").map_err(|e| e)?;
+    }
+    Ok(())
+}
+
+// JS-visible hook to request a GPU readback. This increments an atomic counter
+// that the ECS system observes and will serve as the trigger for a true
+// GPU->CPU readback implementation (added iteratively).
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen]
+pub fn request_wasm_readback_gpu() {
+    // Increment the request sequence; the scaffold system will observe this
+    // and clear it when handled.
+    READBACK_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst);
+    web_sys::console::debug_1(&JsValue::from_str("wasm:gpu_readback requested"));
+}
+
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_request_playing)]
@@ -2780,7 +3577,8 @@ extern "C" {
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
 pub fn main() {
-    eprintln!("Main called");
+    #[cfg(target_arch = "wasm32")]
+    wasm_dbg("wasm: main() entered");
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
@@ -2969,8 +3767,10 @@ pub fn main() {
     let burn_plugin = {
         #[cfg(target_arch = "wasm32")]
         {
+            wasm_dbg("wasm: decompressing embedded tensor (lz4)...");
             let tensor_vec = lz4_flex::decompress_size_prepended(TENSOR_LZ4_BYTES)
                 .expect("decompress embedded burn_human tensor (lz4)");
+            wasm_dbg("wasm: tensor decompressed");
             let tensor: &'static [u8] = Box::leak(tensor_vec.into_boxed_slice());
             BurnHumanPlugin {
                 source: BurnHumanSource::Bytes {
@@ -3009,6 +3809,9 @@ pub fn main() {
 
     let mut app = App::new();
 
+    #[cfg(target_arch = "wasm32")]
+    wasm_dbg("wasm: building Bevy App");
+
     // Ensure EmbeddedAssetRegistry exists in the World before embedding assets.
     app.init_resource::<EmbeddedAssetRegistry>();
 
@@ -3041,12 +3844,39 @@ pub fn main() {
         })
         .insert_resource(OverlayVisibility { show: false })
         .insert_resource(CaptionVisibility { show: true })
-        .insert_resource(OverlayText::default())
-        .insert_resource(RenderScale::default())
+        .insert_resource(OverlayText::default());
+
+    // GPU readback wiring: create an offscreen render target image, retarget
+    // cameras for one frame when a request arrives, then in RenderApp copy
+    // that texture to a mapped buffer and write/post pixels.
+    app.init_resource::<GpuReadbackImage>();
+    app.init_resource::<GpuReadbackPending>();
+    app.add_systems(Startup, ensure_readback_image_exists);
+    // Spawn the offscreen capture camera(s) once the main camera exists.
+    // We moved this to Update to support toggling capture_multi at runtime.
+    // Deterministic GPU readback flow:
+    // - keep capture camera synced to main camera
+    // - size the offscreen target
+    // - arm capture camera when a request arrives
+    // - disable capture camera after a few frames
+    app.add_systems(
+        Update,
+        (
+            ensure_gpu_capture_camera_exists,
+            sync_gpu_capture_cameras_from_views,
+            sync_gpu_capture_camera_fog,
+            update_gpu_capture_viewports,
+            configure_gpu_capture_camera_settings,
+            resize_readback_image_to_window,
+            arm_cameras_for_gpu_readback,
+            restore_cameras_after_gpu_readback,
+        )
+            .chain(),
+    );
         // Native: we create the primary egui context ourselves (on a dedicated overlay camera)
         // so it isn't constrained by the first 3D camera's viewport.
         // WASM: keep the default auto-created primary context.
-        .insert_resource(bevy_egui::EguiGlobalSettings {
+    app.insert_resource(bevy_egui::EguiGlobalSettings {
             auto_create_primary_context: cfg!(target_arch = "wasm32"),
             ..default()
         })
@@ -3068,6 +3898,8 @@ pub fn main() {
         .init_resource::<FluidSimulation>()
         .init_resource::<MultiView>()
         .init_resource::<MultiViewHint>()
+        .init_resource::<EguiCaptureState>()
+        .init_resource::<RenderScale>()
         .add_plugins(plugins)
         .add_plugins(bevy::pbr::wireframe::WireframePlugin::default());
 
@@ -3093,6 +3925,34 @@ pub fn main() {
         .add_systems(Update, apply_subject_mode)
         .add_systems(Update, update_overlays)
         .add_systems(EguiPrimaryContextPass, ui_overlay);
+    
+    #[cfg(all(not(target_arch = "wasm32"), feature = "capture_ui"))]
+    {
+        // No extra registration needed for egui polling/state handled in ui_overlay
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        app.init_resource::<WasmDebugFrameOnce>();
+        app.add_systems(Update, wasm_debug_first_update_tick);
+    }
+
+    // IMPORTANT: register extraction only after DefaultPlugins/RenderPlugin has created the RenderApp.
+    // If we add this plugin earlier, the RenderApp doesn't exist yet and the readback resource won't
+    // be extracted into the render world, causing "render world missing GpuReadbackImage".
+    app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<GpuReadbackImage>::default());
+
+    use bevy::ecs::schedule::IntoScheduleConfigs;
+    use bevy::render::{RenderApp, RenderSystems};
+    let render_app = app.sub_app_mut(RenderApp);
+    render_app.add_systems(
+        bevy::render::Render,
+        gpu_readback_render_system.in_set(RenderSystems::Cleanup),
+    );
+    render_app.add_systems(
+        bevy::render::Render,
+        gpu_readback_poll_system.in_set(RenderSystems::Cleanup),
+    );
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, update_overlay_ui_camera);
@@ -3109,7 +3969,7 @@ pub fn main() {
     );
 
     #[cfg(not(target_arch = "wasm32"))]
-    app.add_systems(Update, (advance_time_native, native_controls));
+    app.add_systems(Update, (advance_time_native, native_controls, gif_auto_capture_system));
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
     {
@@ -3847,6 +4707,8 @@ fn setup_scene(
     mut images: ResMut<Assets<Image>>,
     assets: Res<BurnHumanAssets>,
 ) {
+    #[cfg(target_arch = "wasm32")]
+    wasm_dbg("wasm: setup_scene() entered");
     let polkadot = images.add(make_polkadot_texture());
     commands.insert_resource(AppearanceTextures { polkadot });
 
@@ -4066,6 +4928,8 @@ fn setup_scene(
 
     commands.insert_resource(OverlayState::default());
 
+    #[cfg(target_arch = "wasm32")]
+    wasm_dbg("wasm: setup_scene() done; calling mcbaise_set_wasm_ready()");
     #[cfg(target_arch = "wasm32")]
     mcbaise_set_wasm_ready();
 }
@@ -4423,6 +5287,99 @@ fn advance_time_native(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn gif_auto_capture_system(
+    mut capture_state: ResMut<EguiCaptureState>,
+    time: Res<Time>,
+) {
+    use std::sync::atomic::Ordering;
+    // If GIF recording is enabled, request readbacks when idle.
+    if std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1") {
+        let now = time.elapsed().as_secs_f64();
+        if capture_state.capture_fps > 0 {
+            if now - capture_state.last_capture_time_secs < 1.0 / capture_state.capture_fps as f64 {
+                return;
+            }
+        }
+
+        capture_state.capture_skip_counter += 1;
+        if capture_state.capture_skip_counter < capture_state.capture_skip {
+            return;
+        }
+
+        // Only request if no request is pending and no map is in flight.
+        if READBACK_REQUEST_SEQ.load(Ordering::SeqCst) == 0
+            && READBACK_MAP_IN_FLIGHT.load(Ordering::SeqCst) == 0
+        {
+            READBACK_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst);
+            capture_state.last_capture_time_secs = now;
+            capture_state.capture_skip_counter = 0;
+        }
+    }
+}
+
+// --- Capture UI + preview (native only) ---------------------------------
+
+// Preview entry stores one or more frames (for GIFs) with their bevy handles and egui texture ids.
+#[derive(Default)]
+struct PreviewEntry {
+    handles: Vec<Handle<Image>>,
+    tex_ids: Vec<egui::TextureId>,
+    // per-frame durations in seconds (if empty, use 0.1s)
+    durations: Vec<f32>,
+    current_idx: usize,
+    last_advance_secs: f64,
+}
+
+// Egui capture state: holds loaded previews and last poll time.
+#[derive(Resource)]
+struct EguiCaptureState {
+    last_dir: Option<String>,
+    // map from filename -> PreviewEntry
+    loaded: std::collections::HashMap<String, PreviewEntry>,
+    // order of filenames (most-recent first)
+    order: std::collections::VecDeque<String>,
+    last_polled_secs: f64,
+    // whether the capture UI is visible; default: hidden until user triggers capture
+    visible: bool,
+    // whether the keyboard shortcuts info overlay is visible
+    show_info: bool,
+    // whether to show options instead of previews in the capture UI
+    show_options: bool,
+    // whether to include captions in the recording
+    capture_captions: bool,
+    // whether to capture the whole multi-view layout or just the main camera
+    capture_multi: bool,
+    // target capture FPS (0 = as fast as possible)
+    capture_fps: u32,
+    // how many frames to skip between captures (1 = every frame, 2 = every other frame)
+    capture_skip: u32,
+    // internal counter for frame skipping
+    capture_skip_counter: u32,
+    // last time a frame was captured
+    last_capture_time_secs: f64,
+}
+
+impl Default for EguiCaptureState {
+    fn default() -> Self {
+        Self {
+            last_dir: None,
+            loaded: Default::default(),
+            order: Default::default(),
+            last_polled_secs: 0.0,
+            visible: false,
+            show_info: false,
+            show_options: false,
+            capture_captions: true,
+            capture_multi: false,
+            capture_fps: 30,
+            capture_skip: 1,
+            capture_skip_counter: 0,
+            last_capture_time_secs: 0.0,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn native_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut playback: ResMut<Playback>,
@@ -4431,6 +5388,10 @@ fn native_controls(
     mut pattern_mode: ResMut<TexturePatternMode>,
     _native_youtube: Option<Res<NativeYoutubeSync>>,
     _native_mpv: Option<Res<NativeMpvSync>>,
+    mut readback: ResMut<GpuReadbackImage>,
+    mut images: ResMut<Assets<Image>>,
+    #[cfg(feature = "capture_ui")]
+    mut capture_state_opt: Option<ResMut<EguiCaptureState>>,
 ) {
     if keys.just_pressed(KeyCode::Space) {
         playback.playing = !playback.playing;
@@ -4503,6 +5464,145 @@ fn native_controls(
         }
         playback.speed = (playback.speed - 0.25).clamp(0.25, 3.0);
     }
+
+    // One-shot PNG capture: press `P` to write a single frame PNG to .tmp/readback_<ts>/
+    if keys.just_pressed(KeyCode::F5) {
+        // Ensure readback image exists immediately so the render-side system can copy from it.
+        if readback.0 == Handle::default() {
+            let mut image = Image::new_fill(
+                Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+                TextureDimension::D2,
+                &[0, 0, 0, 0],
+                TextureFormat::Rgba8UnormSrgb,
+                RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+            );
+            image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+                | bevy::render::render_resource::TextureUsages::COPY_SRC
+                | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+            let handle = images.add(image);
+            readback.0 = handle;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let dir = format!(".tmp/readback_{}", ts);
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+        unsafe { std::env::set_var("MCBAISE_READBACK_ONESHOT", "1"); }
+        READBACK_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst);
+        eprintln!("native: requested one-shot readback -> {}", dir);
+            #[cfg(feature = "capture_ui")]
+            if let Some(cs) = capture_state_opt.as_deref_mut() {
+                cs.visible = true;
+                // Ensure the UI polls the newly-created output dir immediately and
+                // don't treat files from this dir as already loaded (in case we
+                // recorded here previously). This forces fresh registration.
+                cs.last_dir = Some(dir.clone());
+                cs.loaded.retain(|k, _| !k.starts_with(&dir));
+                cs.order.retain(|k| !k.starts_with(&dir));
+            }
+
+            // Also clear Egui's loaded set/order so they refresh
+            #[cfg(feature = "capture_ui")]
+            if let Some(cs) = capture_state_opt.as_deref_mut() {
+                cs.last_dir = Some(dir.clone());
+                cs.loaded.retain(|k, _| !k.starts_with(&dir));
+                cs.order.retain(|k| !k.starts_with(&dir));
+            }
+    }
+
+    // GIF recording toggle: press `G` to start/stop recording. Frames are written
+    // to `.tmp/readback_<ts>/frame_*.png`. On stop, frames are assembled into
+    // `.tmp/readback_<ts>/animation.gif` in a background thread.
+    if keys.just_pressed(KeyCode::F6) {
+        match std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() {
+            Some("1") => {
+                // stop recording
+                unsafe { std::env::remove_var("MCBAISE_GIF_RECORD"); }
+                if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
+                    // clear output env var so mapping won't keep writing
+                    unsafe { std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
+                    eprintln!("native: stopping GIF recording, assembling {}", dir);
+                    // assemble GIF in background
+                    std::thread::spawn(move || {
+                        if let Err(e) = assemble_gif_from_dir(&dir) {
+                            eprintln!("failed to assemble gif: {}", e);
+                        }
+                    });
+                }
+            }
+            _ => {
+                // start recording
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let dir = format!(".tmp/readback_{}", ts);
+                let _ = std::fs::create_dir_all(&dir);
+                unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+                unsafe { std::env::set_var("MCBAISE_GIF_RECORD", "1"); }
+                eprintln!("native: started GIF recording -> {}", dir);
+                #[cfg(feature = "capture_ui")]
+                if let Some(cs) = capture_state_opt.as_deref_mut() {
+                    cs.visible = true;
+                }
+            }
+        }
+    }
+}
+
+fn assemble_gif_from_dir(dir: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::fs::{read_dir, File};
+    use std::path::Path;
+
+    let mut paths = read_dir(dir)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("png")).unwrap_or(false))
+        .collect::<Vec<_>>();
+    paths.sort();
+    if paths.is_empty() {
+        return Err("no PNG frames found".into());
+    }
+
+    let first = image::open(&paths[0])?.to_rgba8();
+    let width = first.width();
+    let height = first.height();
+
+    let out_path = Path::new(dir).join("animation.gif");
+    let tmp_path = Path::new(dir).join("animation.gif.tmp");
+
+    // Write to a temp file first, then rename into place to avoid other readers
+    // seeing a partially-written GIF.
+    {
+        let fout = File::create(&tmp_path)?;
+        let mut encoder = image::codecs::gif::GifEncoder::new(fout);
+        // infinite loop
+        let _ = encoder.set_repeat(image::codecs::gif::Repeat::Infinite);
+
+        for p in &paths {
+            let img = image::open(p)?.to_rgba8();
+            let raw = img.into_raw();
+            let rgba = image::RgbaImage::from_raw(width, height, raw)
+                .ok_or("frame size mismatch")?;
+            // Provide a modest default delay (100ms) to make the resulting GIF playable
+            // even if frame timing isn't available. Use `from_parts` to provide the
+            // delay since the `delay` field is private.
+            let delay = image::Delay::from_numer_denom_ms(100, 1);
+            let frame = image::Frame::from_parts(rgba, 0, 0, delay);
+            encoder.encode_frame(frame)?;
+        }
+        // Ensure file is flushed/dropped before rename
+    }
+
+    std::fs::rename(&tmp_path, &out_path)?;
+    eprintln!("native: wrote GIF {}", out_path.display());
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4811,8 +5911,8 @@ fn update_tube_and_subject(
 
     if selected_camera_mode.is_passing() {
         auto_cam.pass_reanchor_since_sec += dt;
-        // Roughly once per second, re-anchor to the current progress.
-        if auto_cam.pass_reanchor_since_sec >= 1.0 {
+        // Roughly once every few seconds, re-anchor to the current progress.
+        if auto_cam.pass_reanchor_since_sec >= 3.0 {
             let lead_u = 0.010;
             auto_cam.pass_anchor_progress = (progress + lead_u).rem_euclid(1.0);
             auto_cam.pass_anchor_valid = true;
@@ -5564,6 +6664,8 @@ fn update_overlays(
 struct UiOverlayParams<'w, 's> {
     commands: Commands<'w, 's>,
     egui_contexts: EguiContexts<'w, 's>,
+    images_assets: ResMut<'w, Assets<Image>>,
+    capture_state: ResMut<'w, EguiCaptureState>,
     overlay_text: Res<'w, OverlayText>,
     overlay_vis: ResMut<'w, OverlayVisibility>,
     caption_vis: ResMut<'w, CaptionVisibility>,
@@ -5592,6 +6694,7 @@ struct UiOverlayParams<'w, 's> {
     _native_youtube_cfg: Option<Res<'w, NativeYoutubeConfig>>,
     _native_mpv: Option<Res<'w, NativeMpvSync>>,
     _native_mpv_cfg: Option<Res<'w, NativeMpvConfig>>,
+    keys: Res<'w, ButtonInput<KeyCode>>,
 }
 
 fn ui_overlay(
@@ -5626,11 +6729,323 @@ fn ui_overlay(
         _native_youtube_cfg,
         _native_mpv,
         _native_mpv_cfg,
-    }: UiOverlayParams,
-) {
+     mut images_assets,
+     mut capture_state,
+     keys,
+     }: UiOverlayParams,
+ ) {
+    // Handle ESC priority
+    if keys.just_pressed(KeyCode::Escape) {
+        if capture_state.show_info {
+            capture_state.show_info = false;
+        } else if capture_state.visible {
+            capture_state.visible = false;
+        } else if overlay_vis.show {
+            overlay_vis.show = false;
+        }
+    }
+
+    // Scan for new captures in any .tmp/readback_* directory
+    let mut scan_dirs = Vec::new();
+    if let Ok(read_tmp) = std::fs::read_dir(".tmp") {
+        for entry in read_tmp.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.is_dir() && p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("readback_")).unwrap_or(false) {
+                scan_dirs.push(p);
+            }
+        }
+    }
+     // Register any new PNGs with bevy assets + egui before borrowing the egui ctx
+     {
+         let now = time.elapsed().as_secs_f64();
+        if now - capture_state.last_polled_secs > 0.3 {
+            capture_state.last_polled_secs = now;
+
+            for dir_path in scan_dirs {
+                let dir = match dir_path.to_str() { Some(s) => s, None => continue };
+                if let Ok(mut entries) = std::fs::read_dir(&dir).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()) {
+                    entries.sort_by_key(|e| e.file_name());
+
+                    for ent in entries {
+                        if let Some(s) = ent.path().to_str() {
+                            let fname = s.to_string();
+                            let lower = fname.to_ascii_lowercase();
+                            let is_png = lower.ends_with(".png");
+                            let is_gif = lower.ends_with(".gif");
+                            if !(is_png || is_gif) {
+                                continue;
+                            }
+                            if capture_state.loaded.contains_key(&fname) {
+                                continue;
+                            }
+
+                            // Skip files that are likely mid-write: zero-length or recently
+                            // modified (within 200ms). This avoids attempting to decode
+                            // partially-written files.
+                            if let Ok(meta) = std::fs::metadata(&fname) {
+                                if meta.len() == 0 {
+                                    continue;
+                                }
+                                if let Ok(modified) = meta.modified() {
+                                    if let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified) {
+                                        if elapsed.as_millis() < 200 {
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
+                            match std::fs::read(&fname) {
+                                Ok(bytes) => {
+                                    if is_gif {
+                                        use std::io::Cursor;
+                                        use image::codecs::gif::GifDecoder;
+                                        use image::AnimationDecoder;
+
+                                        if let Ok(decoder) = GifDecoder::new(Cursor::new(&bytes)) {
+                                            if let Ok(frames_vec) = decoder.into_frames().collect_frames() {
+                                                let mut handles = Vec::with_capacity(frames_vec.len());
+                                                let mut tex_ids = Vec::with_capacity(frames_vec.len());
+                                                let mut durations = Vec::with_capacity(frames_vec.len());
+                                                for frame in frames_vec.into_iter() {
+                                                    let buf: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = frame.buffer().clone();
+                                                    let w = buf.width();
+                                                    let h = buf.height();
+                                                    let raw = buf.into_raw();
+                                                    if let Some(rgba_img) = image::RgbaImage::from_raw(w, h, raw) {
+                                                        let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+                                                        let bevy_image = Image::new(
+                                                            size,
+                                                            bevy::render::render_resource::TextureDimension::D2,
+                                                            rgba_img.into_raw(),
+                                                            bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                                                            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+                                                        );
+                                                        let handle = images_assets.add(bevy_image);
+                                                        let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
+                                                        handles.push(handle);
+                                                        tex_ids.push(tex_id);
+                                                        durations.push(0.1);
+                                                    }
+                                                }
+                                                if !handles.is_empty() {
+                                                    let entry = PreviewEntry { handles, tex_ids, durations, current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
+                                                    capture_state.loaded.insert(fname.clone(), entry);
+                                                    capture_state.order.push_front(fname.clone());
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        match image::load_from_memory(&bytes) {
+                                            Ok(img) => {
+                                                let rgba = img.to_rgba8();
+                                                let (w, h) = (rgba.width(), rgba.height());
+                                                let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+                                                let bevy_image = Image::new(
+                                                    size,
+                                                    bevy::render::render_resource::TextureDimension::D2,
+                                                    rgba.into_raw(),
+                                                    bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                                                    RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+                                                );
+                                                let handle = images_assets.add(bevy_image);
+                                                let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
+                                                let entry = PreviewEntry { handles: vec![handle], tex_ids: vec![tex_id], durations: vec![0.1], current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
+                                                capture_state.loaded.insert(fname.clone(), entry);
+                                                capture_state.order.push_front(fname.clone());
+                                            }
+                                            Err(_) => {}
+                                        }
+                                    }
+                                }
+                                Err(_) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let Ok(ctx) = egui_contexts.ctx_mut() else {
         return;
     };
+
+    // Draw side panel with controls and thumbnails (only when visible)
+    if capture_state.visible {
+        egui::SidePanel::right("mcbaise_capture_panel").min_width(220.0).show(ctx, |ui| {
+        ui.heading("Capture");
+        ui.horizontal(|ui| {
+            if ui.button("Capture PNG").clicked() {
+                if let Ok(ts) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+                    let sec = ts.as_secs();
+                    let dir = format!(".tmp/readback_{}", sec);
+                    let _ = std::fs::create_dir_all(&dir);
+                    unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+                    unsafe { std::env::set_var("MCBAISE_READBACK_ONESHOT", "1"); }
+                    READBACK_REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!("native: UI requested one-shot readback -> {}", dir);
+                }
+            }
+
+            let recording = std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1");
+            let mut assembling = false;
+            if let Ok(read_tmp) = std::fs::read_dir(".tmp") {
+                for ent in read_tmp.filter_map(|e| e.ok()) {
+                    let p = ent.path();
+                    if p.is_dir() && p.join("animation.gif.tmp").exists() {
+                        assembling = true;
+                        break;
+                    }
+                }
+            }
+
+            let btn_enabled = recording || !assembling;
+            let btn_label = if recording { "Stop GIF" } else { "Start GIF" };
+
+            if ui.add_enabled(btn_enabled, egui::Button::new(btn_label)).clicked() {
+                match std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() {
+                    Some("1") => {
+                        unsafe { std::env::remove_var("MCBAISE_GIF_RECORD"); }
+                        if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
+                            unsafe { std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
+                            eprintln!("native: UI stopping GIF recording, assembling {}", dir);
+                            std::thread::spawn(move || {
+                                if let Err(e) = assemble_gif_from_dir(&dir) {
+                                    eprintln!("failed to assemble gif: {}", e);
+                                }
+                            });
+                        }
+                    }
+                    _ => {
+                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                        let dir = format!(".tmp/readback_{}", ts);
+                        let _ = std::fs::create_dir_all(&dir);
+                        unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+                        unsafe { std::env::set_var("MCBAISE_GIF_RECORD", "1"); }
+                        eprintln!("native: UI started GIF recording -> {}", dir);
+                    }
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui.button("Hide").clicked() {
+                capture_state.visible = false;
+            }
+            if ui.button(if capture_state.show_options { "Previews" } else { "Options" }).clicked() {
+                capture_state.show_options = !capture_state.show_options;
+            }
+            if ui.button("Remove All").clicked() {
+                // remove bevy image assets + egui texture ids
+                for entry in capture_state.loaded.values() {
+                    for handle in &entry.handles {
+                        images_assets.remove(handle);
+                    }
+                }
+                capture_state.loaded.clear();
+                capture_state.order.clear();
+                let _ = std::fs::remove_dir_all(".tmp");
+                let _ = std::fs::create_dir_all(".tmp");
+            }
+            if ui.button("📂").on_hover_text("Open captures folder").clicked() {
+                let _ = open::that(".tmp");
+            }
+        });
+
+        if capture_state.show_options {
+            ui.separator();
+            ui.label("Recording Options");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                ui.checkbox(&mut capture_state.capture_captions, "Capture Captions (if visible)");
+                ui.checkbox(&mut capture_state.capture_multi, "Capture Multi-view (experimental)");
+                
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label("Target FPS:");
+                    ui.add(egui::DragValue::new(&mut capture_state.capture_fps).range(0..=120).suffix(" fps"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Frame Skip:");
+                    ui.add(egui::DragValue::new(&mut capture_state.capture_skip).range(1..=10));
+                });
+                ui.label(egui::RichText::new("0 = max render speed").size(10.0).italics().color(egui::Color32::GRAY));
+                
+                ui.add_space(16.0);
+                ui.label("Frame output directory:");
+                ui.label(egui::RichText::new(".tmp/readback_<ts>").small().color(egui::Color32::LIGHT_BLUE));
+                
+                ui.add_space(20.0);
+                ui.label("Tip: Lower FPS saves disk space and CPU during recording.");
+            });
+        } else {
+            ui.separator();
+            ui.label("Previews");
+
+            // Recording indicator
+            if std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1") {
+                ui.horizontal(|ui| {
+                    ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(255, 100, 100));
+                    ui.label("🔴 Recording GIF...");
+                });
+            }
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // Check for rendering GIFs
+                if let Ok(read_tmp) = std::fs::read_dir(".tmp") {
+                    for ent in read_tmp.filter_map(|e| e.ok()) {
+                        let p = ent.path();
+                        if p.is_dir() && p.join("animation.gif.tmp").exists() {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.label("Assembling GIF...");
+                            });
+                        }
+                    }
+                }
+
+                let now = time.elapsed().as_secs_f64();
+                // Snapshot the order to avoid borrowing `capture_state` immutably
+                // while also mutably borrowing entries from `capture_state.loaded`.
+                let order_snapshot: Vec<String> = capture_state.order.iter().cloned().collect();
+                for fname in order_snapshot {
+                    if let Some(entry) = capture_state.loaded.get_mut(&fname) {
+                        // advance frame if needed
+                        if entry.tex_ids.len() > 1 {
+                            let dur = entry.durations.get(entry.current_idx).cloned().unwrap_or(0.1) as f64;
+                            if now - entry.last_advance_secs >= dur {
+                                entry.current_idx = (entry.current_idx + 1) % entry.tex_ids.len();
+                                entry.last_advance_secs = now;
+                            }
+                        }
+                        let tex_id = entry.tex_ids.get(entry.current_idx).copied().unwrap_or(egui::TextureId::default());
+                        let size = egui::vec2(ui.available_width(), 120.0);
+                        let resp = ui.add(egui::Image::new((tex_id, size)).sense(egui::Sense::click()));
+                        if resp.clicked() {
+                            let _ = open::that(&fname);
+                        }
+                        if resp.secondary_clicked() {
+                            #[cfg(windows)]
+                            {
+                                let _ = std::process::Command::new("explorer")
+                                    .arg("/select,")
+                                    .arg(fname.replace("/", "\\"))
+                                    .spawn();
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                if let Some(parent) = std::path::Path::new(&fname).parent() {
+                                    let _ = open::that(parent);
+                                }
+                            }
+                        }
+                        ui.label(fname);
+                    }
+                }
+            });
+        }
+        });
+    }
 
     #[cfg(target_arch = "wasm32")]
     let _ = &overlay_text;
@@ -6801,6 +8216,81 @@ fn ui_overlay(
                 });
         }
     }
+
+    // Info button Bottom-Right
+    egui::Area::new(egui::Id::new("mcbaise_info_button"))
+        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -10.0))
+        .show(ctx, |ui| {
+            let desired = egui::vec2(28.0, 28.0);
+            let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+
+            let painter = ui.painter();
+            let center = rect.center();
+            let radius = rect.width().min(rect.height()) * 0.36;
+
+            // Match the pie indicator style but white-ish
+            let white = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200);
+            painter.circle_stroke(center, radius, egui::Stroke::new(2.2, white));
+
+            // Draw an "i"
+            painter.text(center, egui::Align2::CENTER_CENTER, "i", egui::FontId::proportional(14.0), white);
+
+            if resp.hovered() {
+                painter.rect_stroke(
+                    rect,
+                    egui::CornerRadius::same(6),
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ),
+                    egui::StrokeKind::Inside,
+                );
+            }
+
+            if resp.clicked() {
+                capture_state.show_info = !capture_state.show_info;
+            }
+        });
+
+    if capture_state.show_info {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::default().fill(egui::Color32::from_black_alpha(220)))
+            .show(ctx, |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.heading(egui::RichText::new("Keyboard Shortcuts").size(32.0).color(egui::Color32::WHITE));
+                        ui.add_space(32.0);
+
+                        egui::Grid::new("shortcuts_grid")
+                            .num_columns(2)
+                            .spacing([60.0, 16.0])
+                            .show(ui, |ui| {
+                                let label_style = |s: &str| egui::RichText::new(s).size(20.0).color(egui::Color32::LIGHT_BLUE);
+                                let desc_style = |s: &str| egui::RichText::new(s).size(20.0).color(egui::Color32::WHITE);
+
+                                ui.label(label_style("Space")); ui.label(desc_style("Toggle Playback")); ui.end_row();
+                                ui.label(label_style("1")); ui.label(desc_style("Cycle Color Scheme")); ui.end_row();
+                                ui.label(label_style("2")); ui.label(desc_style("Cycle Texture Pattern")); ui.end_row();
+                                ui.label(label_style("Arrow Up")); ui.label(desc_style("Increase Playback Speed")); ui.end_row();
+                                ui.label(label_style("Arrow Down")); ui.label(desc_style("Decrease Playback Speed")); ui.end_row();
+                                ui.label(label_style("F5")); ui.label(desc_style("Capture PNG (One-shot)")); ui.end_row();
+                                ui.label(label_style("F6")); ui.label(desc_style("Toggle GIF Recording")); ui.end_row();
+                                ui.label(label_style("ESC")); ui.label(desc_style("Close this overlay")); ui.end_row();
+                            });
+
+                        ui.add_space(48.0);
+                        if ui.add(egui::Button::new(egui::RichText::new("Close").size(24.0)).min_size(egui::vec2(120.0, 40.0))).clicked() {
+                            capture_state.show_info = false;
+                        }
+                    });
+                });
+            });
+
+        // Also allow ESC to close
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            capture_state.show_info = false;
+        }
+    }
 }
 
 // ---------------------------- time → curve progress ----------------------------
@@ -6863,7 +8353,7 @@ impl CameraMode {
             CameraMode::PassingLeft
             | CameraMode::PassingRight
             | CameraMode::PassingTop
-            | CameraMode::PassingBottom => (0.9, 1.2),
+            | CameraMode::PassingBottom => (3.0, 3.0),
         }
     }
 
@@ -7333,6 +8823,33 @@ fn camera_pose(
             pos = pass_pos_bottom;
             look = pass_look_bottom;
             up = pass_up;
+        }
+    }
+
+    // If we're in a passing shot and the anchor is provided, gently track the
+    // subject after it has moved passed the anchor point so the camera reads
+    // the subject as it exits the frame.
+    if selected_mode.is_passing() {
+        if let Some((pass_c, pass_tan, pass_n, _pass_b)) = pass_anchor {
+            let active_pos = match subject_mode {
+                SubjectMode::Human => subject_pos_human,
+                SubjectMode::Ball => subject_pos_ball,
+                SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
+            };
+            let rel = active_pos - pass_c;
+            let along = rel.dot(pass_tan);
+            // Start following once the subject moves slightly past the anchor.
+            if along > 0.05 {
+                // Normalize amount and clamp; smaller divisor => stronger follow sooner.
+                let follow_strength = (along / 1.2).clamp(0.0, 1.0);
+                // Blend the look target toward the subject so the pass reads as tracking.
+                let look_alpha = 0.45 + 0.55 * follow_strength; // [0.45..1.0]
+                look = look.lerp(active_pos, look_alpha);
+                // Nudge camera position toward the subject for a more noticeable follow.
+                let pos_target = active_pos + pass_tan * -2.0 + pass_n * 0.2;
+                let pos_alpha = 0.12 + 0.28 * follow_strength;
+                pos = pos.lerp(pos_target, pos_alpha);
+            }
         }
     }
 
