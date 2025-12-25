@@ -33,7 +33,7 @@ path = "src/main.rs"
 required-features = ["native-mpv"]
 
 [features]
-default = ["native"]
+default = ["native","capture_ui"]
 native = ["bevy/multi_threaded"]
 burn_human = ["bevy_burn_human"]
 native-youtube = ["dep:fantoccini", "dep:tokio", "dep:serde_json", "dep:url", "dep:time"]

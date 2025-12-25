@@ -6019,11 +6019,11 @@ fn setup_scene(
     let polkadot = images.add(make_polkadot_texture());
     commands.insert_resource(AppearanceTextures { polkadot });
 
-    commands.spawn((
-        Camera3d::default(),
-        Camera { order: 1, ..default() },
-        Transform::from_xyz(10.0, 18.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
-    ));
+    // commands.spawn((
+    //     Camera3d::default(),
+    //     Camera { order: 1, ..default() },
+    //     Transform::from_xyz(10.0, 18.0, 6.0).looking_at(Vec3::ZERO, Vec3::Y),
+    // ));
 
     commands.spawn((
         DirectionalLight {
