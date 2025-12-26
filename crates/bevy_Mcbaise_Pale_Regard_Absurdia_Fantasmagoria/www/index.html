@@ -228,6 +228,78 @@
     .videoPi[data-dir="left"] { left: 8px; top: 50%; transform: translateY(-50%); }
     .videoPi[data-dir="right"] { right: 8px; top: 50%; transform: translateY(-50%); }
 
+    /* Recorder buttons: same outline style as E/W, positioned above them. */
+    .videoPiRecord {
+      font-family: 'Material Icons';
+      font-weight: 400;
+      font-size: 22px;
+      line-height: 1;
+      user-select: none;
+    }
+    .videoPiRecord[data-pos="left-above"] { left: 8px; top: calc(50% - 44px); transform: translateY(-50%); }
+    .videoPiRecord[data-pos="right-above"] { right: 8px; top: calc(50% - 44px); transform: translateY(-50%); }
+
+    /* Encoding overlay */
+    #encodeOverlay {
+      position: fixed;
+      inset: 0;
+      display: none;
+      place-items: center;
+      pointer-events: auto;
+      z-index: 100001;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(6px);
+    }
+    #encodeOverlay.show { display: grid; }
+    #encodeOverlay .box {
+      width: min(92vw, 520px);
+      border-radius: 14px;
+      border: 1px solid rgba(255,255,255,0.20);
+      background: rgba(0,0,0,0.70);
+      padding: 14px 14px 12px;
+      color: rgba(255,255,255,0.92);
+      box-shadow: 0 10px 26px rgba(0,0,0,0.35);
+    }
+    #encodeOverlay .hdr {
+      font: 800 18px/1.05 "Baloo 2", system-ui, sans-serif;
+      letter-spacing: 0.02em;
+      margin-bottom: 8px;
+    }
+    #encodeOverlay .msg {
+      font: 600 13px/1.35 system-ui, sans-serif;
+      opacity: 0.9;
+      margin-bottom: 10px;
+    }
+    #encodeOverlay .bar {
+      height: 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(0,0,0,0.25);
+      overflow: hidden;
+      margin-bottom: 12px;
+    }
+    #encodeOverlay .bar > div {
+      height: 100%;
+      width: 0%;
+      background: rgba(255,255,255,0.65);
+    }
+    #encodeOverlay .actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+    }
+    #encodeOverlayStop {
+      appearance: none;
+      border: 1.2px solid rgba(255,255,255,0.65);
+      border-radius: 10px;
+      background: rgba(0,0,0,0.15);
+      color: rgba(255,255,255,0.95);
+      padding: 8px 12px;
+      font: 800 12px/1 system-ui, sans-serif;
+      cursor: pointer;
+    }
+    #encodeOverlayStop:active { transform: translateY(1px); }
+
     /* hidden by default; toggled by .show on container */
     #videoPiContainer { opacity: 0; transition: opacity 140ms ease; }
     #videoPiContainer.show { opacity: 1; }
@@ -478,8 +550,21 @@
     <button class="videoPi" data-dir="right" title="Add viz right">E</button>
     <button class="videoPi" data-dir="bottom" title="Add viz below">S</button>
     <button class="videoPi" data-dir="left" title="Add viz left">W</button>
-    <i id="gif-recorder-icon" class="material-icons" style="position: absolute; right: 8px; bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); color: #cccccc; font-size: 24px; pointer-events: auto; z-index: 40; transition: color 0.2s ease; cursor: pointer;">videocam</i>
-    <i id="gif-fullscreen-icon" class="material-icons" style="position: absolute; right: 40px; bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); color: #cccccc; font-size: 24px; pointer-events: auto; z-index: 40; transition: color 0.2s ease; cursor: pointer; border: 2px solid white; border-radius: 50%; padding: 2px;">web</i>
+    <!-- Recorder buttons (above W and E) -->
+    <button id="videoSingle" class="videoPi videoPiRecord" data-pos="left-above" title="Record (single canvas)">videocam</button>
+    <button id="videoFullscreen" class="videoPi videoPiRecord" data-pos="right-above" title="Record (fullscreen composite)">web</button>
+  </div>
+
+  <!-- Encoding overlay: shown while GIF/WebM encoding is running. -->
+  <div id="encodeOverlay" aria-hidden="true">
+    <div class="box">
+      <div class="hdr" id="encodeOverlayHdr">Encoding…</div>
+      <div class="msg" id="encodeOverlayMsg">Preparing…</div>
+      <div class="bar"><div id="encodeOverlayBar"></div></div>
+      <div class="actions">
+        <button id="encodeOverlayStop" type="button">Stop</button>
+      </div>
+    </div>
   </div>
 
   <script type="module">
@@ -942,6 +1027,7 @@
       try { window._mcbaise_playerReady = !!playerReady; } catch (_) {}
       try { window._mcbaise_isPlaying = !!isPlaying; } catch (_) {}
       try { window._mcbaise_player = player || null; } catch (_) {}
+      try { if (typeof scheduleWasmSetVideoTime === 'function') window._mcbaise_scheduleWasmSetVideoTime = scheduleWasmSetVideoTime; } catch (_) {}
       try { if (typeof broadcastSync === 'function') window._mcbaise_broadcastSync = broadcastSync; } catch (_) {}
       try { if (typeof broadcastTime === 'function') window._mcbaise_broadcastTime = broadcastTime; } catch (_) {}
       try {
@@ -2061,7 +2147,7 @@
 
     // Wire up directional pi buttons to inject viz in that cardinal direction.
     if (videoPiContainer) {
-      const btns = videoPiContainer.querySelectorAll('.videoPi');
+      const btns = videoPiContainer.querySelectorAll('.videoPi[data-dir]');
       btns.forEach(b => {
         b.addEventListener('click', (ev) => {
           const dir = b.dataset.dir || 'right';
@@ -2156,13 +2242,105 @@
     let isFullscreenRecording = false;
     let frames = [];
     let recordInterval;
+    let _mcbaise_single_record_fps = 10;
+    let _mcbaise_full_record_fps = 5;
     // Keep last-good snapshots so we can reuse them when a tick returns a black/placeholder frame.
     let lastGoodSingleDataUrl = null;
     let lastGoodCompositeDataUrl = null;
 
+    function _mcbaise_get_query_number(name, fallback) {
+      try {
+        const u = new URL(window.location.href);
+        const v = u.searchParams.get(name);
+        if (v == null || v === '') return fallback;
+        const n = Number(v);
+        return Number.isFinite(n) ? n : fallback;
+      } catch (_) {
+        return fallback;
+      }
+    }
+
+    function _mcbaise_get_query_bool(name, fallback) {
+      try {
+        const u = new URL(window.location.href);
+        const v = u.searchParams.get(name);
+        if (v == null || v === '') return !!fallback;
+        const s = String(v).trim().toLowerCase();
+        if (s === '1' || s === 'true' || s === 'yes' || s === 'y' || s === 'on') return true;
+        if (s === '0' || s === 'false' || s === 'no' || s === 'n' || s === 'off') return false;
+        return !!fallback;
+      } catch (_) {
+        return !!fallback;
+      }
+    }
+
+    // Recording FPS controls:
+    // - `?recFps=15` sets both recorders unless overridden
+    // - `?singleRecFps=15` / `?fullRecFps=10` override per-mode
+    try {
+      const base = _mcbaise_get_query_number('recFps', NaN);
+      const single = _mcbaise_get_query_number('singleRecFps', Number.isFinite(base) ? base : _mcbaise_single_record_fps);
+      const full = _mcbaise_get_query_number('fullRecFps', Number.isFinite(base) ? base : _mcbaise_full_record_fps);
+      _mcbaise_single_record_fps = Math.max(1, Math.min(60, Math.round(single)));
+      _mcbaise_full_record_fps = Math.max(1, Math.min(60, Math.round(full)));
+      if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:fps', { single: _mcbaise_single_record_fps, full: _mcbaise_full_record_fps });
+    } catch (_) {}
+
+    // Optional lockstep recording:
+    // - `?recLockstep=1` enables for both unless overridden
+    // - `?fullRecLockstep=1` specifically enables fullscreen lockstep capture
+    // Lockstep pauses/seeks to a target time per frame and waits for all panes.
+    let _mcbaise_full_record_lockstep = false;
+    try {
+      const base = _mcbaise_get_query_bool('recLockstep', false);
+      const full = _mcbaise_get_query_bool('fullRecLockstep', base);
+      _mcbaise_full_record_lockstep = !!full;
+      if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:lockstep', { full: _mcbaise_full_record_lockstep });
+    } catch (_) {}
+
     console.log('GIF script loaded, attaching event listener');
-    const gifIcon = document.getElementById('gif-recorder-icon');
-    const fullscreenIcon = document.getElementById('gif-fullscreen-icon');
+    const gifIcon = document.getElementById('videoSingle');
+    const fullscreenIcon = document.getElementById('videoFullscreen');
+
+    // Encoding overlay + cancellation
+    const encodeOverlayEl = document.getElementById('encodeOverlay');
+    const encodeOverlayHdrEl = document.getElementById('encodeOverlayHdr');
+    const encodeOverlayMsgEl = document.getElementById('encodeOverlayMsg');
+    const encodeOverlayBarEl = document.getElementById('encodeOverlayBar');
+    const encodeOverlayStopBtn = document.getElementById('encodeOverlayStop');
+    let _mcbaise_cancel_encode = null;
+    let _mcbaise_encode_active = false;
+
+    function _mcbaise_show_encode_overlay(hdr, msg, progress01) {
+      try {
+        if (!encodeOverlayEl) return;
+        encodeOverlayHdrEl.textContent = hdr || 'Encoding…';
+        encodeOverlayMsgEl.textContent = msg || '';
+        const p = Math.max(0, Math.min(1, Number(progress01) || 0));
+        if (encodeOverlayBarEl) encodeOverlayBarEl.style.width = `${Math.round(p * 100)}%`;
+        encodeOverlayEl.classList.add('show');
+        try { encodeOverlayEl.setAttribute('aria-hidden', 'false'); } catch (_) {}
+      } catch (_) {}
+    }
+
+    function _mcbaise_hide_encode_overlay() {
+      try {
+        if (!encodeOverlayEl) return;
+        encodeOverlayEl.classList.remove('show');
+        try { encodeOverlayEl.setAttribute('aria-hidden', 'true'); } catch (_) {}
+        if (encodeOverlayBarEl) encodeOverlayBarEl.style.width = '0%';
+      } catch (_) {}
+    }
+
+    try {
+      if (encodeOverlayStopBtn) {
+        encodeOverlayStopBtn.addEventListener('click', () => {
+          try {
+            if (typeof _mcbaise_cancel_encode === 'function') _mcbaise_cancel_encode('user');
+          } catch (_) {}
+        });
+      }
+    } catch (_) {}
 
     gifIcon.addEventListener('click', function() {
       if (isFullscreenRecording) return; // Don't allow both recordings
@@ -2176,18 +2354,42 @@
 
         const loopToken = Date.now() + Math.random();
         try { window._mcbaise_single_record_token = loopToken; } catch (_) {}
-        const intervalMs = 100;
+        const fps = Math.max(1, _mcbaise_single_record_fps || 10);
+        const intervalMs = Math.max(1, Math.round(1000 / fps));
+        const startMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        let frameIndex = 0; // how many frames we've committed to `frames`
         const tick = async () => {
           try {
             if (!isRecording) return;
             try { if (window._mcbaise_single_record_token !== loopToken) return; } catch (_) {}
+
+            // Fixed-FPS scheduler:
+            // Ensure we produce exactly one frame per ideal slot. If capture lags,
+            // fill missed slots with the last-good frame so output duration matches
+            // the requested FPS.
+            const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            const expectedIndex = Math.max(0, Math.floor((nowMs - startMs) / intervalMs));
+            const missing = expectedIndex - frameIndex;
+            if (missing > 0 && lastGoodSingleDataUrl) {
+              for (let i = 0; i < missing; i++) frames.push(lastGoodSingleDataUrl);
+              frameIndex += missing;
+              if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:single:filled-missed-frames', { missing, frameIndex, expectedIndex });
+            }
+            if (frameIndex > expectedIndex) {
+              // We're early; wait until the next ideal slot.
+              const nextMs = startMs + frameIndex * intervalMs;
+              const waitMs = Math.max(0, Math.round(nextMs - nowMs));
+              recordInterval = setTimeout(tick, waitMs);
+              return;
+            }
+
             const canvas = document.getElementById('bevy-canvas');
             if (canvas instanceof HTMLCanvasElement) {
               try {
                 // Prefer compositor frame to avoid WebGPU readback blanks.
                 let dataURL = null;
                 try {
-                  const bmp = await _mcbaise_grab_canvas_frame_bitmap(canvas, 30);
+                  const bmp = await _mcbaise_grab_canvas_frame_bitmap(canvas, fps);
                   if (bmp) {
                     try {
                       const oc = document.createElement('canvas');
@@ -2214,14 +2416,17 @@
                   if (!isBlack) {
                     frames.push(dataURL);
                     lastGoodSingleDataUrl = dataURL;
+                    frameIndex += 1;
                   } else if (lastGoodSingleDataUrl) {
                     frames.push(lastGoodSingleDataUrl);
+                    frameIndex += 1;
                     if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:using-last-good-single-frame (mostly black)');
                   } else {
                     if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:skipping mostly-black single-canvas frame', { len: (dataURL || '').length });
                   }
                 } else if (lastGoodSingleDataUrl) {
                   frames.push(lastGoodSingleDataUrl);
+                  frameIndex += 1;
                   if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:using-last-good-single-frame');
                 } else {
                   if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:skipping tiny single-canvas frame', { len: (dataURL || '').length });
@@ -2229,6 +2434,7 @@
               } catch (e) {
                 if (lastGoodSingleDataUrl) {
                   frames.push(lastGoodSingleDataUrl);
+                  frameIndex += 1;
                   if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:single capture failed - using last good', e);
                 } else {
                   if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:single capture failed', e);
@@ -2239,10 +2445,13 @@
           try {
             if (!isRecording) return;
             try { if (window._mcbaise_single_record_token !== loopToken) return; } catch (_) {}
-            recordInterval = setTimeout(tick, intervalMs);
+            const nowMs2 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+            const nextMs = startMs + frameIndex * intervalMs;
+            const waitMs = Math.max(0, Math.round(nextMs - nowMs2));
+            recordInterval = setTimeout(tick, waitMs);
           } catch (_) {}
         };
-        recordInterval = setTimeout(tick, intervalMs);
+        recordInterval = setTimeout(tick, 0);
       } else {
         // Stop recording and create GIF
         isRecording = false;
@@ -2252,7 +2461,7 @@
         gifIcon.textContent = 'videocam';
         gifIcon.style.color = '#cccccc'; // Back to light grey
         if (frames.length > 0) {
-          createGIF(frames);
+          createGIF(frames, { fps: _mcbaise_single_record_fps });
         }
       }
     });
@@ -2269,12 +2478,116 @@
 
         const loopToken = Date.now() + Math.random();
         try { window._mcbaise_full_record_token = loopToken; } catch (_) {}
-        const intervalMs = 200;
+        const fps = Math.max(1, _mcbaise_full_record_fps || 5);
+        const intervalMs = Math.max(1, Math.round(1000 / fps));
+        const lockstep = !!_mcbaise_full_record_lockstep;
+
+        if (lockstep) {
+          try {
+            const p = (typeof window !== 'undefined') ? window._mcbaise_player : null;
+            try { p?.playVideo?.(); } catch (_) {}
+          } catch (_) {}
+        }
+
+        const startMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+        let frameIndex = 0; // how many frames we've committed to `frames`
+        let lockstepRetry = 0;
+        let lockstepForcePause = false;
+        let lockstepFrameTimeSec = null;
+        let lockstepFrameSyncId = null;
+
+        async function _mcbaise_wait_for_player_time(targetSec, timeoutMs = 2500, epsSec = 0.06) {
+          try {
+            const t0 = performance.now();
+            while ((performance.now() - t0) < timeoutMs) {
+              const p = (typeof window !== 'undefined') ? window._mcbaise_player : null;
+              const t = (p && typeof p.getCurrentTime === 'function') ? Number(p.getCurrentTime() || 0) : NaN;
+              if (Number.isFinite(t) && Math.abs(t - targetSec) <= epsSec) return true;
+              // eslint-disable-next-line no-await-in-loop
+              await new Promise(r => setTimeout(r, 40));
+            }
+          } catch (_) {}
+          return false;
+        }
 
         const tick = async () => {
           try {
             if (!isFullscreenRecording) return;
             try { if (window._mcbaise_full_record_token !== loopToken) return; } catch (_) {}
+
+            // Shared capture time/syncId for this frame.
+            const captureSyncId = lockstep
+              ? (lockstepFrameSyncId || (lockstepFrameSyncId = (Date.now().toString(36) + '-' + frameIndex.toString(36) + '-' + Math.random().toString(36).slice(2, 8))))
+              : (Date.now().toString(36) + '-' + frameIndex.toString(36) + '-' + Math.random().toString(36).slice(2, 8));
+            let captureTimeSec = 0;
+            let capturePlaying = false;
+
+            if (lockstep) {
+              // Lockstep barrier while keeping playback overall:
+              // 1) Ensure video is playing.
+              // 2) Sample current time.
+              // 3) Briefly pause + broadcast a paused sync so every pane captures *the same time*.
+              // 4) Capture snapshots.
+              // 5) Resume play.
+              const p = (typeof window !== 'undefined') ? window._mcbaise_player : null;
+
+              try { p?.playVideo?.(); } catch (_) {}
+
+              try {
+                if (lockstepFrameTimeSec == null) {
+                  const tNow = (p && typeof p.getCurrentTime === 'function') ? Number(p.getCurrentTime() || 0) : 0;
+                  lockstepFrameTimeSec = Number.isFinite(tNow) ? tNow : 0;
+                }
+                captureTimeSec = Number(lockstepFrameTimeSec) || 0;
+              } catch (_) {
+                captureTimeSec = 0;
+              }
+
+              // Only pause if we previously detected a lagging pane on this frame.
+              if (lockstepForcePause) {
+                try { p?.pauseVideo?.(); } catch (_) {}
+              }
+              capturePlaying = false;
+
+              try {
+                const setTime = (typeof window !== 'undefined') ? window._mcbaise_scheduleWasmSetVideoTime : null;
+                if (typeof setTime === 'function') setTime(captureTimeSec, false);
+              } catch (_) {}
+              try {
+                const bsync = (typeof window !== 'undefined') ? window._mcbaise_broadcastSync : null;
+                if (typeof bsync === 'function') bsync(captureTimeSec, false);
+              } catch (_) {}
+
+              await new Promise((res) => requestAnimationFrame(() => requestAnimationFrame(res)));
+            } else {
+              const _ps = (typeof window._mcbaise_getPlayerState === 'function') ? window._mcbaise_getPlayerState() : null;
+              captureTimeSec = (_ps && _ps.playerReady) ? (Number(_ps.timeSec) || 0) : 0;
+              capturePlaying = (_ps && _ps.playerReady) ? !!_ps.playing : false;
+
+              // Nudge all children toward the same time before requesting snapshots.
+              try {
+                const bsync = (typeof window._mcbaise_broadcastSync === 'function') ? window._mcbaise_broadcastSync : (typeof broadcastSync === 'function' ? broadcastSync : null);
+                if (bsync) bsync(captureTimeSec, capturePlaying);
+              } catch (_) {}
+            }
+
+            if (!lockstep) {
+              // Fixed-FPS scheduler (see single-canvas recorder for rationale)
+              const nowMs = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+              const expectedIndex = Math.max(0, Math.floor((nowMs - startMs) / intervalMs));
+              const missing = expectedIndex - frameIndex;
+              if (missing > 0 && lastGoodCompositeDataUrl) {
+                for (let i = 0; i < missing; i++) frames.push(lastGoodCompositeDataUrl);
+                frameIndex += missing;
+                if (window.__MCBAISE_DEBUG) console.debug('mcbaise:record:full:filled-missed-frames', { missing, frameIndex, expectedIndex });
+              }
+              if (frameIndex > expectedIndex) {
+                const nextMs = startMs + frameIndex * intervalMs;
+                const waitMs = Math.max(0, Math.round(nextMs - nowMs));
+                recordInterval = setTimeout(tick, waitMs);
+                return;
+              }
+            }
 
             // Use page dimensions so we can place multiple canvases by absolute page position.
             const pageRect = document.documentElement.getBoundingClientRect();
@@ -2397,6 +2710,8 @@
                 const reqSyncId = (req && req.syncId != null) ? String(req.syncId) : null;
                 const reqTimeSec = (req && req.timeSec != null) ? Number(req.timeSec) : null;
                 const reqPlaying = !!(req && req.playing);
+                const timeoutMs = Math.max(250, Math.round(Number(req && req.timeoutMs) || 3000));
+                const strict = !!(req && req.strict);
 
                 let iframeWin = null;
                 try { iframeWin = iframe && iframe.contentWindow; } catch (_) { iframeWin = null; }
@@ -2429,11 +2744,15 @@
                     try {
                       return await new Promise((resolve) => {
                         let resolved = false;
+                        let gotTriggerAck = false;
                         const finish = (val) => {
                           if (resolved) return;
                           resolved = true;
                           try { frameObj.port.removeEventListener('message', onport); } catch (_) {}
                           try { window.removeEventListener('message', onwin); } catch (_) {}
+                          try {
+                            if (frameObj && reqSyncId != null && frameObj._pendingSnapshotSyncId === reqSyncId) frameObj._pendingSnapshotSyncId = null;
+                          } catch (_) {}
                           try {
                             // Cache last-good snapshot for this iframe (used when a request times out).
                             // Cache only pixels/dataUrl; ImageBitmaps are typically single-use.
@@ -2452,6 +2771,13 @@
                             if (!d || typeof d !== 'object') return;
 
                             if (d.type === 'wasm_pixels' && d.pixels && d.width && d.height) {
+                              // If the wasm message includes correlation fields, enforce them.
+                              if (reqSyncId != null && d.syncId != null && String(d.syncId) !== reqSyncId) return;
+                              // If the wasm message does NOT include correlation fields, only accept it
+                              // after we saw a trigger ack for this request.
+                              if (reqSyncId != null && d.syncId == null && !gotTriggerAck) return;
+                              // If we set a pending syncId for this iframe, only accept pixels while pending.
+                              try { if (reqSyncId != null && frameObj && frameObj._pendingSnapshotSyncId && frameObj._pendingSnapshotSyncId !== reqSyncId) return; } catch (_) {}
                               if (window.__MCBAISE_DEBUG) console.debug('mcbaise:iframe:wasm_pixels', { w: d.width, h: d.height, gpu: !!d.gpu, checksum: d.checksum });
                               finish({ kind: 'pixels', pixels: d.pixels, width: Number(d.width) || 0, height: Number(d.height) || 0, checksum: (d.checksum != null) ? Number(d.checksum) : null, gpu: !!d.gpu, sample: d.sample || null });
                               return;
@@ -2463,6 +2789,13 @@
                             if (d.type === 'snapshot') {
                               if (reqSyncId != null && String(d.syncId || '') !== reqSyncId) return;
                               finish({ kind: 'dataUrl', dataUrl: d.dataUrl || null });
+                              return;
+                            }
+                            if (d.type === 'snapshot_gpu_triggered') {
+                              // Acknowledgement that the child started a GPU readback for this request.
+                              if (reqSyncId != null && String(d.syncId || '') !== reqSyncId) return;
+                              gotTriggerAck = true;
+                              try { if (frameObj && reqSyncId != null) frameObj._pendingSnapshotSyncId = reqSyncId; } catch (_) {}
                               return;
                             }
                           } catch (_) {}
@@ -2480,8 +2813,17 @@
 
                         try { window.addEventListener('message', onwin); } catch (_) {}
                         try { frameObj.port.addEventListener('message', onport); } catch (_) {}
+                        try { if (frameObj && reqSyncId != null) frameObj._pendingSnapshotSyncId = reqSyncId; } catch (_) {}
                         try { frameObj.port.postMessage({ type: 'request_snapshot', syncId: reqSyncId, timeSec: reqTimeSec, playing: reqPlaying }); } catch (_) {}
-                        setTimeout(() => { if (!resolved) { resolved = true; try { frameObj.port.removeEventListener('message', onport); } catch (_) {} try { window.removeEventListener('message', onwin); } catch (_) {} resolve(null); } }, 3000);
+                        setTimeout(() => {
+                          if (!resolved) {
+                            resolved = true;
+                            try { frameObj.port.removeEventListener('message', onport); } catch (_) {}
+                            try { window.removeEventListener('message', onwin); } catch (_) {}
+                            try { if (frameObj && reqSyncId != null && frameObj._pendingSnapshotSyncId === reqSyncId) frameObj._pendingSnapshotSyncId = null; } catch (_) {}
+                            resolve(null);
+                          }
+                        }, timeoutMs);
                       });
                     } catch (e) { if (window.__MCBAISE_DEBUG) console.debug('port snapshot request failed', e); }
                   }
@@ -2494,10 +2836,14 @@
                     try {
                       return await new Promise((resolve) => {
                         let resolved = false;
+                        let gotTriggerAck = false;
                         const finish = (val) => {
                           if (resolved) return;
                           resolved = true;
                           try { window.removeEventListener('message', onmsg); } catch (_) {}
+                          try {
+                            if (frameObj && reqSyncId != null && frameObj._pendingSnapshotSyncId === reqSyncId) frameObj._pendingSnapshotSyncId = null;
+                          } catch (_) {}
                           try {
                             if (frameObj && val && (val.kind === 'pixels' || val.kind === 'dataUrl')) {
                               frameObj._lastSnapshot = val;
@@ -2514,6 +2860,9 @@
                             if (!d || typeof d !== 'object') return;
 
                             if (d.type === 'wasm_pixels' && d.pixels && d.width && d.height) {
+                              if (reqSyncId != null && d.syncId != null && String(d.syncId) !== reqSyncId) return;
+                              if (reqSyncId != null && d.syncId == null && !gotTriggerAck) return;
+                              try { if (reqSyncId != null && frameObj && frameObj._pendingSnapshotSyncId && frameObj._pendingSnapshotSyncId !== reqSyncId) return; } catch (_) {}
                               if (window.__MCBAISE_DEBUG) console.debug('mcbaise:iframe:wasm_pixels', { w: d.width, h: d.height, gpu: !!d.gpu, checksum: d.checksum });
                               finish({ kind: 'pixels', pixels: d.pixels, width: Number(d.width) || 0, height: Number(d.height) || 0, checksum: (d.checksum != null) ? Number(d.checksum) : null, gpu: !!d.gpu, sample: d.sample || null });
                               return;
@@ -2527,13 +2876,27 @@
                               finish({ kind: 'dataUrl', dataUrl: d.dataUrl || null });
                               return;
                             }
+                            if (d.type === 'snapshot_gpu_triggered') {
+                              if (reqSyncId != null && String(d.syncId || '') !== reqSyncId) return;
+                              gotTriggerAck = true;
+                              try { if (frameObj && reqSyncId != null) frameObj._pendingSnapshotSyncId = reqSyncId; } catch (_) {}
+                              return;
+                            }
                           } catch (_) {}
                         };
 
                         window.addEventListener('message', onmsg);
+                        try { if (frameObj && reqSyncId != null) frameObj._pendingSnapshotSyncId = reqSyncId; } catch (_) {}
                         const msg = { type: 'request_snapshot', syncId: reqSyncId, timeSec: reqTimeSec, playing: reqPlaying };
                         try { win.postMessage(msg, PAGE_ORIGIN); } catch (e) { try { win.postMessage(msg, '*'); } catch (_) {} }
-                        setTimeout(() => { if (!resolved) { resolved = true; window.removeEventListener('message', onmsg); resolve(null); } }, 3000);
+                        setTimeout(() => {
+                          if (!resolved) {
+                            resolved = true;
+                            window.removeEventListener('message', onmsg);
+                            try { if (frameObj && reqSyncId != null && frameObj._pendingSnapshotSyncId === reqSyncId) frameObj._pendingSnapshotSyncId = null; } catch (_) {}
+                            resolve(null);
+                          }
+                        }, timeoutMs);
                       });
                     } catch (e) { if (window.__MCBAISE_DEBUG) console.debug('iframe postMessage request failed', e); }
                   }
@@ -2547,56 +2910,106 @@
               // the UI can decide whether to render a placeholder caption.
               try { if (frameObj) frameObj._failCount = (frameObj._failCount || 0) + 1; } catch (_) {}
 
-              // If the request failed/timed out, reuse last-good snapshot (if any).
-              try {
-                if (frameObj && frameObj._lastSnapshot) {
-                  return frameObj._lastSnapshot;
-                }
-              } catch (_) {}
+              // If the request failed/timed out, reuse last-good snapshot (if any)
+              // unless the caller asked for strict lockstep.
+              if (!strict) {
+                try {
+                  if (frameObj && frameObj._lastSnapshot) {
+                    return frameObj._lastSnapshot;
+                  }
+                } catch (_) {}
+              }
               return null;
             }
 
-            for (const iframe of extraIframes) {
-              try {
-                const iframeRect = iframe.getBoundingClientRect();
-                // Try to request a snapshot via port/postMessage first.
-                const _ps = (typeof window._mcbaise_getPlayerState === 'function') ? window._mcbaise_getPlayerState() : null;
-                const captureTimeSec = (_ps && _ps.playerReady) ? (Number(_ps.timeSec) || 0) : 0;
-                const capturePlaying = (_ps && _ps.playerReady) ? !!_ps.playing : false;
-                const captureSyncId = (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8));
-                // Nudge all children toward the same time before requesting snapshots.
-                try {
-                  const bsync = (typeof window._mcbaise_broadcastSync === 'function') ? window._mcbaise_broadcastSync : (typeof broadcastSync === 'function' ? broadcastSync : null);
-                  if (bsync) bsync(captureTimeSec, capturePlaying);
-                } catch (_) {}
-                const snap = await requestIframeSnapshot(iframe, { syncId: captureSyncId, timeSec: captureTimeSec, playing: capturePlaying });
-                if (snap && snap.kind === 'dataUrl' && snap.dataUrl) {
+            const iframeList = Array.from(extraIframes || []).map(ifr => ({ iframe: ifr, rect: ifr.getBoundingClientRect() }));
+
+            if (lockstep) {
+              // Optimistic: request snapshots while video is still playing. If any iframe doesn't
+              // respond quickly, escalate to a pause+retry barrier for this same frame.
+              const optimisticTimeoutMs = lockstepForcePause ? 10000 : 350;
+              const snaps = await Promise.all(iframeList.map(ent => requestIframeSnapshot(ent.iframe, {
+                syncId: captureSyncId,
+                timeSec: captureTimeSec,
+                playing: capturePlaying,
+                timeoutMs: optimisticTimeoutMs,
+                strict: true,
+              })));
+
+              for (let i = 0; i < iframeList.length; i++) {
+                const ent = iframeList[i];
+                const snap = snaps[i];
+
+                if (!snap) {
+                  lockstepRetry = (lockstepRetry || 0) + 1;
+                  if (!lockstepForcePause) lockstepForcePause = true;
+                  if (lockstepRetry <= 80) {
+                    if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:missing-iframe-snapshot:retry', { frameIndex, retry: lockstepRetry, forcedPause: lockstepForcePause });
+                    throw new Error('mcbaise_lockstep_retry');
+                  }
+                  if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:missing-iframe-snapshot:gave-up', { frameIndex, retry: lockstepRetry });
+                  continue;
+                }
+
+                if (snap.kind === 'dataUrl' && snap.dataUrl) {
                   try {
                     const img = new Image();
                     await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = snap.dataUrl; });
-                    targets.push({ img, rect: iframeRect, fromIframe: true, isImage: true });
+                    targets.push({ img, rect: ent.rect, fromIframe: true, isImage: true });
                     continue;
                   } catch (e) {
                     if (window.__MCBAISE_DEBUG) console.debug('failed to load snapshot image', e);
-                  }
-                }
-                if (snap && snap.kind === 'bitmap' && snap.bitmap) {
-                  targets.push({ bitmap: snap.bitmap, rect: iframeRect, fromIframe: true, isBitmap: true });
-                  continue;
-                }
-                if (snap && snap.kind === 'pixels' && snap.pixels && snap.width && snap.height) {
-                  const cs = (snap.checksum != null) ? Number(snap.checksum) : null;
-                  // Treat checksum==0 as likely blank; let it fall through to placeholder/last-good.
-                  if (cs !== 0) {
-                    targets.push({ pixels: snap.pixels, pw: snap.width, ph: snap.height, rect: iframeRect, fromIframe: true, isPixels: true, gpu: !!snap.gpu, checksum: cs, sample: snap.sample || null });
-                    continue;
+                    lockstepRetry = (lockstepRetry || 0) + 1;
+                    if (!lockstepForcePause) lockstepForcePause = true;
+                    throw new Error('mcbaise_lockstep_retry');
                   }
                 }
 
-                // Do not fall back to drawing the iframe's canvas directly.
-                // That path commonly yields black frames for WebGPU canvases.
-              } catch (e) {
-                if (window.__MCBAISE_DEBUG) console.debug('extra iframe handling failed', e);
+                if (snap.kind === 'bitmap' && snap.bitmap) {
+                  targets.push({ bitmap: snap.bitmap, rect: ent.rect, fromIframe: true, isBitmap: true });
+                  continue;
+                }
+
+                if (snap.kind === 'pixels' && snap.pixels && snap.width && snap.height) {
+                  const cs = (snap.checksum != null) ? Number(snap.checksum) : null;
+                  if (cs !== 0) {
+                    targets.push({ pixels: snap.pixels, pw: snap.width, ph: snap.height, rect: ent.rect, fromIframe: true, isPixels: true, gpu: !!snap.gpu, checksum: cs, sample: snap.sample || null });
+                    continue;
+                  }
+                  // checksum==0 likely blank => retry.
+                  lockstepRetry = (lockstepRetry || 0) + 1;
+                  if (!lockstepForcePause) lockstepForcePause = true;
+                  throw new Error('mcbaise_lockstep_retry');
+                }
+              }
+            } else {
+              for (const ent of iframeList) {
+                try {
+                  const snap = await requestIframeSnapshot(ent.iframe, { syncId: captureSyncId, timeSec: captureTimeSec, playing: capturePlaying });
+                  if (snap && snap.kind === 'dataUrl' && snap.dataUrl) {
+                    try {
+                      const img = new Image();
+                      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = snap.dataUrl; });
+                      targets.push({ img, rect: ent.rect, fromIframe: true, isImage: true });
+                      continue;
+                    } catch (e) {
+                      if (window.__MCBAISE_DEBUG) console.debug('failed to load snapshot image', e);
+                    }
+                  }
+                  if (snap && snap.kind === 'bitmap' && snap.bitmap) {
+                    targets.push({ bitmap: snap.bitmap, rect: ent.rect, fromIframe: true, isBitmap: true });
+                    continue;
+                  }
+                  if (snap && snap.kind === 'pixels' && snap.pixels && snap.width && snap.height) {
+                    const cs = (snap.checksum != null) ? Number(snap.checksum) : null;
+                    if (cs !== 0) {
+                      targets.push({ pixels: snap.pixels, pw: snap.width, ph: snap.height, rect: ent.rect, fromIframe: true, isPixels: true, gpu: !!snap.gpu, checksum: cs, sample: snap.sample || null });
+                      continue;
+                    }
+                  }
+                } catch (e) {
+                  if (window.__MCBAISE_DEBUG) console.debug('extra iframe handling failed', e);
+                }
               }
             }
 
@@ -2662,7 +3075,7 @@
                 try {
                   const isMainBevy = (!t.fromIframe && t.canvas && t.canvas.id === 'bevy-canvas');
                   if (isMainBevy) {
-                    const bmp = await _mcbaise_grab_canvas_frame_bitmap(t.canvas, 30);
+                    const bmp = await _mcbaise_grab_canvas_frame_bitmap(t.canvas, fps);
                     if (bmp) {
                       try {
                         ctx.drawImage(bmp, 0, 0, bmp.width, bmp.height, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
@@ -2779,8 +3192,17 @@
               // the frame as invalid and reuse last-good.
               if (_drawnTargets <= 0 || _missingTarget) {
                 try { window._mcbaise_last_bad_frame = dataUrl; window._mcbaise_last_bad_reason = (_drawnTargets <= 0 ? 'no-targets-drawn' : 'missing-target'); } catch (_) {}
+                if (lockstep) {
+                  lockstepRetry = (lockstepRetry || 0) + 1;
+                  if (lockstepRetry <= 50) {
+                    if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:missing-targets:retry', { frameIndex, retry: lockstepRetry, drawnTargets: _drawnTargets });
+                    throw new Error('mcbaise_lockstep_retry');
+                  }
+                }
                 if (lastGoodCompositeDataUrl) {
                   frames.push(lastGoodCompositeDataUrl);
+                  frameIndex += 1;
+                  if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:using-last-good-composite-due-to-missing-targets', { len, drawnTargets: _drawnTargets });
                 } else {
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:skipping composite frame due to missing targets', { len, drawnTargets: _drawnTargets });
@@ -2790,14 +3212,25 @@
               // a snapshot, prefer to reuse the last-good composite frame so the
               // output remains visually continuous. If no last-good exists, skip.
               else if (_drewExtraVizPlaceholder) {
+                if (lockstep) {
+                  lockstepRetry = (lockstepRetry || 0) + 1;
+                  if (lockstepRetry <= 50) {
+                    if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:placeholder-drawn:retry', { frameIndex, retry: lockstepRetry });
+                    throw new Error('mcbaise_lockstep_retry');
+                  }
+                }
                 // Don't skip or freeze the whole composite just because an extra viz is missing.
                 // Record the current composite (with placeholder or cached content) so time continues.
                 if (len > 200) {
                   frames.push(dataUrl);
                   lastGoodCompositeDataUrl = dataUrl;
+                  frameIndex += 1;
+                  if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:recording-frame-with-extra-viz-placeholder', { len });
                 } else if (lastGoodCompositeDataUrl) {
                   frames.push(lastGoodCompositeDataUrl);
+                  frameIndex += 1;
+                  if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:using-last-good-composite-due-to-tiny-placeholder-frame', { len });
                 } else {
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:skipping tiny placeholder frame', { len });
@@ -2809,8 +3242,17 @@
                 } catch (_) { isBlack = false; }
 
                 if (isBlack) {
+                  if (lockstep) {
+                    lockstepRetry = (lockstepRetry || 0) + 1;
+                    if (lockstepRetry <= 50) {
+                      if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:black-frame:retry', { frameIndex, retry: lockstepRetry });
+                      throw new Error('mcbaise_lockstep_retry');
+                    }
+                  }
                   if (lastGoodCompositeDataUrl) {
                     frames.push(lastGoodCompositeDataUrl);
+                    frameIndex += 1;
+                    if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                     if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:using-last-good-composite-due-to-black-frame', { len });
                   } else {
                     if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:skipping mostly-black composite frame', { len });
@@ -2818,10 +3260,21 @@
                 } else {
                   frames.push(dataUrl);
                   lastGoodCompositeDataUrl = dataUrl;
+                  frameIndex += 1;
+                  if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                 }
               } else {
+                if (lockstep) {
+                  lockstepRetry = (lockstepRetry || 0) + 1;
+                  if (lockstepRetry <= 50) {
+                    if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:lockstep:tiny-frame:retry', { frameIndex, retry: lockstepRetry, len });
+                    throw new Error('mcbaise_lockstep_retry');
+                  }
+                }
                 if (lastGoodCompositeDataUrl) {
                   frames.push(lastGoodCompositeDataUrl);
+                  frameIndex += 1;
+                  if (lockstep) { lockstepRetry = 0; lockstepForcePause = false; lockstepFrameTimeSec = null; lockstepFrameSyncId = null; }
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:using-last-good-composite-due-to-tiny-frame', { len });
                 } else {
                   if (window.__MCBAISE_DEBUG) console.warn('mcbaise:record:skipping tiny/empty frame', { len });
@@ -2831,16 +3284,37 @@
               console.error('mcbaise:record:toDataURL failed', e);
             }
           } catch (err) {
+            if (lockstep && err && String(err.message || err).includes('mcbaise_lockstep_retry')) {
+              try {
+                if (!isFullscreenRecording) return;
+                try { if (window._mcbaise_full_record_token !== loopToken) return; } catch (_) {}
+                recordInterval = setTimeout(tick, 80);
+                return;
+              } catch (_) {}
+            }
             console.error('Fullscreen capture tick failed', err);
           }
 
           try {
             if (!isFullscreenRecording) return;
             try { if (window._mcbaise_full_record_token !== loopToken) return; } catch (_) {}
-            recordInterval = setTimeout(tick, intervalMs);
+            if (lockstep) {
+              // Resume playback between lockstep barriers.
+              try {
+                const p = (typeof window !== 'undefined') ? window._mcbaise_player : null;
+                try { p?.playVideo?.(); } catch (_) {}
+              } catch (_) {}
+
+              recordInterval = setTimeout(tick, intervalMs);
+            } else {
+              const nowMs2 = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+              const nextMs = startMs + frameIndex * intervalMs;
+              const waitMs = Math.max(0, Math.round(nextMs - nowMs2));
+              recordInterval = setTimeout(tick, waitMs);
+            }
           } catch (_) {}
         };
-        recordInterval = setTimeout(tick, intervalMs);
+        recordInterval = setTimeout(tick, 0);
       } else {
         // Stop recording and create GIF
         isFullscreenRecording = false;
@@ -2849,16 +3323,27 @@
         try { _mcbaise_reset_canvas_capture_cache(); } catch (_) {}
         fullscreenIcon.textContent = 'web';
         fullscreenIcon.style.color = '#cccccc'; // Back to light grey
-        if (frames.length > 0) createGIF(frames);
+        if (frames.length > 0) createGIF(frames, { fps: _mcbaise_full_record_fps });
       }
     });
 
-    function createGIF(frameDataURLs) {
+    function createGIF(frameDataURLs, opts) {
+      const fps = Math.max(1, Math.min(60, Math.round(Number(opts && opts.fps) || 10)));
+      const delayMs = Math.max(1, Math.round(1000 / fps));
       // Helper: fallback to WebM by replaying frames onto a canvas and recording via MediaRecorder
-      function createWebMFromFrames(urls, fps = 10) {
+      function createWebMFromFrames(urls, fps = 10, hooks) {
         return new Promise(async (resolve, reject) => {
           try {
             if (!urls || !urls.length) return reject(new Error('no frames'));
+
+            let cancelled = false;
+            const onProgress = (hooks && typeof hooks.onProgress === 'function') ? hooks.onProgress : null;
+            const onRegisterCancel = (hooks && typeof hooks.registerCancel === 'function') ? hooks.registerCancel : null;
+            const cancel = () => {
+              cancelled = true;
+              try { clearInterval(id); } catch (_) {}
+              try { recorder.stop(); } catch (_) {}
+            };
             // Load all images
             const imgs = await Promise.all(urls.map(u => new Promise((res, rej) => {
               const im = new Image();
@@ -2886,12 +3371,17 @@
             // Playback loop
             let idx = 0;
             const interval = Math.round(1000 / fps);
-            const id = setInterval(() => {
+            let id = null;
+            try { if (onRegisterCancel) onRegisterCancel(cancel); } catch (_) {}
+
+            id = setInterval(() => {
               try {
+                if (cancelled) return;
                 const im = imgs[idx % imgs.length];
                 octx.clearRect(0, 0, w, h);
                 octx.drawImage(im, 0, 0, w, h);
                 idx++;
+                try { if (onProgress) onProgress(Math.min(1, idx / imgs.length)); } catch (_) {}
                 if (idx >= imgs.length) {
                   clearInterval(id);
                   setTimeout(() => {
@@ -2908,7 +3398,7 @@
 
       // If only one frame or gif.js is unreliable, prefer WebM fallback for reliability.
       if (frameDataURLs.length < 2) {
-        createWebMFromFrames(frameDataURLs, 10).then(blob => {
+        createWebMFromFrames(frameDataURLs, fps).then(blob => {
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
@@ -2921,17 +3411,30 @@
         return;
       }
 
-      // Otherwise attempt GIF but fall back to WebM if GIF rendering fails or stalls.
-      const gif = new GIF({ workers: 2, quality: 10, workerScript: 'gif.worker.js' });
-      const imgs = [];
-      let loaded = 0;
-      let didFinish = false;
+      // Otherwise attempt GIF. No timeout: wait indefinitely.
+      // If GIF rendering actually fails, retry twice, then fall back to WebM.
+      const fallbackToWebm = (reason, err) => {
+        try { console.warn('gif: falling back to webm', { reason, err }); } catch (_) {}
+        _mcbaise_encode_active = true;
+        _mcbaise_show_encode_overlay('Encoding WebM…', 'Rendering frames…', 0);
+        let cancelled = false;
+        _mcbaise_cancel_encode = (why) => {
+          cancelled = true;
+          try { if (typeof _mcbaise_cancel_encode._inner === 'function') _mcbaise_cancel_encode._inner(); } catch (_) {}
+          _mcbaise_cancel_encode = null;
+          _mcbaise_encode_active = false;
+          _mcbaise_hide_encode_overlay();
+          if (window.__MCBAISE_DEBUG) console.debug('mcbaise:encode:webm:cancelled', why);
+        };
 
-      const failover = () => {
-        if (didFinish) return;
-        didFinish = true;
-        console.warn('gif: falling back to webm');
-        createWebMFromFrames(frameDataURLs, 10).then(blob => {
+        createWebMFromFrames(frameDataURLs, fps, {
+          onProgress: (p) => {
+            if (cancelled) return;
+            _mcbaise_show_encode_overlay('Encoding WebM…', `Progress ${Math.round((p || 0) * 100)}%`, p || 0);
+          },
+          registerCancel: (fn) => { try { _mcbaise_cancel_encode._inner = fn; } catch (_) {} },
+        }).then(blob => {
+          if (cancelled) return;
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
           a.href = url;
@@ -2940,23 +3443,90 @@
           a.click();
           document.body.removeChild(a);
           URL.revokeObjectURL(url);
-        }).catch(e => console.error('webm fallback failed', e));
+        }).catch(e => {
+          if (!cancelled) console.error('webm fallback failed', e);
+        }).finally(() => {
+          if (cancelled) return;
+          _mcbaise_cancel_encode = null;
+          _mcbaise_encode_active = false;
+          _mcbaise_hide_encode_overlay();
+        });
       };
 
-      // Timeout to trigger fallback if GIF.render doesn't finish in a reasonable time
-      const fallbackTimer = setTimeout(failover, 15000);
+      (async () => {
+        _mcbaise_encode_active = true;
 
-      frameDataURLs.forEach(dataURL => {
-        const img = new Image();
-        img.onload = function() {
-          if (didFinish) return;
-          gif.addFrame(img, { delay: 100 });
-          loaded++;
-          if (loaded === frameDataURLs.length) {
+        // Cancellation: if user clicks Stop, abort current attempt and exit (no fallback).
+        let userCancelled = false;
+        _mcbaise_cancel_encode = (why) => {
+          userCancelled = true;
+          try { if (typeof _mcbaise_cancel_encode._inner === 'function') _mcbaise_cancel_encode._inner(); } catch (_) {}
+          _mcbaise_cancel_encode = null;
+          _mcbaise_encode_active = false;
+          _mcbaise_hide_encode_overlay();
+          if (window.__MCBAISE_DEBUG) console.debug('mcbaise:encode:cancelled', why);
+        };
+
+        // Preload frames (show progress)
+        const imgs = [];
+        try {
+          for (let i = 0; i < frameDataURLs.length; i++) {
+            if (userCancelled) return;
+            const u = frameDataURLs[i];
+            _mcbaise_show_encode_overlay('Preparing GIF…', `Loading frame ${i + 1}/${frameDataURLs.length}`, (i / Math.max(1, frameDataURLs.length)) * 0.25);
+            // eslint-disable-next-line no-await-in-loop
+            const im = await new Promise((res, rej) => {
+              const img = new Image();
+              img.onload = () => res(img);
+              img.onerror = rej;
+              img.src = u;
+            });
+            imgs.push(im);
+          }
+        } catch (e) {
+          if (!userCancelled) console.warn('gif: preload failed', e);
+          if (!userCancelled) fallbackToWebm('preload_failed', e);
+          return;
+        }
+
+        let attempt = 0;
+        const MAX_ATTEMPTS = 2;
+
+        const startAttempt = () => {
+          if (userCancelled) return;
+          attempt++;
+          const gif = new GIF({ workers: 2, quality: 10, workerScript: 'gif.worker.js' });
+
+          try { _mcbaise_cancel_encode._inner = () => { try { gif.abort?.(); } catch (_) {} }; } catch (_) {}
+
+          try {
+            for (const im of imgs) gif.addFrame(im, { delay: delayMs });
+          } catch (e) {
+            if (attempt < MAX_ATTEMPTS) {
+              console.warn('gif: addFrame failed, retrying', { attempt, err: e });
+              setTimeout(startAttempt, 0);
+              return;
+            }
+            fallbackToWebm('addFrame_failed', e);
+            return;
+          }
+
+          try {
+            gif.on('progress', (p) => {
+              if (userCancelled) return;
+              const pp = Math.max(0, Math.min(1, Number(p) || 0));
+              _mcbaise_show_encode_overlay(
+                `Encoding GIF… (${attempt}/${MAX_ATTEMPTS})`,
+                `Progress ${Math.round(pp * 100)}%`,
+                0.25 + pp * 0.75
+              );
+            });
+          } catch (_) {}
+
+          try {
             gif.on('finished', function(blob) {
-              if (didFinish) return;
-              didFinish = true;
-              clearTimeout(fallbackTimer);
+              if (userCancelled) return;
+              _mcbaise_show_encode_overlay('Encoding GIF…', 'Finalizing…', 1);
               const url = URL.createObjectURL(blob);
               const a = document.createElement('a');
               a.href = url;
@@ -2965,13 +3535,40 @@
               a.click();
               document.body.removeChild(a);
               URL.revokeObjectURL(url);
+              _mcbaise_cancel_encode = null;
+              _mcbaise_encode_active = false;
+              _mcbaise_hide_encode_overlay();
             });
-            try { gif.render(); } catch (e) { console.error('gif.render failed', e); failover(); }
+          } catch (_) {}
+
+          try {
+            gif.on('abort', () => {
+              if (userCancelled) return;
+              // A non-user abort is treated as a failure.
+              console.warn('gif: aborted');
+              if (attempt < MAX_ATTEMPTS) {
+                setTimeout(startAttempt, 0);
+              } else {
+                fallbackToWebm('abort', null);
+              }
+            });
+          } catch (_) {}
+
+          try {
+            _mcbaise_show_encode_overlay(`Encoding GIF… (${attempt}/${MAX_ATTEMPTS})`, 'Starting…', 0.25);
+            gif.render();
+          } catch (e) {
+            if (attempt < MAX_ATTEMPTS) {
+              console.warn('gif.render threw, retrying', { attempt, err: e });
+              setTimeout(startAttempt, 0);
+            } else {
+              fallbackToWebm('render_throw', e);
+            }
           }
         };
-        img.onerror = function() { console.warn('failed to load frame image'); };
-        img.src = dataURL;
-      });
+
+        startAttempt();
+      })();
     }
   </script>
 </body>

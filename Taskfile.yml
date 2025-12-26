@@ -615,6 +615,22 @@ tasks:
     cmds:
       - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
 
+  test:fullscreen:
+    desc: Run native demo starting fullscreen (auto-exit after 5s)
+    env:
+      MCBAISE_FULLSCREEN: '1'
+      MCBAISE_SHOW_FOR_SEC: '5'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
+  test:no_title:
+    desc: Run native demo without a title bar (auto-exit after 5s)
+    env:
+      MCBAISE_HIDE_TITLEBAR: '1'
+      MCBAISE_SHOW_FOR_SEC: '5'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
   mcbaise:test:workspace:
     desc: Run all workspace tests
     cmds:

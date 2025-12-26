@@ -59,6 +59,215 @@ static READBACK_REQUEST_SEQ: AtomicU32 = AtomicU32::new(0);
 // 3 = capture this frame
 static READBACK_GPU_PHASE: AtomicU32 = AtomicU32::new(0);
 
+// Native-only: window chrome + fullscreen helpers.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Clone, Copy)]
+struct WindowChromeState {
+    desired_decorations: bool,
+    last_windowed_logical: Option<(f32, f32)>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Default for WindowChromeState {
+    fn default() -> Self {
+        Self {
+            desired_decorations: true,
+            last_windowed_logical: None,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn set_fullscreen(window: &mut Window, chrome: &mut WindowChromeState, enable: bool) {
+    if enable {
+        if matches!(window.mode, bevy::window::WindowMode::Windowed) {
+            chrome.last_windowed_logical =
+                Some((window.resolution.width(), window.resolution.height()));
+        }
+        window.mode = bevy::window::WindowMode::BorderlessFullscreen(
+            bevy::window::MonitorSelection::Primary,
+        );
+    } else {
+        window.mode = bevy::window::WindowMode::Windowed;
+        window.decorations = chrome.desired_decorations;
+        if let Some((w, h)) = chrome.last_windowed_logical {
+            window.resolution.set(w.max(1.0), h.max(1.0));
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn exit_fullscreen_on_escape_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut last_resize: ResMut<LastResizeEventTime>,
+    mut chrome: ResMut<WindowChromeState>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !keys.just_pressed(KeyCode::Escape) {
+        return;
+    }
+
+    let mut iter = windows.iter_mut();
+    let Some(mut window) = iter.next() else {
+        return;
+    };
+    if iter.next().is_some() {
+        return;
+    }
+
+    if !matches!(window.mode, bevy::window::WindowMode::Windowed) {
+        set_fullscreen(&mut window, &mut chrome, false);
+        // Treat this like a resize event so camera gating behaves consistently.
+        last_resize.last_secs = Some(time.elapsed_secs_f64());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn toggle_fullscreen_on_f11_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    time: Res<Time>,
+    mut last_resize: ResMut<LastResizeEventTime>,
+    mut chrome: ResMut<WindowChromeState>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !keys.just_pressed(KeyCode::F11) {
+        return;
+    }
+
+    let shift_held = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+
+    let mut iter = windows.iter_mut();
+    let Some(mut window) = iter.next() else {
+        return;
+    };
+    if iter.next().is_some() {
+        return;
+    }
+
+    if shift_held {
+        // Shift+F11 toggles decorations (titlebar) regardless of fullscreen state.
+        // If fullscreen is active, we just update the desired setting and apply it
+        // when returning to windowed mode.
+        let next = !chrome.desired_decorations;
+        chrome.desired_decorations = next;
+        if matches!(window.mode, bevy::window::WindowMode::Windowed) {
+            window.decorations = next;
+        }
+    } else {
+        // F11 toggles fullscreen.
+        let enable = matches!(window.mode, bevy::window::WindowMode::Windowed);
+        set_fullscreen(&mut window, &mut chrome, enable);
+        // Treat this like a resize event so camera gating behaves consistently.
+        last_resize.last_secs = Some(time.elapsed_secs_f64());
+    }
+}
+
+// Optional native helper: exit the app after showing a window for some seconds.
+// Enable with:
+// - MCBAISE_SHOW_FOR_SEC=5
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_exit_after_show_for_sec_system(
+    time: Res<Time>,
+    mut start_sec: Local<Option<f64>>,
+    mut printed: Local<bool>,
+    mut app_exit: MessageWriter<AppExit>,
+) {
+    let show_for_sec: f64 = match std::env::var("MCBAISE_SHOW_FOR_SEC") {
+        Ok(v) => v.parse().ok().unwrap_or(0.0),
+        Err(_) => 0.0,
+    };
+    if !(show_for_sec > 0.0) {
+        return;
+    }
+
+    let now = time.elapsed_secs_f64();
+    let start = start_sec.get_or_insert(now);
+    if now - *start >= show_for_sec {
+        if !*printed {
+            eprintln!(
+                "native: exiting because MCBAISE_SHOW_FOR_SEC={} elapsed",
+                show_for_sec
+            );
+            *printed = true;
+        }
+        app_exit.write(AppExit::Success);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drag_window_on_both_mouse_buttons_system(
+    mut chord_active: Local<bool>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    primary: Query<(Entity, &Window), With<PrimaryWindow>>,
+    winit_windows: Option<NonSend<bevy::winit::WinitWindows>>,
+) {
+    let debug_drag = std::env::var("MCBAISE_DEBUG_DRAG")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+
+    let Some(winit_windows) = winit_windows else {
+        if debug_drag {
+            eprintln!("native: drag skipped (no WinitWindows)");
+        }
+        return;
+    };
+
+    let Some((entity, bevy_window)) = primary.iter().next() else {
+        if debug_drag {
+            eprintln!("native: drag skipped (no PrimaryWindow)");
+        }
+        return;
+    };
+    let Some(w) = winit_windows.get_window(entity) else {
+        if debug_drag {
+            eprintln!("native: drag skipped (no winit window handle)");
+        }
+        return;
+    };
+
+    if debug_drag {
+        if mouse.just_pressed(MouseButton::Left) {
+            eprintln!("native: mouse left pressed");
+        }
+        if mouse.just_pressed(MouseButton::Right) {
+            eprintln!("native: mouse right pressed");
+        }
+        if mouse.just_released(MouseButton::Left) {
+            eprintln!("native: mouse left released");
+        }
+        if mouse.just_released(MouseButton::Right) {
+            eprintln!("native: mouse right released");
+        }
+    }
+
+    let windowed = matches!(bevy_window.mode, bevy::window::WindowMode::Windowed);
+    let both_pressed = mouse.pressed(MouseButton::Left) && mouse.pressed(MouseButton::Right);
+
+    if !both_pressed {
+        *chord_active = false;
+        return;
+    }
+
+    if !windowed {
+        if debug_drag {
+            eprintln!("native: drag skipped (window not windowed: {:?})", bevy_window.mode);
+        }
+        return;
+    }
+
+    // Fire once per chord.
+    if !*chord_active {
+        *chord_active = true;
+        eprintln!("native: drag_window() requested (both mouse buttons)");
+        if let Err(err) = w.drag_window() {
+            eprintln!("native: drag_window() failed: {err:?}");
+        }
+    }
+}
+
 // Whether a staging buffer is currently mapped (or mapping) for GPU readback.
 // When set, we poll the device each render tick to help drive mapping callbacks.
 static READBACK_MAP_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
@@ -128,6 +337,8 @@ fn spawn_burn_human_when_ready(
     assets_opt: Option<Res<BurnHumanAssets>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut spawned: ResMut<BurnHumanSpawned>,
+    subject_mode: Res<SubjectMode>,
+    auto_subject: Res<AutoSubjectState>,
 ) {
     if spawned.0 {
         return;
@@ -145,6 +356,11 @@ fn spawn_burn_human_when_ready(
         .iter()
         .position(|c| c.pose_parameters.shape[0] == 1)
         .unwrap_or(0usize);
+
+    let active = match *subject_mode {
+        SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
+        _ => *subject_mode,
+    };
 
     commands.spawn((
         BurnHumanInput {
@@ -168,7 +384,14 @@ fn spawn_burn_human_when_ready(
         })),
         Transform::from_rotation(Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2))
             .with_scale(Vec3::splat(HUMAN_SCALE)),
-        Visibility::default(),
+        if matches!(
+            active,
+            SubjectMode::Human | SubjectMode::HumanBall | SubjectMode::HumanDoughnut
+        ) {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        },
         SubjectTag,
         Name::new("burn_human_subject"),
     ));
@@ -181,9 +404,15 @@ fn enforce_burn_human_subject_mode(
     burn_enabled: Option<Res<BurnHumanEnabled>>,
 ) {
     let enabled = burn_enabled.map(|r| r.0).unwrap_or(true);
-    if !enabled && *subject_mode == SubjectMode::Human {
-        *subject_mode = SubjectMode::Doughnut;
+    if enabled {
+        return;
     }
+
+    *subject_mode = match *subject_mode {
+        SubjectMode::HumanBall => SubjectMode::Ball,
+        SubjectMode::Human | SubjectMode::HumanDoughnut => SubjectMode::Doughnut,
+        other => other,
+    };
 }
 
 // Render-subapp cleanup monitor: run in the render app Cleanup stage. When
@@ -924,7 +1153,7 @@ fn overlay_hide_after_resize_secs() -> f64 {
     std::env::var("MCBAISE_HIDE_OVERLAY_AFTER_RESIZE_SECS")
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
-        .unwrap_or(2.0)
+    .unwrap_or(0.5)
         .clamp(0.0, 10.0)
 }
 
@@ -4104,7 +4333,14 @@ const TUBE_RADIUS: f32 = 3.4;
 const SUBJECT_RADIUS: f32 = 0.78;
 const HUMAN_SCALE: f32 = 1.15;
 const HUMAN_RADIUS: f32 = SUBJECT_RADIUS * HUMAN_SCALE;
-const BALL_RADIUS: f32 = 0.70;
+// Sized so the burn_human subject can read as being *inside* with a bit of clearance.
+const BALL_RADIUS: f32 = 1.05;
+// Torus (doughnut) size. Keep it large enough that it doesn't read as
+// "smaller than the human" in some camera views.
+const DOUGHNUT_MAJOR: f32 = HUMAN_RADIUS * 1.05;
+const DOUGHNUT_MINOR: f32 = HUMAN_RADIUS * 0.33;
+// Place the human slightly above the torus so it reads as "riding".
+const DOUGHNUT_RIDER_OFFSET: f32 = DOUGHNUT_MINOR * 0.85;
 const CONTACT_EPS: f32 = 0.01;
 const GRAVITY: f32 = 9.81;
 
@@ -4127,6 +4363,9 @@ struct TubeTag;
 struct SubjectTag;
 
 #[derive(Component)]
+struct DoughnutTag;
+
+#[derive(Component)]
 struct BallTag;
 
 #[derive(Component)]
@@ -4138,6 +4377,8 @@ enum SubjectMode {
     Auto,
     Random,
     Human,
+    HumanBall,
+    HumanDoughnut,
     Doughnut,
     Ball,
 }
@@ -4148,6 +4389,8 @@ impl SubjectMode {
             SubjectMode::Auto => "Subject: auto",
             SubjectMode::Random => "Subject: random",
             SubjectMode::Human => "Subject: human",
+            SubjectMode::HumanBall => "Subject: human+ball",
+            SubjectMode::HumanDoughnut => "Subject: human+doughnut",
             SubjectMode::Doughnut => "Subject: doughnut",
             SubjectMode::Ball => "Subject: ball",
         }
@@ -4158,11 +4401,16 @@ impl SubjectMode {
             SubjectMode::Auto => "auto",
             SubjectMode::Random => "random",
             SubjectMode::Human => "human",
+            SubjectMode::HumanBall => "human+ball",
+            SubjectMode::HumanDoughnut => "human+doughnut",
             SubjectMode::Doughnut => "doughnut",
             SubjectMode::Ball => "ball",
         }
     }
 }
+
+const COLOR_SCHEME_COUNT: u32 = 11; // indices 0..=10
+const TEXTURE_PATTERN_COUNT: u32 = 13; // indices 0..=12
 
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
 enum ColorSchemeMode {
@@ -4604,15 +4852,29 @@ impl AutoSubjectState {
     }
 
     fn pick_next_subject(&mut self) -> SubjectMode {
-        match self.current {
-            SubjectMode::Ball => {
-                if cfg!(feature = "burn_human") {
-                    SubjectMode::Human
-                } else {
-                    SubjectMode::Doughnut
+        // In random mode we want some variety, including doughnut when burn_human is enabled.
+        // Keep the choice set small and deterministic (LCG-based).
+        if cfg!(feature = "burn_human") {
+            let choices = [
+                SubjectMode::Human,
+                SubjectMode::HumanBall,
+                SubjectMode::HumanDoughnut,
+                SubjectMode::Doughnut,
+                SubjectMode::Ball,
+            ];
+            for _ in 0..6 {
+                let idx = (self.lcg_next() % (choices.len() as u32)) as usize;
+                let pick = choices[idx];
+                if pick != self.current {
+                    return pick;
                 }
             }
-            _ => SubjectMode::Ball,
+            choices[0]
+        } else {
+            match self.current {
+                SubjectMode::Ball => SubjectMode::Doughnut,
+                _ => SubjectMode::Ball,
+            }
         }
     }
 }
@@ -4679,10 +4941,10 @@ impl AutoTubeStyleState {
     }
 
     fn pick_next_scheme(&mut self) {
-        let prev = self.scheme_current % 4;
+        let prev = self.scheme_current % COLOR_SCHEME_COUNT;
         let mut next = prev;
         for _ in 0..8 {
-            next = self.lcg_next() % 4;
+            next = self.lcg_next() % COLOR_SCHEME_COUNT;
             if next != prev {
                 break;
             }
@@ -4695,7 +4957,7 @@ impl AutoTubeStyleState {
         let mut next = prev;
         for _ in 0..8 {
             // Use full set of patterns (0..12) so Auto cycles through all shaders
-            next = self.lcg_next() % 13;
+            next = self.lcg_next() % TEXTURE_PATTERN_COUNT;
             if next != prev {
                 break;
             }
@@ -4704,11 +4966,15 @@ impl AutoTubeStyleState {
     }
 
     fn pick_next_wire_pattern(&mut self) {
-        let prev = self.pattern_current;
+        // Keep this list aligned with wire-capable patterns.
+        // (StripeWire=2, SwirlWire=3, HoopWire=11)
+        const WIRE: [u32; 3] = [2, 3, 11];
+
+        let prev = self.pattern_current % TEXTURE_PATTERN_COUNT;
         let mut next = prev;
         for _ in 0..8 {
-            // Expand wire choices to include all wire-like pattern indices (2..=12)
-            next = 2 + (self.lcg_next() % 11);
+            let idx = (self.lcg_next() % (WIRE.len() as u32)) as usize;
+            next = WIRE[idx];
             if next != prev {
                 break;
             }
@@ -5015,9 +5281,19 @@ impl MultiViewHint {
         self.until_sec = now_sec + Self::SHOW_FOR_SEC;
     }
 
+    fn show_for(&mut self, now_sec: f64, show_for_sec: f64, text: impl Into<String>) {
+        self.text = text.into();
+        self.until_sec = now_sec + show_for_sec.max(0.0);
+    }
+
     fn active(&self, now_sec: f64) -> bool {
         !self.text.is_empty() && now_sec < self.until_sec
     }
+}
+
+#[derive(Default)]
+struct EscExitConfirm {
+    until_sec: f64,
 }
 
 #[derive(Resource, Default)]
@@ -5086,6 +5362,11 @@ struct OverlayState {
 
 #[derive(Resource, Clone, Copy)]
 struct OverlayVisibility {
+    show: bool,
+}
+
+#[derive(Resource, Clone, Copy)]
+struct UiChromeVisibility {
     show: bool,
 }
 
@@ -5643,6 +5924,19 @@ pub fn main() {
         }
     };
 
+    fn env_true(name: &str) -> bool {
+        std::env::var(name)
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    // Native window chrome configuration.
+    // - MCBAISE_HIDE_TITLEBAR=1  -> disables OS window decorations
+    // - MCBAISE_FULLSCREEN=1     -> starts in fullscreen (borderless)
+    let hide_titlebar = env_true("MCBAISE_HIDE_TITLEBAR");
+    let start_fullscreen = env_true("MCBAISE_FULLSCREEN");
+
     let plugins = DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
             title: format!("{VIDEO_ID} • tube ride"),
@@ -5650,6 +5944,14 @@ pub fn main() {
             canvas: Some("#bevy-canvas".to_string()),
             #[cfg(target_arch = "wasm32")]
             fit_canvas_to_parent: true,
+            #[cfg(not(target_arch = "wasm32"))]
+            decorations: !hide_titlebar,
+            #[cfg(not(target_arch = "wasm32"))]
+            mode: if start_fullscreen {
+                bevy::window::WindowMode::BorderlessFullscreen(bevy::window::MonitorSelection::Primary)
+            } else {
+                bevy::window::WindowMode::Windowed
+            },
             ..default()
         }),
         ..default()
@@ -5699,8 +6001,38 @@ pub fn main() {
             pattern: 0,
         })
         .insert_resource(OverlayVisibility { show: false })
+        .insert_resource(UiChromeVisibility { show: true })
         .insert_resource(CaptionVisibility { show: true })
         .insert_resource(OverlayText::default());
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Make the desired decorations visible to systems.
+        app.insert_resource(WindowChromeState {
+            desired_decorations: !hide_titlebar,
+            last_windowed_logical: None,
+        });
+
+        // Window chrome hotkeys.
+        app.add_systems(
+            Update,
+            exit_fullscreen_on_escape_system.after(main_frame_tick_system),
+        );
+        app.add_systems(
+            Update,
+            toggle_fullscreen_on_f11_system.after(main_frame_tick_system),
+        );
+        app.add_systems(
+            PreUpdate,
+            drag_window_on_both_mouse_buttons_system.after(bevy::input::InputSystems),
+        );
+
+        // Optional auto-exit for Taskfile smoke runs.
+        app.add_systems(
+            Update,
+            auto_exit_after_show_for_sec_system.after(main_frame_tick_system),
+        );
+    }
 
     // GPU readback wiring: create an offscreen render target image, retarget
     // cameras for one frame when a request arrives, then in RenderApp copy
@@ -7886,13 +8218,13 @@ fn setup_scene(
         Name::new("subject_fill_light"),
     ));
 
-    // If the `burn_human` feature is not enabled, spawn a lightweight
-    // glass doughnut (torus) as a placeholder subject so the scene isn't empty.
-    #[cfg(not(feature = "burn_human"))]
+    // Always spawn a lightweight glass doughnut (torus) so it's available
+    // as a selectable subject even when the `burn_human` feature is enabled.
+    // In burn_human builds we start it hidden (human is the default).
     {
-        // Torus parameters (kept small for performance).
-        let major = HUMAN_RADIUS * 0.9;
-        let minor = HUMAN_RADIUS * 0.28;
+        // Torus parameters.
+        let major = DOUGHNUT_MAJOR;
+        let minor = DOUGHNUT_MINOR;
         let tubular_segments: usize = 128;
         let radial_segments: usize = 32;
 
@@ -7914,16 +8246,26 @@ fn setup_scene(
         });
 
         // Spawn as `SubjectTag` so existing subject transforms/logic apply.
+        // Tag it so we can toggle visibility independently from the human model.
         commands.spawn((
             Mesh3d(torus_mesh),
             MeshMaterial3d(torus_mat),
             Transform::default(),
+            if cfg!(feature = "burn_human") {
+                Visibility::Hidden
+            } else {
+                Visibility::Visible
+            },
             SubjectTag,
+            DoughnutTag,
             Name::new("placeholder_doughnut"),
         ));
 
-        // Mark spawned so other systems don't try to spawn again.
-        commands.insert_resource(BurnHumanSpawned(true));
+        // In builds without burn_human, consider the subject "spawned" so
+        // no burn-human spawn attempts (if any runtime systems exist) will run.
+        if !cfg!(feature = "burn_human") {
+            commands.insert_resource(BurnHumanSpawned(true));
+        }
     }
 
     // Native: present the main 3D render target as a full-window sprite.
@@ -9296,6 +9638,7 @@ fn restart_cameras_execute_system(
 
 // Cycle through preset output/window resolutions when the user right-clicks
 // the resize icon in the egui overlay.
+#[cfg(target_arch = "wasm32")]
 fn cycle_resolution_on_resize_icon_request_system(
     mut capture_state: ResMut<EguiCaptureState>,
     mut pending_window_geometry: ResMut<PendingWindowGeometry>,
@@ -9325,6 +9668,100 @@ fn cycle_resolution_on_resize_icon_request_system(
         (1170, 2532, "iPhone Pro (1170x2532)"),
         (1080, 2340, "Modern Phone (1080x2340)"),
     ];
+
+    let next_index = if capture_state.selected_resolution >= 0
+        && (capture_state.selected_resolution as usize) < resolutions.len()
+    {
+        let idx = capture_state.selected_resolution as usize;
+        (idx + 1) % resolutions.len()
+    } else {
+        0usize
+    };
+
+    let (w, h, _label) = resolutions[next_index];
+    capture_state.selected_resolution = next_index as i32;
+
+    schedule_window_geometry_change(
+        &mut pending_window_geometry,
+        &mut deferred,
+        w,
+        h,
+        frame.0,
+        "resize icon right-click cycled",
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn cycle_resolution_on_resize_icon_request_system(
+    mut capture_state: ResMut<EguiCaptureState>,
+    mut pending_window_geometry: ResMut<PendingWindowGeometry>,
+    mut deferred: ResMut<DeferredWindowResolutionChange>,
+    frame: Res<GlobalFrameCount>,
+    time: Res<Time>,
+    mut last_resize: ResMut<LastResizeEventTime>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    mut chrome: ResMut<WindowChromeState>,
+) {
+    if !capture_state.cycle_resolution_requested {
+        return;
+    }
+    // Consume the request even if we're busy to avoid repeated cycling.
+    capture_state.cycle_resolution_requested = false;
+
+    if pending_window_geometry.pending || deferred.pending {
+        return;
+    }
+
+    let resolutions: &[(u32, u32, &str)] = &[
+        (256, 144, "144p (256x144)"),
+        (426, 240, "240p (426x240)"),
+        (640, 360, "360p (640x360)"),
+        (854, 480, "480p (854x480)"),
+        (1280, 720, "720p (1280x720)"),
+        (1920, 1080, "1080p (1920x1080)"),
+        (2560, 1440, "1440p (2560x1440)"),
+        (3840, 2160, "2160p (3840x2160)"),
+        (1080, 1920, "Phone Portrait (1080x1920)"),
+        (1170, 2532, "iPhone Pro (1170x2532)"),
+        (1080, 2340, "Modern Phone (1080x2340)"),
+    ];
+
+    let Some(mut window) = windows.iter_mut().next() else {
+        return;
+    };
+
+    let is_fullscreen = !matches!(window.mode, bevy::window::WindowMode::Windowed);
+    let now = time.elapsed_secs_f64();
+
+    // Fullscreen is an extra cycle step.
+    // - if fullscreen: exit fullscreen, then go to first preset
+    // - if windowed and at last preset: enter fullscreen
+    if is_fullscreen {
+        set_fullscreen(&mut window, &mut chrome, false);
+        last_resize.last_secs = Some(now);
+
+        let (w, h, _label) = resolutions[0];
+        capture_state.selected_resolution = 0;
+        schedule_window_geometry_change(
+            &mut pending_window_geometry,
+            &mut deferred,
+            w,
+            h,
+            frame.0,
+            "resize icon right-click cycled (exit fullscreen)",
+        );
+        return;
+    }
+
+    let at_last_preset = capture_state.selected_resolution >= 0
+        && (capture_state.selected_resolution as usize) == resolutions.len().saturating_sub(1);
+    if at_last_preset {
+        set_fullscreen(&mut window, &mut chrome, true);
+        last_resize.last_secs = Some(now);
+        // Track fullscreen as a special cycle state.
+        capture_state.selected_resolution = -2;
+        return;
+    }
 
     let next_index = if capture_state.selected_resolution >= 0
         && (capture_state.selected_resolution as usize) < resolutions.len()
@@ -10065,6 +10502,7 @@ fn native_controls(
     mut settings: ResMut<TubeSettings>,
     mut scheme_mode: ResMut<ColorSchemeMode>,
     mut pattern_mode: ResMut<TexturePatternMode>,
+    mut camera_preset: ResMut<CameraPreset>,
     _native_youtube: Option<Res<NativeYoutubeSync>>,
     _native_mpv: Option<Res<NativeMpvSync>>,
     mut readback: ResMut<GpuReadbackImage>,
@@ -10072,7 +10510,8 @@ fn native_controls(
     #[cfg(feature = "capture_ui")]
     mut capture_state_opt: Option<ResMut<EguiCaptureState>>,
 ) {
-    if keys.just_pressed(KeyCode::Space) {
+    let alt_held = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
+    if !alt_held && keys.just_pressed(KeyCode::Space) {
         playback.playing = !playback.playing;
 
         #[cfg(feature = "native-youtube")]
@@ -10110,12 +10549,24 @@ fn native_controls(
         }
     }
     if keys.just_pressed(KeyCode::Digit1) {
-        settings.scheme = (settings.scheme + 1) % 4;
+        settings.scheme = (settings.scheme + 1) % COLOR_SCHEME_COUNT;
         *scheme_mode = ColorSchemeMode::from_value(settings.scheme);
     }
     if keys.just_pressed(KeyCode::Digit2) {
-        settings.pattern = (settings.pattern + 1) % 6;
+        settings.pattern = (settings.pattern + 1) % TEXTURE_PATTERN_COUNT;
         *pattern_mode = TexturePatternMode::from_value(settings.pattern);
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        let choices = CameraPreset::choices();
+        let cur = *camera_preset;
+        let mut idx = 0usize;
+        for (i, (preset, _label)) in choices.iter().enumerate() {
+            if *preset == cur {
+                idx = i;
+                break;
+            }
+        }
+        *camera_preset = choices[(idx + 1) % choices.len()].0;
     }
     if keys.just_pressed(KeyCode::ArrowUp) {
         #[cfg(feature = "native-youtube")]
@@ -10346,12 +10797,12 @@ fn apply_js_input(
             playback.time_sec += time.delta_secs();
         }
         if st.toggle_scheme {
-            settings.scheme = (settings.scheme + 1) % 4;
+            settings.scheme = (settings.scheme + 1) % COLOR_SCHEME_COUNT;
             *scheme_mode = ColorSchemeMode::from_value(settings.scheme);
             st.toggle_scheme = false;
         }
         if st.toggle_texture {
-            settings.pattern = (settings.pattern + 1) % 6;
+            settings.pattern = (settings.pattern + 1) % TEXTURE_PATTERN_COUNT;
             *pattern_mode = TexturePatternMode::from_value(settings.pattern);
             st.toggle_texture = false;
         }
@@ -10407,7 +10858,7 @@ fn update_tube_and_subject(
         mut auto_subject,
     }: TubeUpdateParams,
     mut subject: Query<
-        &mut Transform,
+        (&mut Transform, Option<&DoughnutTag>),
         (
             With<SubjectTag>,
             Without<MainCamera>,
@@ -10459,7 +10910,7 @@ fn update_tube_and_subject(
                 auto_style.pick_next_scheme();
                 auto_style.schedule_next_scheme_switch();
             }
-            auto_style.scheme_current % 4
+            auto_style.scheme_current % COLOR_SCHEME_COUNT
         }
         ColorSchemeMode::OrangeWhite => 0,
         ColorSchemeMode::Nin => 1,
@@ -10481,7 +10932,8 @@ fn update_tube_and_subject(
                 if auto_style.auto_wire_next_switch_sec == 0.0 {
                     auto_style.schedule_next_auto_wire_pattern_switch();
                 }
-                if auto_style.pattern_current % 4 < 2 {
+                let p = auto_style.pattern_current % TEXTURE_PATTERN_COUNT;
+                if p != 2 && p != 3 && p != 11 {
                     auto_style.pick_next_wire_pattern();
                     auto_style.schedule_next_auto_wire_pattern_switch();
                 }
@@ -10492,7 +10944,7 @@ fn update_tube_and_subject(
                     auto_style.schedule_next_auto_wire_pattern_switch();
                 }
 
-                auto_style.pattern_current % 6
+                auto_style.pattern_current % TEXTURE_PATTERN_COUNT
             } else {
                 timeline_texture_pattern(t)
             }
@@ -10503,7 +10955,7 @@ fn update_tube_and_subject(
                 auto_style.pick_next_pattern();
                 auto_style.schedule_next_pattern_switch();
             }
-            auto_style.pattern_current % 6
+            auto_style.pattern_current % TEXTURE_PATTERN_COUNT
         }
         TexturePatternMode::Stripe => 0,
         TexturePatternMode::Swirl => 1,
@@ -10520,13 +10972,30 @@ fn update_tube_and_subject(
         TexturePatternMode::HoopAlt => 12,
     };
 
-    // If color scheme is fluid, force fluid pattern regardless of pattern mode selection
-    let final_pattern = if scheme == 5 { 4 } else { pattern };
+    // If color scheme is fluid, force fluid pattern only in Auto/Random texture modes.
+    // Explicit/manual selection (e.g. Digit2) should be honored.
+    let final_pattern = if scheme == 6
+        && matches!(*pattern_mode, TexturePatternMode::Auto | TexturePatternMode::Random)
+    {
+        4
+    } else {
+        pattern
+    };
 
-    auto_style.scheme_current = scheme;
-    auto_style.pattern_current = final_pattern;
-    settings.scheme = scheme;
-    settings.pattern = final_pattern;
+    if auto_style.scheme_current != scheme {
+        auto_style.scheme_current = scheme;
+    }
+    if auto_style.pattern_current != final_pattern {
+        auto_style.pattern_current = final_pattern;
+    }
+
+    // Avoid per-frame writes so we don't trip change-detection and cause UI/system feedback loops.
+    if settings.scheme != scheme {
+        settings.scheme = scheme;
+    }
+    if settings.pattern != final_pattern {
+        settings.pattern = final_pattern;
+    }
 
     // Resolve subject from explicit / auto timeline / random.
     match *subject_mode {
@@ -10540,7 +11009,11 @@ fn update_tube_and_subject(
                 auto_subject.schedule_next_switch();
             }
         }
-        SubjectMode::Human | SubjectMode::Doughnut | SubjectMode::Ball => {
+        SubjectMode::Human
+        | SubjectMode::HumanBall
+        | SubjectMode::HumanDoughnut
+        | SubjectMode::Doughnut
+        | SubjectMode::Ball => {
             auto_subject.current = *subject_mode;
         }
     }
@@ -10687,7 +11160,9 @@ fn update_tube_and_subject(
     }
 
     let r_ring = match active_subject_mode {
-        SubjectMode::Human => dyns.human_r.max(0.25),
+        SubjectMode::Human | SubjectMode::HumanBall | SubjectMode::HumanDoughnut => {
+            dyns.human_r.max(0.25)
+        }
         SubjectMode::Doughnut => dyns.human_r.max(0.25),
         SubjectMode::Ball => dyns.ball_r.max(0.25),
         SubjectMode::Auto | SubjectMode::Random => dyns.human_r.max(0.25),
@@ -10699,9 +11174,9 @@ fn update_tube_and_subject(
     // theta¨ = -(g/r) * sin(theta - theta_eq) - damping * theta˙
     // Damping acts like friction along the tube wall.
     let damping = match active_subject_mode {
-        SubjectMode::Human => 0.55,
+        SubjectMode::Human | SubjectMode::HumanBall | SubjectMode::HumanDoughnut => 0.55,
         SubjectMode::Doughnut => 0.55,
-        SubjectMode::Ball => 0.35,
+        SubjectMode::Ball => 0.45,
         SubjectMode::Auto | SubjectMode::Random => 0.55,
     };
     // When the tangent is close to vertical, g_mag is small; add a small floor so it still
@@ -10752,12 +11227,14 @@ fn update_tube_and_subject(
     let ball_r_rest = (ball_r_max - CONTACT_EPS).max(0.25);
     let k_b = 60.0;
     let c_b = 9.0;
+    let mut ball_hit_wall = false;
     dyns.ball_vr += (a_out - k_b * (dyns.ball_r - ball_r_rest) - c_b * dyns.ball_vr) * dt;
     dyns.ball_r += dyns.ball_vr * dt;
     if dyns.ball_r > ball_r_max {
         dyns.ball_r = ball_r_max;
         if dyns.ball_vr > 0.0 {
             dyns.ball_vr = -dyns.ball_vr * 0.55;
+            ball_hit_wall = true;
         }
     }
     dyns.ball_r = dyns.ball_r.max(ball_r_rest - 0.35);
@@ -10775,7 +11252,7 @@ fn update_tube_and_subject(
     // Use the velocity computed above (curve advance) plus wall sliding.
 
     let active_r = match active_subject_mode {
-        SubjectMode::Human => dyns.human_r,
+        SubjectMode::Human | SubjectMode::HumanBall | SubjectMode::HumanDoughnut => dyns.human_r,
         SubjectMode::Doughnut => dyns.human_r,
         SubjectMode::Ball => dyns.ball_r,
         SubjectMode::Auto | SubjectMode::Random => dyns.human_r,
@@ -10819,6 +11296,11 @@ fn update_tube_and_subject(
     // Human posture dynamics: allow the body to roll/pitch relative to the surface.
     // This avoids the "always orthographic/upright" look (enables belly/back/sideways).
     // Use effective acceleration components to drive posture, then smooth with critical damping.
+    let hit_for_pose = if matches!(active_subject_mode, SubjectMode::HumanBall) {
+        ball_hit_wall
+    } else {
+        human_hit_wall
+    };
     match *pose_mode {
         // Timeline pose: deterministic (not random).
         PoseMode::Auto => {
@@ -10831,7 +11313,7 @@ fn update_tube_and_subject(
             auto_pose.since_switch_sec += dt;
             auto_pose.collision_cooldown_sec = (auto_pose.collision_cooldown_sec - dt).max(0.0);
 
-            if human_hit_wall && auto_pose.collision_cooldown_sec <= 0.0 {
+            if hit_for_pose && auto_pose.collision_cooldown_sec <= 0.0 {
                 // "Hit direction" is outward from the tube center.
                 let world_hit_dir = subject_up;
                 // Convert to model-local using the current desired rotation (includes model basis).
@@ -10895,18 +11377,86 @@ fn update_tube_and_subject(
     }
     let desired_ball_rot = Quat::from_axis_angle(ball_roll_axis, dyns.ball_roll) * desired_rot;
 
-    if let Ok(mut tr) = subject.single_mut() {
-        let mut desired = desired_human_rot;
+    // Couple vehicle orientation to the human's posture/impact so composite modes read
+    // as a single system (rider + vehicle) instead of two independent animations.
+    let vehicle_perturb = Quat::from_axis_angle(subject_forward, dyns.human_roll * 0.28)
+        * Quat::from_axis_angle(subject_around, dyns.human_pitch * 0.28);
+
+    for (mut tr, is_doughnut) in &mut subject {
+        // Doughnut is the vehicle mesh; human is the rider mesh.
+        let is_doughnut = is_doughnut.is_some();
+
+        let (target_pos, desired_target) = match active_subject_mode {
+            // Composite: show both human + doughnut; keep the doughnut on the track and
+            // offset the human slightly outward so it reads as "riding".
+            SubjectMode::HumanDoughnut => {
+                if is_doughnut {
+                    (subject_pos_human, vehicle_perturb * desired_rot)
+                } else {
+                    // "Riding" placement: keep the doughnut on the track and lift the
+                    // human slightly outward so it sits on top of the ring.
+                    (subject_pos_human + subject_up * DOUGHNUT_RIDER_OFFSET, desired_human_rot)
+                }
+            }
+
+            // Composite: show both human + ball; keep them co-located at the ball path.
+            // Human gets an extra spin so it reads as being "inside" the ball.
+            SubjectMode::HumanBall => {
+                if is_doughnut {
+                    // Hide doughnut in this mode (visibility system does this too), but keep a sane target.
+                    (subject_pos_human, desired_rot)
+                } else {
+                    let spin = Quat::from_axis_angle(subject_up, (t * 1.8).rem_euclid(std::f32::consts::TAU));
+                    (subject_pos_ball, (vehicle_perturb * desired_ball_rot) * spin)
+                }
+            }
+
+            // Single-subject modes.
+            SubjectMode::Doughnut => {
+                if is_doughnut {
+                    (subject_pos_human, desired_rot)
+                } else {
+                    (subject_pos_human, desired_human_rot)
+                }
+            }
+            SubjectMode::Ball => {
+                if is_doughnut {
+                    (subject_pos_human, desired_rot)
+                } else {
+                    (subject_pos_ball, desired_ball_rot)
+                }
+            }
+            SubjectMode::Human => {
+                if is_doughnut {
+                    (subject_pos_human, desired_rot)
+                } else {
+                    (subject_pos_human, desired_human_rot)
+                }
+            }
+            SubjectMode::Auto | SubjectMode::Random => {
+                if is_doughnut {
+                    (subject_pos_human, desired_rot)
+                } else {
+                    (subject_pos_human, desired_human_rot)
+                }
+            }
+        };
+
+        let mut desired = desired_target;
         if tr.rotation.dot(desired) < 0.0 {
             desired = -desired;
         }
 
-        tr.translation = tr.translation.lerp(subject_pos_human, pos_alpha);
+        tr.translation = tr.translation.lerp(target_pos, pos_alpha);
         tr.rotation = tr.rotation.slerp(desired, rot_alpha);
     }
 
     if let Ok(mut tr) = ball.single_mut() {
-        let mut desired = desired_ball_rot;
+        let mut desired = if active_subject_mode == SubjectMode::HumanBall {
+            vehicle_perturb * desired_ball_rot
+        } else {
+            desired_ball_rot
+        };
         if tr.rotation.dot(desired) < 0.0 {
             desired = -desired;
         }
@@ -10916,9 +11466,8 @@ fn update_tube_and_subject(
 
     if let Ok(mut light_tr) = subject_light.single_mut() {
         let active_pos = match active_subject_mode {
-            SubjectMode::Human => subject_pos_human,
-            SubjectMode::Doughnut => subject_pos_human,
-            SubjectMode::Ball => subject_pos_ball,
+            SubjectMode::Human | SubjectMode::Doughnut | SubjectMode::HumanDoughnut => subject_pos_human,
+            SubjectMode::Ball | SubjectMode::HumanBall => subject_pos_ball,
             SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
         };
         let target = active_pos + subject_up * 0.9 - subject_forward * 0.6;
@@ -10976,27 +11525,70 @@ fn update_tube_and_subject(
 fn apply_subject_mode(
     subject_mode: Res<SubjectMode>,
     auto_subject: Res<AutoSubjectState>,
-    mut human_vis: Query<&mut Visibility, (With<SubjectTag>, Without<BallTag>)>,
+    mut human_vis: Query<&mut Visibility, (With<SubjectTag>, Without<DoughnutTag>, Without<BallTag>)>,
+    mut doughnut_vis: Query<&mut Visibility, (With<DoughnutTag>, Without<BallTag>)>,
     mut ball_vis: Query<&mut Visibility, (With<BallTag>, Without<SubjectTag>)>,
 ) {
     if !subject_mode.is_changed() && !auto_subject.is_changed() {
         return;
     }
 
-    let active = match *subject_mode {
+    let has_human = !human_vis.is_empty();
+    let has_doughnut = !doughnut_vis.is_empty();
+
+    let mut active = match *subject_mode {
         SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
         _ => *subject_mode,
     };
 
-    let (show_human, show_ball) = match active {
-        SubjectMode::Human => (true, false),
-        SubjectMode::Doughnut => (true, false),
-        SubjectMode::Ball => (false, true),
-        SubjectMode::Auto | SubjectMode::Random => (true, false),
+    // `auto_subject.current` should never be Auto/Random, but if it ever is
+    // (e.g. due to future refactors), do NOT hide everything.
+    if matches!(active, SubjectMode::Auto | SubjectMode::Random) {
+        active = if cfg!(feature = "burn_human") {
+            SubjectMode::Human
+        } else {
+            SubjectMode::Doughnut
+        };
+    }
+
+    // When the burn_human model hasn't spawned yet, `Human` would result in a
+    // totally empty scene if we also hide the placeholder doughnut. Prefer to
+    // show the doughnut until the human exists.
+    if active == SubjectMode::Human && !has_human && has_doughnut {
+        active = SubjectMode::Doughnut;
+    }
+
+    if active == SubjectMode::HumanBall && !has_human {
+        active = SubjectMode::Ball;
+    }
+    if active == SubjectMode::HumanDoughnut && !has_human {
+        active = SubjectMode::Doughnut;
+    }
+    // Symmetric fallback: if doughnut isn't present (shouldn't happen), show
+    // the human if it's available.
+    if active == SubjectMode::Doughnut && !has_doughnut && has_human {
+        active = SubjectMode::Human;
+    }
+
+    let (show_human, show_doughnut, show_ball) = match active {
+        SubjectMode::Human => (true, false, false),
+        SubjectMode::HumanBall => (true, false, true),
+        SubjectMode::HumanDoughnut => (true, true, false),
+        SubjectMode::Doughnut => (false, true, false),
+        SubjectMode::Ball => (false, false, true),
+        SubjectMode::Auto | SubjectMode::Random => (true, false, false),
     };
 
     for mut v in &mut human_vis {
         *v = if show_human {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+
+    for mut v in &mut doughnut_vis {
+        *v = if show_doughnut {
             Visibility::Visible
         } else {
             Visibility::Hidden
@@ -11221,7 +11813,7 @@ fn update_subject_appearance(
         }
     };
 
-    if let Some((e, h)) = human_mat.iter().next() {
+    for (e, h) in &human_mat {
         if let Some(mat) = materials.get_mut(&h.0) {
             apply_appearance_preset(mat, human_preset, &textures.polkadot);
         }
@@ -11400,6 +11992,7 @@ struct UiOverlayParams<'w, 's> {
     teardown: ResMut<'w, TeardownState>,
     overlay_text: Res<'w, OverlayText>,
     overlay_vis: ResMut<'w, OverlayVisibility>,
+    ui_chrome: ResMut<'w, UiChromeVisibility>,
     caption_vis: ResMut<'w, CaptionVisibility>,
     #[cfg(target_arch = "wasm32")]
     video_vis: ResMut<'w, VideoVisibility>,
@@ -11435,14 +12028,17 @@ struct UiOverlayParams<'w, 's> {
     loading_state: Res<'w, LoadingState>,
     resize_automation: Res<'w, ResizeAutomation>,
     auto_resolution_cycle: Res<'w, AutoResolutionCycle>,
+    app_exit: MessageWriter<'w, AppExit>,
 }
 
 fn ui_overlay(
+    mut esc_exit: Local<EscExitConfirm>,
     UiOverlayParams {
         mut commands,
         mut egui_contexts,
         overlay_text,
         mut overlay_vis,
+        mut ui_chrome,
         mut caption_vis,
         #[cfg(target_arch = "wasm32")]
         mut video_vis,
@@ -11483,15 +12079,70 @@ fn ui_overlay(
     resize_automation,
     auto_resolution_cycle,
     frame,
+    mut app_exit,
      }: UiOverlayParams) {
     // Handle ESC priority
     if keys.just_pressed(KeyCode::Escape) {
-        if capture_state.show_info {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            // Let the native fullscreen ESC handler win without also
+            // triggering the "double-ESC exit" confirm.
+            let is_windowed = {
+                let mut iter = windows.iter_mut();
+                match iter.next() {
+                    None => true,
+                    Some(w) => matches!(w.mode, bevy::window::WindowMode::Windowed),
+                }
+            };
+            if !is_windowed {
+                return;
+            }
+        }
+
+        let mut any_visible = false;
+        any_visible |= capture_state.show_info;
+        any_visible |= capture_state.visible;
+        any_visible |= overlay_vis.show;
+        any_visible |= caption_vis.show;
+        any_visible |= ui_chrome.show;
+        #[cfg(target_arch = "wasm32")]
+        {
+            any_visible |= video_vis.show;
+        }
+
+        if any_visible {
             capture_state.show_info = false;
-        } else if capture_state.visible {
             capture_state.visible = false;
-        } else if overlay_vis.show {
             overlay_vis.show = false;
+            caption_vis.show = false;
+            ui_chrome.show = false;
+            #[cfg(target_arch = "wasm32")]
+            {
+                video_vis.show = false;
+            }
+            // Also clear transient hints so "hide overlays" is immediate.
+            multi_view_hint.until_sec = 0.0;
+            esc_exit.until_sec = 0.0;
+        } else {
+            // Everything is hidden.
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                // Native: double-ESC to exit.
+                let now_sec = time.elapsed().as_secs_f64();
+                if now_sec <= esc_exit.until_sec {
+                    eprintln!("native: exiting because ESC was pressed twice with overlays hidden");
+                    app_exit.write(AppExit::Success);
+                } else {
+                    esc_exit.until_sec = now_sec + 3.0;
+                    multi_view_hint.show_for(now_sec, 3.0, "press ESC again in the next 3 secs to exit");
+                }
+            }
+
+            #[cfg(target_arch = "wasm32")]
+            {
+                // wasm: cannot exit the page; do nothing.
+                esc_exit.until_sec = 0.0;
+            }
         }
     }
 
@@ -11511,7 +12162,7 @@ fn ui_overlay(
                 .unwrap_or("0")
                 == "1";
 
-            if show_resolution_overlay {
+            if ui_chrome.show && show_resolution_overlay {
                 // Place the *right edge* of the resolution label to the left of the
                 // pie (pie right edge is ~10px from right; pie width ~28px).
                 egui::Area::new(egui::Id::new("resolution_overlay"))
@@ -11573,7 +12224,7 @@ fn ui_overlay(
                 lines.push("Disable: unset MCBAISE_AUTO_READBACK_EXIT".to_string());
             }
 
-            if !lines.is_empty() {
+            if ui_chrome.show && !lines.is_empty() {
                 egui::Window::new("autoexit_overlay")
                     .title_bar(false)
                     .resizable(false)
@@ -11961,7 +12612,7 @@ fn ui_overlay(
                         }
                     }
 
-                    egui::ComboBox::from_label("Window Resolution")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_window_resolution")
                         .selected_text(if capture_state.selected_resolution >= 0 && (capture_state.selected_resolution as usize) < resolutions.len() {
                             resolutions[capture_state.selected_resolution as usize].2
                         } else {
@@ -12105,9 +12756,10 @@ fn ui_overlay(
     let _ = &mut commands;
 
     // Top-right: add an additional synced view.
-    egui::Area::new(egui::Id::new("mcbaise_add_view_pie"))
-        .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
-        .show(ctx, |ui| {
+    if ui_chrome.show {
+        egui::Area::new(egui::Id::new("mcbaise_add_view_pie"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+            .show(ctx, |ui| {
             let desired = egui::vec2(28.0, 28.0);
             let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
 
@@ -12168,7 +12820,8 @@ fn ui_overlay(
                     multi_view_hint.show(now_sec, "left click/tap to add more");
                 }
             }
-        });
+            });
+    }
 
     // Small transient hint beside the view pie button.
     {
@@ -12196,7 +12849,7 @@ fn ui_overlay(
         }
     }
 
-    if !overlay_vis.show {
+    if ui_chrome.show && !overlay_vis.show {
         egui::Area::new(egui::Id::new("mcbaise_overlay_restore_pi"))
             .anchor(egui::Align2::LEFT_TOP, egui::vec2(10.0, 10.0))
             .show(ctx, |ui| {
@@ -12361,7 +13014,7 @@ fn ui_overlay(
                 });
 
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_label("Subject")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_subject")
                         .selected_text(match *subject_mode {
                             SubjectMode::Auto => {
                                 format!("Subject: auto ({})", auto_subject.current.short_label())
@@ -12382,12 +13035,24 @@ fn ui_overlay(
                                 SubjectMode::Random,
                                 SubjectMode::Random.label(),
                             );
+                            #[cfg(feature = "burn_human")]
                             ui.selectable_value(
                                 &mut *subject_mode,
                                 SubjectMode::Human,
                                 SubjectMode::Human.label(),
                             );
-                            #[cfg(not(feature = "burn_human"))]
+                            #[cfg(feature = "burn_human")]
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::HumanBall,
+                                SubjectMode::HumanBall.label(),
+                            );
+                            #[cfg(feature = "burn_human")]
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::HumanDoughnut,
+                                SubjectMode::HumanDoughnut.label(),
+                            );
                             ui.selectable_value(
                                 &mut *subject_mode,
                                 SubjectMode::Doughnut,
@@ -12400,7 +13065,7 @@ fn ui_overlay(
                             );
                         });
 
-                    egui::ComboBox::from_label("Pose")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_pose")
                         .selected_text(match *pose_mode {
                             PoseMode::Auto => {
                                 format!("Pose: auto ({})", auto_pose.current.short_label())
@@ -12448,7 +13113,7 @@ fn ui_overlay(
                             );
                         });
 
-                    egui::ComboBox::from_label("Camera")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_camera")
                         .selected_text(match *camera_preset {
                             CameraPreset::Auto => {
                                 format!("Camera: auto ({})", auto_cam.current.label())
@@ -12505,7 +13170,7 @@ fn ui_overlay(
                 });
 
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_label("Human")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_human")
                         .selected_text(match human_appearance.0 {
                             AppearanceMode::Auto => {
                                 format!("Human: auto ({})", auto_human_appearance.0.current.label())
@@ -12559,7 +13224,7 @@ fn ui_overlay(
                             );
                         });
 
-                    egui::ComboBox::from_label("Ball")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_ball")
                         .selected_text(match ball_appearance.0 {
                             AppearanceMode::Auto => {
                                 format!("Ball: auto ({})", auto_ball_appearance.0.current.label())
@@ -12834,7 +13499,7 @@ fn ui_overlay(
                 });
 
                 ui.horizontal(|ui| {
-                    egui::ComboBox::from_label("Colors")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_colors")
                         .selected_text(match *scheme_mode {
                             ColorSchemeMode::Auto => format!(
                                 "Colors: auto ({})",
@@ -12980,7 +13645,7 @@ fn ui_overlay(
                             }
                         });
 
-                    egui::ComboBox::from_label("Texture")
+                    egui::ComboBox::from_id_salt("mcbaise_combo_texture")
                         .selected_text(match *pattern_mode {
                             TexturePatternMode::Auto => format!(
                                 "Texture: auto ({})",
@@ -13668,36 +14333,47 @@ fn timeline_subject_mode(video_time_sec: f32) -> SubjectMode {
     let cycle = 14.0;
     let u = video_time_sec.rem_euclid(cycle);
     if u > 11.0 {
-        SubjectMode::Ball
+        return SubjectMode::Ball;
+    }
+
+    if !cfg!(feature = "burn_human") {
+        return SubjectMode::Doughnut;
+    }
+
+    // Include the newer combined-subject modes in the Auto timeline.
+    // Keep it deterministic, and alternate each 14s cycle.
+    let cycle_idx = (video_time_sec / cycle).floor() as i32;
+    if (cycle_idx & 1) == 0 {
+        if u < 4.0 {
+            SubjectMode::Human
+        } else if u < 7.5 {
+            SubjectMode::HumanDoughnut
+        } else {
+            SubjectMode::Doughnut
+        }
     } else {
-        SubjectMode::Human
+        if u < 4.0 {
+            SubjectMode::Doughnut
+        } else if u < 7.5 {
+            SubjectMode::HumanBall
+        } else {
+            SubjectMode::Human
+        }
     }
 }
 
 fn timeline_color_scheme(video_time_sec: f32) -> u32 {
-    // Deterministic color timeline (four schemes).
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
-    if u < 3.5 {
-        0
-    } else if u < 7.0 {
-        1
-    } else if u < 10.5 {
-        2
-    } else {
-        3
-    }
+    // Deterministic color timeline (covers all schemes).
+    let step = 3.5;
+    let idx = (video_time_sec / step).floor().max(0.0) as u32;
+    idx % COLOR_SCHEME_COUNT
 }
 
 fn timeline_texture_pattern(video_time_sec: f32) -> u32 {
-    // Deterministic texture timeline.
-    // pattern 0: stripe
-    // pattern 1: swirl
-    // Flip every 3.5s inside the 14s cycle.
+    // Deterministic texture timeline (covers all patterns).
     let step = 3.5;
-    // Previously the shader treated 0 as swirl; we now treat 0 as stripe.
-    // So invert the old alternating sequence.
-    1 - ((((video_time_sec / step).floor() as i32) & 1) as u32)
+    let idx = (video_time_sec / step).floor().max(0.0) as u32;
+    idx % TEXTURE_PATTERN_COUNT
 }
 
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
@@ -13827,9 +14503,8 @@ fn camera_pose(
     let in_intro = video_time_sec < (intro_show_tube + intro_dive);
 
     let active_pos = match subject_mode {
-        SubjectMode::Human => subject_pos_human,
-        SubjectMode::Doughnut => subject_pos_human,
-        SubjectMode::Ball => subject_pos_ball,
+        SubjectMode::Human | SubjectMode::HumanDoughnut | SubjectMode::Doughnut => subject_pos_human,
+        SubjectMode::HumanBall | SubjectMode::Ball => subject_pos_ball,
         SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
     };
     let target_pos = match camera_preset {
@@ -14001,9 +14676,10 @@ fn camera_pose(
     if selected_mode.is_passing() {
         if let Some((pass_c, pass_tan, pass_n, _pass_b)) = pass_anchor {
             let active_pos = match subject_mode {
-                SubjectMode::Human => subject_pos_human,
-                SubjectMode::Doughnut => subject_pos_human,
-                SubjectMode::Ball => subject_pos_ball,
+                SubjectMode::Human | SubjectMode::HumanDoughnut | SubjectMode::Doughnut => {
+                    subject_pos_human
+                }
+                SubjectMode::HumanBall | SubjectMode::Ball => subject_pos_ball,
                 SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
             };
             let rel = active_pos - pass_c;
