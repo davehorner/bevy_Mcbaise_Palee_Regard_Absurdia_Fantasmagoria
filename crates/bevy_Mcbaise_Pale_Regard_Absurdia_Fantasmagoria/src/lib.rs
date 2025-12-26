@@ -332,6 +332,336 @@ impl Default for BurnHumanEnabled {
 }
 
 #[cfg(feature = "burn_human")]
+#[derive(Resource, Clone, Copy, PartialEq, Eq)]
+enum HumanDeformMode {
+    Normal,
+    Perturbed,
+    Phenotyped,
+}
+
+#[cfg(feature = "burn_human")]
+impl HumanDeformMode {
+    fn label(self) -> &'static str {
+        match self {
+            HumanDeformMode::Normal => "Human: normal",
+            HumanDeformMode::Perturbed => "Human: perturbed",
+            HumanDeformMode::Phenotyped => "Human: phenotyped",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            HumanDeformMode::Normal => HumanDeformMode::Perturbed,
+            HumanDeformMode::Perturbed => HumanDeformMode::Phenotyped,
+            HumanDeformMode::Phenotyped => HumanDeformMode::Normal,
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        let raw = std::env::var("MCBAISE_HUMAN_MODE").ok()?;
+        let v = raw.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "normal" | "reference" => Some(HumanDeformMode::Normal),
+            "perturbed" | "perturb" | "ragdoll" => Some(HumanDeformMode::Perturbed),
+            "phenotyped" | "phenotype" => Some(HumanDeformMode::Phenotyped),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "burn_human")]
+impl Default for HumanDeformMode {
+    fn default() -> Self {
+        Self::from_env().unwrap_or(HumanDeformMode::Normal)
+    }
+}
+
+#[cfg(feature = "burn_human")]
+#[derive(Component, Clone)]
+struct BurnHumanRagdollRig {
+    bones: usize,
+    batch: usize,
+    base_pose: Vec<f64>,
+    bone_labels: Vec<String>,
+    reference_case_name: Option<String>,
+}
+
+#[cfg(feature = "burn_human")]
+fn drive_burn_human_ragdoll(
+    burn_enabled: Option<Res<BurnHumanEnabled>>,
+    deform_mode: Res<HumanDeformMode>,
+    assets_opt: Option<Res<BurnHumanAssets>>,
+    playback: Res<Playback>,
+    dyns: Res<SubjectDynamics>,
+    subject_mode: Res<SubjectMode>,
+    auto_subject: Res<AutoSubjectState>,
+    mut query: Query<(&mut BurnHumanInput, &BurnHumanRagdollRig), With<SubjectTag>>,
+) {
+    let enabled = burn_enabled.map(|r| r.0).unwrap_or(true);
+    if !enabled {
+        return;
+    }
+
+    let active = match *subject_mode {
+        SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
+        _ => *subject_mode,
+    };
+    if !matches!(
+        active,
+        SubjectMode::Human | SubjectMode::HumanBall | SubjectMode::HumanDoughnut
+    ) {
+        return;
+    }
+
+    let mut iter = query.iter_mut();
+    let Some((mut input, rig)) = iter.next() else {
+        return;
+    };
+    if iter.next().is_some() {
+        // Unexpected: multiple burn_human subjects tagged as SubjectTag.
+        return;
+    }
+
+    let t = playback.time_sec;
+
+    if *deform_mode == HumanDeformMode::Normal {
+        input.case_name = rig.reference_case_name.clone();
+        input.phenotype_inputs = None;
+        input.blendshape_weights = None;
+        input.blendshape_delta = None;
+        input.pose_parameters = None;
+        input.pose_parameters_delta = None;
+        input.root_translation_delta = None;
+        return;
+    }
+    let hit = dyns.human_hit_impulse;
+    let omega = dyns.omega;
+
+    let base_amp_deg = 6.0 + hit * 28.0 + omega.abs() * 3.0;
+    let roll_deg = dyns.human_roll.to_degrees();
+    let pitch_deg = dyns.human_pitch.to_degrees();
+
+    let mut pose = rig.base_pose.clone();
+    let bones = rig.bones;
+    let batch = rig.batch.max(1);
+
+    for b in 0..batch {
+        for bone in 0..bones {
+            if bone == 0 {
+                continue;
+            }
+
+            let base = (b * bones + bone) * 16;
+            if base + 15 >= pose.len() {
+                break;
+            }
+
+            let label = rig
+                .bone_labels
+                .get(bone)
+                .map(String::as_str)
+                .unwrap_or("");
+            let group_scale = pose_noise_scale_for_bone(label);
+
+            let phase = (bone as f32 * 0.37).sin() * std::f32::consts::TAU;
+            let wobble = (t * 3.2 + phase).sin();
+            let wobble2 = (t * 2.1 + phase * 0.7).cos();
+            let jitter = (t * 5.3 + phase * 1.3).sin();
+
+            let rx = (wobble * base_amp_deg * 0.85 * group_scale).clamp(-60.0, 60.0);
+            let ry = (wobble2 * base_amp_deg * 0.55 * group_scale
+                + roll_deg * 0.22 * group_scale)
+                .clamp(-60.0, 60.0);
+            let rz = (pitch_deg * 0.30 * group_scale + jitter * base_amp_deg * 0.18 * group_scale)
+                .clamp(-60.0, 60.0);
+
+            let base_rot = [
+                [pose[base], pose[base + 1], pose[base + 2]],
+                [pose[base + 4], pose[base + 5], pose[base + 6]],
+                [pose[base + 8], pose[base + 9], pose[base + 10]],
+            ];
+            let delta = euler_deg_to_mat3(rx, ry, rz);
+            let rot = mat3_mul(delta, base_rot);
+            pose[base] = rot[0][0];
+            pose[base + 1] = rot[0][1];
+            pose[base + 2] = rot[0][2];
+            pose[base + 4] = rot[1][0];
+            pose[base + 5] = rot[1][1];
+            pose[base + 6] = rot[1][2];
+            pose[base + 8] = rot[2][0];
+            pose[base + 9] = rot[2][1];
+            pose[base + 10] = rot[2][2];
+            pose[base + 15] = 1.0;
+        }
+    }
+
+    input.case_name = None;
+    input.pose_parameters = Some(pose);
+    input.pose_parameters_delta = None;
+
+    match *deform_mode {
+        HumanDeformMode::Normal => {
+            // handled above
+        }
+        HumanDeformMode::Perturbed => {
+            input.phenotype_inputs = None;
+        }
+        HumanDeformMode::Phenotyped => {
+            let Some(assets) = assets_opt else {
+                input.phenotype_inputs = None;
+                return;
+            };
+            let labels = &assets.body.metadata().metadata.phenotype_labels;
+            input.phenotype_inputs = Some(phenotype_program_values(labels, t));
+        }
+    }
+}
+
+#[cfg(feature = "burn_human")]
+fn phenotype_program_values(labels: &[String], time_sec: f32) -> Vec<f64> {
+    fn find_idx(labels: &[String], pred: impl Fn(&str) -> bool) -> Option<usize> {
+        for (i, s) in labels.iter().enumerate() {
+            if pred(&s.to_ascii_lowercase()) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn smoothstep01(x: f32) -> f32 {
+        let x = x.clamp(0.0, 1.0);
+        x * x * (3.0 - 2.0 * x)
+    }
+
+    let len = labels.len();
+    let mut v = vec![0.5f64; len];
+
+    // Best-effort phenotype axis picks.
+    let male = find_idx(labels, |s| s.contains("male") && !s.contains("female"));
+    let female = find_idx(labels, |s| s.contains("female"));
+    let child = find_idx(labels, |s| s.contains("child") || s.contains("young"));
+    let oldage = find_idx(labels, |s| {
+        s.contains("oldage") || (s.contains("old") && s.contains("age")) || s.contains("elder")
+    });
+
+    // Cycle 3 segments:
+    // 0) male: child -> oldage
+    // 1) female: child -> oldage
+    // 2) female child -> male oldage
+    let seg_sec = 18.0f32;
+    let cycle = 3.0 * seg_sec;
+    let t = time_sec.rem_euclid(cycle);
+    let seg = (t / seg_sec).floor().clamp(0.0, 2.0) as i32;
+    let u = (t - (seg as f32) * seg_sec) / seg_sec;
+    let u = smoothstep01(u);
+
+    let (sex_from_female, sex_to_female) = match seg {
+        0 => (false, false),
+        1 => (true, true),
+        _ => (true, false),
+    };
+
+    // Sex interpolation: fixed for segments 0/1, blended for segment 2.
+    let sex_female = if sex_from_female == sex_to_female {
+        if sex_to_female { 1.0 } else { 0.0 }
+    } else {
+        1.0 - u
+    };
+
+    if let Some(i) = female {
+        v[i] = sex_female as f64;
+    }
+    if let Some(i) = male {
+        v[i] = (1.0 - sex_female) as f64;
+    }
+
+    // Age interpolation.
+    if let Some(i) = child {
+        v[i] = (1.0 - u) as f64;
+    }
+    if let Some(i) = oldage {
+        v[i] = u as f64;
+    }
+
+    for x in v.iter_mut() {
+        *x = x.clamp(0.0, 1.0);
+    }
+    v
+}
+
+#[cfg(feature = "burn_human")]
+fn pose_noise_scale_for_bone(name: &str) -> f32 {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("upperleg") || lower.contains("upper_leg") || lower.contains("thigh") {
+        0.55
+    } else if lower.contains("lowerleg")
+        || lower.contains("lower_leg")
+        || lower.contains("calf")
+        || lower.contains("knee")
+        || lower.contains("foot")
+        || lower.contains("toe")
+    {
+        0.45
+    } else if lower.contains("upper_arm")
+        || lower.contains("shoulder")
+        || lower.contains("clavicle")
+        || lower.contains("upperarm")
+    {
+        0.85
+    } else if lower.contains("lower_arm")
+        || lower.contains("lowerarm")
+        || lower.contains("elbow")
+        || lower.contains("forearm")
+    {
+        0.95
+    } else if lower.contains("wrist") {
+        1.05
+    } else if lower.contains("hand") || lower.contains("finger") || lower.contains("metacarpal") {
+        1.10
+    } else if lower.contains("spine") || lower.contains("neck") || lower.contains("chest") {
+        0.35
+    } else {
+        0.40
+    }
+}
+
+#[cfg(feature = "burn_human")]
+fn euler_deg_to_mat3(rx_deg: f32, ry_deg: f32, rz_deg: f32) -> [[f64; 3]; 3] {
+    let (rx, ry, rz) = (
+        rx_deg.to_radians() as f64,
+        ry_deg.to_radians() as f64,
+        rz_deg.to_radians() as f64,
+    );
+    let (sx, cx) = rx.sin_cos();
+    let (sy, cy) = ry.sin_cos();
+    let (sz, cz) = rz.sin_cos();
+
+    // Rz * Ry * Rx
+    let r00 = cz * cy;
+    let r01 = cz * sy * sx - sz * cx;
+    let r02 = cz * sy * cx + sz * sx;
+    let r10 = sz * cy;
+    let r11 = sz * sy * sx + cz * cx;
+    let r12 = sz * sy * cx - cz * sx;
+    let r20 = -sy;
+    let r21 = cy * sx;
+    let r22 = cy * cx;
+
+    [[r00, r01, r02], [r10, r11, r12], [r20, r21, r22]]
+}
+
+#[cfg(feature = "burn_human")]
+fn mat3_mul(a: [[f64; 3]; 3], b: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut out = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+#[cfg(feature = "burn_human")]
 fn spawn_burn_human_when_ready(
     mut commands: Commands,
     assets_opt: Option<Res<BurnHumanAssets>>,
@@ -348,7 +678,7 @@ fn spawn_burn_human_when_ready(
         return;
     };
 
-    let phenotype_len = assets.body.metadata().metadata.phenotype_labels.len();
+    let bones = assets.body.metadata().metadata.bone_labels.len();
     let selected_case = assets
         .body
         .metadata()
@@ -357,6 +687,35 @@ fn spawn_burn_human_when_ready(
         .position(|c| c.pose_parameters.shape[0] == 1)
         .unwrap_or(0usize);
 
+    let reference_case_name = assets
+        .body
+        .metadata()
+        .metadata
+        .case_names
+        .get(selected_case)
+        .cloned();
+
+    let (batch, mut base_pose) = if let Some(name) = reference_case_name.as_ref() {
+        if let Some(case) = assets.body.metadata().cases.iter().find(|c| &c.name == name) {
+            (case.pose_parameters.shape[0].max(1), case.pose_parameters.data.clone())
+        } else {
+            (1usize, Vec::new())
+        }
+    } else {
+        (1usize, Vec::new())
+    };
+
+    if base_pose.is_empty() {
+        base_pose = vec![0.0f64; bones * 16];
+        for bone in 0..bones {
+            let base = bone * 16;
+            base_pose[base] = 1.0;
+            base_pose[base + 5] = 1.0;
+            base_pose[base + 10] = 1.0;
+            base_pose[base + 15] = 1.0;
+        }
+    }
+
     let active = match *subject_mode {
         SubjectMode::Auto | SubjectMode::Random => auto_subject.current,
         _ => *subject_mode,
@@ -364,15 +723,20 @@ fn spawn_burn_human_when_ready(
 
     commands.spawn((
         BurnHumanInput {
-            case_name: assets
-                .body
-                .metadata()
-                .metadata
-                .case_names
-                .get(selected_case)
-                .cloned(),
-            phenotype_inputs: Some(vec![0.5; phenotype_len]),
+            case_name: reference_case_name.clone(),
+            phenotype_inputs: None,
             ..Default::default()
+        },
+        bevy_burn_human::BurnHumanMeshSettings {
+            cache_mesh: false,
+            ..Default::default()
+        },
+        BurnHumanRagdollRig {
+            bones,
+            batch,
+            base_pose,
+            bone_labels: assets.body.metadata().metadata.bone_labels.clone(),
+            reference_case_name,
         },
         MeshMaterial3d(std_materials.add(StandardMaterial {
             base_color: Color::srgb(0.95, 0.95, 0.95),
@@ -393,6 +757,7 @@ fn spawn_burn_human_when_ready(
             Visibility::Hidden
         },
         SubjectTag,
+        HumanSubjectTag,
         Name::new("burn_human_subject"),
     ));
 
@@ -4334,13 +4699,25 @@ const SUBJECT_RADIUS: f32 = 0.78;
 const HUMAN_SCALE: f32 = 1.15;
 const HUMAN_RADIUS: f32 = SUBJECT_RADIUS * HUMAN_SCALE;
 // Sized so the burn_human subject can read as being *inside* with a bit of clearance.
-const BALL_RADIUS: f32 = 1.05;
+const BALL_RADIUS: f32 = 1.15;
+// Human-in-ball placement: we want the human to *read* tangent to the ball surface,
+// but still fit entirely inside the sphere.
+//
+// Radial offset is toward the tube wall (along `subject_up`). Keep conservative.
+const HUMAN_IN_BALL_RADIAL_OFFSET: f32 = (BALL_RADIUS - HUMAN_RADIUS) * 0.55;
+// Body-axis offset moves the model along its own head↔feet axis.
+// Positive values move toward the head (assuming model +Y is "up").
+const HUMAN_IN_BALL_BODY_AXIS_OFFSET: f32 = 0.12;
 // Torus (doughnut) size. Keep it large enough that it doesn't read as
 // "smaller than the human" in some camera views.
 const DOUGHNUT_MAJOR: f32 = HUMAN_RADIUS * 1.05;
 const DOUGHNUT_MINOR: f32 = HUMAN_RADIUS * 0.33;
+// Conservative bound for keeping the torus mesh inside the tube.
+const DOUGHNUT_OUTER_RADIUS: f32 = DOUGHNUT_MAJOR + DOUGHNUT_MINOR;
 // Place the human slightly above the torus so it reads as "riding".
 const DOUGHNUT_RIDER_OFFSET: f32 = DOUGHNUT_MINOR * 0.85;
+// How long pose changes should take to visually settle.
+const POSE_TRANSITION_SEC: f32 = 0.75;
 const CONTACT_EPS: f32 = 0.01;
 const GRAVITY: f32 = 9.81;
 
@@ -4361,6 +4738,9 @@ struct TubeTag;
 
 #[derive(Component)]
 struct SubjectTag;
+
+#[derive(Component)]
+struct HumanSubjectTag;
 
 #[derive(Component)]
 struct DoughnutTag;
@@ -4409,8 +4789,8 @@ impl SubjectMode {
     }
 }
 
-const COLOR_SCHEME_COUNT: u32 = 11; // indices 0..=10
-const TEXTURE_PATTERN_COUNT: u32 = 13; // indices 0..=12
+const COLOR_SCHEME_COUNT: u32 = 10; // indices 0..=9
+const TEXTURE_PATTERN_COUNT: u32 = 10; // indices 0..=9
 
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
 enum ColorSchemeMode {
@@ -4423,7 +4803,6 @@ enum ColorSchemeMode {
     RandomGrey,
     Blue,
     Dynamic,
-    Fluid,
     Sun,
     Psychedelic,
     Neon,
@@ -4441,7 +4820,6 @@ impl ColorSchemeMode {
             ColorSchemeMode::RandomGrey => "Colors: random grey",
             ColorSchemeMode::Blue => "Colors: blue",
             ColorSchemeMode::Dynamic => "Colors: dynamic",
-            ColorSchemeMode::Fluid => "Colors: fluid",
             ColorSchemeMode::Sun => "Colors: sun",
             ColorSchemeMode::Psychedelic => "Colors: psychedelic",
             ColorSchemeMode::Neon => "Colors: neon",
@@ -4457,11 +4835,10 @@ impl ColorSchemeMode {
             3 => "random grey",
             4 => "blue",
             5 => "dynamic",
-            6 => "fluid",
-            7 => "sun",
-            8 => "psychedelic",
-            9 => "neon",
-            10 => "matrix",
+            6 => "sun",
+            7 => "psychedelic",
+            8 => "neon",
+            9 => "matrix",
             _ => "random grey",
         }
     }
@@ -4474,11 +4851,10 @@ impl ColorSchemeMode {
             3 => ColorSchemeMode::RandomGrey,
             4 => ColorSchemeMode::Blue,
             5 => ColorSchemeMode::Dynamic,
-            6 => ColorSchemeMode::Fluid,
-            7 => ColorSchemeMode::Sun,
-            8 => ColorSchemeMode::Psychedelic,
-            9 => ColorSchemeMode::Neon,
-            10 => ColorSchemeMode::Matrix,
+            6 => ColorSchemeMode::Sun,
+            7 => ColorSchemeMode::Psychedelic,
+            8 => ColorSchemeMode::Neon,
+            9 => ColorSchemeMode::Matrix,
             _ => ColorSchemeMode::RandomGrey,
         }
     }
@@ -4493,9 +4869,6 @@ enum TexturePatternMode {
     Swirl,
     StripeWire,
     SwirlWire,
-    Fluid,
-    FluidStripe,
-    FluidSwirl,
     Wave,
     Fractal,
     Particle,
@@ -4695,9 +5068,6 @@ impl TexturePatternMode {
             TexturePatternMode::Swirl => "Texture: swirl",
             TexturePatternMode::StripeWire => "Texture: stripe (wire)",
             TexturePatternMode::SwirlWire => "Texture: swirl (wire)",
-            TexturePatternMode::Fluid => "Texture: fluid",
-            TexturePatternMode::FluidStripe => "Texture: fluid stripe",
-            TexturePatternMode::FluidSwirl => "Texture: fluid swirl",
             TexturePatternMode::Wave => "Texture: wave",
             TexturePatternMode::Fractal => "Texture: fractal",
             TexturePatternMode::Particle => "Texture: particle",
@@ -4713,15 +5083,12 @@ impl TexturePatternMode {
             1 => "swirl",
             2 => "stripe wire",
             3 => "swirl wire",
-            4 => "fluid",
-            5 => "fluid stripe",
-            6 => "fluid swirl",
-            7 => "wave",
-            8 => "fractal",
-            9 => "particle",
-            10 => "grid",
-            11 => "hoop",
-            12 => "hoop-alt",
+            4 => "wave",
+            5 => "fractal",
+            6 => "particle",
+            7 => "grid",
+            8 => "hoop",
+            9 => "hoop-alt",
             _ => "stripe",
         }
     }
@@ -4732,15 +5099,12 @@ impl TexturePatternMode {
             1 => TexturePatternMode::Swirl,
             2 => TexturePatternMode::StripeWire,
             3 => TexturePatternMode::SwirlWire,
-            4 => TexturePatternMode::Fluid,
-            5 => TexturePatternMode::FluidStripe,
-            6 => TexturePatternMode::FluidSwirl,
-            7 => TexturePatternMode::Wave,
-            8 => TexturePatternMode::Fractal,
-            9 => TexturePatternMode::Particle,
-            10 => TexturePatternMode::Grid,
-            11 => TexturePatternMode::HoopWire,
-            12 => TexturePatternMode::HoopAlt,
+            4 => TexturePatternMode::Wave,
+            5 => TexturePatternMode::Fractal,
+            6 => TexturePatternMode::Particle,
+            7 => TexturePatternMode::Grid,
+            8 => TexturePatternMode::HoopWire,
+            9 => TexturePatternMode::HoopAlt,
             _ => TexturePatternMode::Stripe,
         }
     }
@@ -4967,8 +5331,8 @@ impl AutoTubeStyleState {
 
     fn pick_next_wire_pattern(&mut self) {
         // Keep this list aligned with wire-capable patterns.
-        // (StripeWire=2, SwirlWire=3, HoopWire=11)
-        const WIRE: [u32; 3] = [2, 3, 11];
+        // (StripeWire=2, SwirlWire=3, HoopWire=8)
+        const WIRE: [u32; 3] = [2, 3, 8];
 
         let prev = self.pattern_current % TEXTURE_PATTERN_COUNT;
         let mut next = prev;
@@ -5308,6 +5672,9 @@ struct SubjectDynamics {
     human_vr: f32,
     human_roll: f32,
     human_pitch: f32,
+    vehicle_roll: f32,
+    vehicle_pitch: f32,
+    human_hit_impulse: f32,
     ball_r: f32,
     ball_vr: f32,
     ball_roll: f32,
@@ -5325,6 +5692,9 @@ impl Default for SubjectDynamics {
             human_vr: 0.0,
             human_roll: 0.0,
             human_pitch: 0.0,
+            vehicle_roll: 0.0,
+            vehicle_pitch: 0.0,
+            human_hit_impulse: 0.0,
             ball_r: ball_r_max - CONTACT_EPS,
             ball_vr: 0.0,
             ball_roll: 0.0,
@@ -5828,26 +6198,6 @@ pub fn main() {
                 BurnHumanSource::Preloaded(_) => {
                     eprintln!("[mcbaise] assets self-test ok (preloaded)");
                 }
-                BurnHumanSource::AssetPath(meta_path) => {
-                    let raw = std::path::PathBuf::from(&meta_path);
-                    let candidate = if exists_file(&raw) {
-                        raw
-                    } else {
-                        std::path::PathBuf::from("assets").join(&meta_path)
-                    };
-
-                    if exists_file(&candidate) {
-                        eprintln!("[mcbaise] assets self-test ok (asset pipeline)");
-                        eprintln!("[mcbaise] meta:   {}", candidate.display());
-                    } else {
-                        eprintln!(
-                            "[mcbaise] assets self-test: meta asset path does not exist on disk: {meta_path}"
-                        );
-                    }
-                }
-                BurnHumanSource::Asset(_) => {
-                    eprintln!("[mcbaise] assets self-test ok (asset pipeline handle)");
-                }
             }
         }
 
@@ -5882,13 +6232,6 @@ pub fn main() {
                     }
                     BurnHumanSource::Preloaded(_) => {
                         eprintln!("[mcbaise] assets preflight ok (preloaded)");
-                    }
-                    BurnHumanSource::AssetPath(meta_path) => {
-                        eprintln!("[mcbaise] assets preflight ok (asset pipeline)");
-                        eprintln!("[mcbaise] meta:   {meta_path}");
-                    }
-                    BurnHumanSource::Asset(_) => {
-                        eprintln!("[mcbaise] assets preflight ok (asset pipeline handle)");
                     }
                 }
             }
@@ -6227,12 +6570,14 @@ pub fn main() {
         .init_resource::<AutoBallAppearanceState>()
         .init_resource::<SubjectDynamics>()
         .init_resource::<SubjectNormalsComputed>()
-        .init_resource::<FluidSimulation>()
         .init_resource::<MultiView>()
         .init_resource::<MultiViewHint>()
         .init_resource::<EguiCaptureState>()
         .init_resource::<RenderScale>()
         .add_plugins(plugins);
+
+    #[cfg(feature = "burn_human")]
+    app.init_resource::<HumanDeformMode>();
 
         // Diagnostic: optionally skip PBR-related plugins for isolation testing.
         // If `MCBAISE_DISABLE_PBR=1` is set, do not register the wireframe/material/burn plugins.
@@ -6264,14 +6609,17 @@ pub fn main() {
         .add_systems(Update, sync_view_cameras)
         .add_systems(Update, update_multiview_viewports.after(sync_view_cameras))
         .add_systems(Update, ensure_subject_normals)
-        .add_systems(Update, update_fluid_simulation)
         .add_systems(Update, update_tube_and_subject)
             .add_systems(Update, apply_subject_mode)
             .add_systems(Update, enforce_burn_human_subject_mode.before(apply_subject_mode))
+        .add_systems(Update, update_subject_appearance.after(apply_subject_mode))
         .add_systems(Update, update_overlays)
         .add_systems(EguiPrimaryContextPass, ui_overlay);
     #[cfg(feature = "burn_human")]
     app.add_systems(Update, spawn_burn_human_when_ready);
+
+    #[cfg(feature = "burn_human")]
+    app.add_systems(Update, drive_burn_human_ragdoll.after(update_tube_and_subject));
     
     #[cfg(all(not(target_arch = "wasm32"), feature = "capture_ui"))]
     {
@@ -8125,50 +8473,6 @@ fn setup_scene(
 
     let tube_mat = tube_materials.add(TubeMaterial::default());
 
-    // Create initial fluid textures (will be updated by fluid simulation)
-    let fluid_size = 64;
-    let mut velocity_data = Vec::with_capacity(fluid_size * fluid_size * 4);
-    let mut density_data = Vec::with_capacity(fluid_size * fluid_size * 4);
-
-    for _ in 0..(fluid_size * fluid_size) {
-        // Initial neutral values
-        velocity_data.extend_from_slice(&[128, 128, 0, 255]); // RG = (0.5, 0.5) for neutral velocity
-        density_data.extend_from_slice(&[128, 128, 128, 255]); // Gray for neutral density
-    }
-
-    let velocity_texture = Image::new(
-        Extent3d {
-            width: fluid_size as u32,
-            height: fluid_size as u32,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        velocity_data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-
-    let density_texture = Image::new(
-        Extent3d {
-            width: fluid_size as u32,
-            height: fluid_size as u32,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        density_data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-
-    let velocity_handle = images.add(velocity_texture);
-    let density_handle = images.add(density_texture);
-
-    // Update tube material with initial fluid textures
-    if let Some(material) = tube_materials.get_mut(&tube_mat) {
-        material.fluid_velocity = Some(velocity_handle);
-        material.fluid_density = Some(density_handle);
-    }
-
     commands.spawn((
         Mesh3d(tube_mesh),
         MeshMaterial3d(tube_mat.clone()),
@@ -9859,12 +10163,6 @@ fn restart_scene_system(mut p: RestartSceneParams, frame: Res<GlobalFrameCount>)
 
     let mut drops = PendingRenderAssetDrops::default();
     for (_h, mat) in p.tube_materials.iter() {
-        if let Some(h) = &mat.fluid_velocity {
-            drops.images.push(h.clone());
-        }
-        if let Some(h) = &mat.fluid_density {
-            drops.images.push(h.clone());
-        }
     }
     for (_h, mat) in p.std_materials.iter() {
         if let Some(h) = &mat.base_color_texture {
@@ -10051,142 +10349,6 @@ fn subject_mesh_has_usable_normals(mesh: &Mesh) -> bool {
         }),
         _ => true,
     }
-}
-
-fn update_fluid_simulation(
-    time: Res<Time>,
-    mut fluid_sim: ResMut<FluidSimulation>,
-    mut images: ResMut<Assets<Image>>,
-    tube_scene: Res<TubeScene>,
-    mut tube_materials: ResMut<Assets<TubeMaterial>>,
-    playback: Res<Playback>,
-) {
-    // Update fluid simulation
-    fluid_sim.update(time.delta_secs(), playback.time_sec);
-
-    // If fluid textures are not enabled, do not allocate GPU textures yet.
-    // The simulation still advances (so enabling later will be smooth), but
-    // we avoid creating `Image` assets until the feature is enabled.
-    if !fluid_sim.enabled {
-        return;
-    }
-
-    // Create or update velocity texture (create-once, then update data)
-    let velocity_image = create_fluid_texture(
-        &fluid_sim.velocity_field,
-        fluid_sim.width,
-        fluid_sim.height,
-        true,
-    );
-    let velocity_handle = if let Some(handle) = &fluid_sim.velocity_handle {
-        if let Some(img) = images.get_mut(handle) {
-            img.data = velocity_image.data;
-            Some(handle.clone())
-        } else {
-            let h = images.add(velocity_image);
-            fluid_sim.velocity_handle = Some(h.clone());
-            Some(h)
-        }
-    } else {
-        let h = images.add(velocity_image);
-        fluid_sim.velocity_handle = Some(h.clone());
-        Some(h)
-    };
-
-    // Create or update density texture (create-once, then update data)
-    let density_image = create_fluid_texture_density(&fluid_sim.density_field, fluid_sim.width, fluid_sim.height);
-    let density_handle = if let Some(handle) = &fluid_sim.density_handle {
-        if let Some(img) = images.get_mut(handle) {
-            img.data = density_image.data;
-            Some(handle.clone())
-        } else {
-            let h = images.add(density_image);
-            fluid_sim.density_handle = Some(h.clone());
-            Some(h)
-        }
-    } else {
-        let h = images.add(density_image);
-        fluid_sim.density_handle = Some(h.clone());
-        Some(h)
-    };
-
-    // Update tube material with fluid textures
-    if let Some(material) = tube_materials.get_mut(&tube_scene.tube_material) {
-        material.fluid_velocity = velocity_handle.clone();
-        material.fluid_density = density_handle.clone();
-    }
-}
-
-fn create_fluid_texture(
-    velocity_field: &[Vec2],
-    width: usize,
-    height: usize,
-    is_velocity: bool,
-) -> Image {
-    let mut data = Vec::with_capacity(width * height * 4);
-
-    for &vel in velocity_field {
-        if is_velocity {
-            // Store velocity as RG channels, BA as zero
-            let r = ((vel.x * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            let g = ((vel.y * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            data.extend_from_slice(&[r, g, 0, 255]);
-        } else {
-            // For density, store as grayscale
-            let gray = ((vel.x * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            data.extend_from_slice(&[gray, gray, gray, 255]);
-        }
-    }
-
-    let mut img = Image::new(
-        Extent3d {
-            width: width as u32,
-            height: height as u32,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    // Label the fluid texture for clearer wgpu logs.
-    let _ = match &mut img.texture_descriptor.label {
-        Some(_) => {
-            img.texture_descriptor.label = Some(if is_velocity { "fluid_velocity" } else { "fluid_generic" });
-            true
-        }
-        None => false,
-    };
-    img
-}
-
-fn create_fluid_texture_density(density_field: &[f32], width: usize, height: usize) -> Image {
-    let mut data = Vec::with_capacity(width * height * 4);
-
-    for &density in density_field {
-        let gray = (density.clamp(0.0, 1.0) * 255.0) as u8;
-        data.extend_from_slice(&[gray, gray, gray, 255]);
-    }
-
-    let mut img = Image::new(
-        Extent3d {
-            width: width as u32,
-            height: height as u32,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        data,
-        TextureFormat::Rgba8Unorm,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    let _ = match &mut img.texture_descriptor.label {
-        Some(_) => {
-            img.texture_descriptor.label = Some("fluid_density");
-            true
-        }
-        None => false,
-    };
-    img
 }
 
 fn compute_smooth_normals(mesh: &mut Mesh) -> bool {
@@ -10507,6 +10669,8 @@ fn native_controls(
     _native_mpv: Option<Res<NativeMpvSync>>,
     mut readback: ResMut<GpuReadbackImage>,
     mut images: ResMut<Assets<Image>>,
+    #[cfg(feature = "burn_human")]
+    mut human_deform_mode: ResMut<HumanDeformMode>,
     #[cfg(feature = "capture_ui")]
     mut capture_state_opt: Option<ResMut<EguiCaptureState>>,
 ) {
@@ -10568,31 +10732,11 @@ fn native_controls(
         }
         *camera_preset = choices[(idx + 1) % choices.len()].0;
     }
-    if keys.just_pressed(KeyCode::ArrowUp) {
-        #[cfg(feature = "native-youtube")]
-        {
-            if _native_youtube
-                .as_ref()
-                .map(|yt| yt.enabled)
-                .unwrap_or(false)
-            {
-                return;
-            }
-        }
-        playback.speed = (playback.speed + 0.25).clamp(0.25, 3.0);
-    }
-    if keys.just_pressed(KeyCode::ArrowDown) {
-        #[cfg(feature = "native-youtube")]
-        {
-            if _native_youtube
-                .as_ref()
-                .map(|yt| yt.enabled)
-                .unwrap_or(false)
-            {
-                return;
-            }
-        }
-        playback.speed = (playback.speed - 0.25).clamp(0.25, 3.0);
+    #[cfg(feature = "burn_human")]
+    if keys.just_pressed(KeyCode::Digit4) {
+        let next = human_deform_mode.next();
+        *human_deform_mode = next;
+        eprintln!("[mcbaise] {}", next.label());
     }
 
     // One-shot PNG capture: press `P` to write a single frame PNG to .tmp/readback_<ts>/
@@ -10897,9 +11041,12 @@ fn update_tube_and_subject(
     let t = playback.time_sec;
 
     // Keep smoothing behavior consistent across frame rates.
-    let dt = time.delta_secs().min(0.1);
-    let pos_alpha = 1.0 - (-12.0 * dt).exp();
-    let rot_alpha = 1.0 - (-12.0 * dt).exp();
+    // Treat pause as pausing the simulation timeline, but still allow user-driven
+    // state changes (egui comboboxes) to re-render immediately.
+    let dt_frame = time.delta_secs().min(0.1);
+    let dt = if playback.playing { dt_frame } else { 0.0 };
+    let pos_alpha = 1.0 - (-12.0 * dt_frame).exp();
+    let rot_alpha = 1.0 - (-12.0 * dt_frame).exp();
 
     // Resolve tube style (colors/texture) from explicit / auto timeline / random.
     let scheme = match *scheme_mode {
@@ -10918,11 +11065,10 @@ fn update_tube_and_subject(
         ColorSchemeMode::RandomGrey => 3,
         ColorSchemeMode::Blue => 4,
         ColorSchemeMode::Dynamic => 5,
-        ColorSchemeMode::Fluid => 6,
-        ColorSchemeMode::Sun => 7,
-        ColorSchemeMode::Psychedelic => 8,
-        ColorSchemeMode::Neon => 9,
-        ColorSchemeMode::Matrix => 10,
+        ColorSchemeMode::Sun => 6,
+        ColorSchemeMode::Psychedelic => 7,
+        ColorSchemeMode::Neon => 8,
+        ColorSchemeMode::Matrix => 9,
     };
 
     let pattern = match *pattern_mode {
@@ -10933,7 +11079,7 @@ fn update_tube_and_subject(
                     auto_style.schedule_next_auto_wire_pattern_switch();
                 }
                 let p = auto_style.pattern_current % TEXTURE_PATTERN_COUNT;
-                if p != 2 && p != 3 && p != 11 {
+                if p != 2 && p != 3 && p != 8 {
                     auto_style.pick_next_wire_pattern();
                     auto_style.schedule_next_auto_wire_pattern_switch();
                 }
@@ -10961,26 +11107,15 @@ fn update_tube_and_subject(
         TexturePatternMode::Swirl => 1,
         TexturePatternMode::StripeWire => 2,
         TexturePatternMode::SwirlWire => 3,
-        TexturePatternMode::Fluid => 4,
-        TexturePatternMode::FluidStripe => 5,
-        TexturePatternMode::FluidSwirl => 6,
-        TexturePatternMode::Wave => 7,
-        TexturePatternMode::Fractal => 8,
-        TexturePatternMode::Particle => 9,
-        TexturePatternMode::Grid => 10,
-        TexturePatternMode::HoopWire => 11,
-        TexturePatternMode::HoopAlt => 12,
+        TexturePatternMode::Wave => 4,
+        TexturePatternMode::Fractal => 5,
+        TexturePatternMode::Particle => 6,
+        TexturePatternMode::Grid => 7,
+        TexturePatternMode::HoopWire => 8,
+        TexturePatternMode::HoopAlt => 9,
     };
 
-    // If color scheme is fluid, force fluid pattern only in Auto/Random texture modes.
-    // Explicit/manual selection (e.g. Digit2) should be honored.
-    let final_pattern = if scheme == 6
-        && matches!(*pattern_mode, TexturePatternMode::Auto | TexturePatternMode::Random)
-    {
-        4
-    } else {
-        pattern
-    };
+    let final_pattern = pattern;
 
     if auto_style.scheme_current != scheme {
         auto_style.scheme_current = scheme;
@@ -11079,7 +11214,7 @@ fn update_tube_and_subject(
     if mode_changed {
         auto_cam.mode_since_sec = 0.0;
     } else {
-        auto_cam.mode_since_sec += dt;
+        auto_cam.mode_since_sec += dt_frame;
     }
 
     // Passing modes need a stable camera anchor so the subject can pass through frame.
@@ -11099,7 +11234,7 @@ fn update_tube_and_subject(
     }
 
     if selected_camera_mode.is_passing() {
-        auto_cam.pass_reanchor_since_sec += dt;
+        auto_cam.pass_reanchor_since_sec += dt_frame;
         // Roughly once every few seconds, re-anchor to the current progress.
         if auto_cam.pass_reanchor_since_sec >= 3.0 {
             let lead_u = 0.010;
@@ -11196,7 +11331,18 @@ fn update_tube_and_subject(
     // Use effective acceleration (gravity - inertial) so loops push/pull on the contact.
     let a_out = eff_acc.dot(offset);
 
-    let human_r_max = (TUBE_RADIUS - HUMAN_RADIUS).max(0.25);
+    // Keep the *entire* visible subject inside the tube.
+    // For doughnut modes we need more clearance than the human's bounding radius.
+    let subject_clearance_r = match active_subject_mode {
+        SubjectMode::HumanDoughnut => {
+            // Human is offset outward on top of the torus.
+            DOUGHNUT_OUTER_RADIUS.max(DOUGHNUT_RIDER_OFFSET + HUMAN_RADIUS)
+        }
+        SubjectMode::Doughnut => DOUGHNUT_OUTER_RADIUS,
+        _ => HUMAN_RADIUS,
+    };
+
+    let human_r_max = (TUBE_RADIUS - subject_clearance_r).max(0.25);
     let human_r_rest = (human_r_max - CONTACT_EPS).max(0.25);
     let k_h = 90.0;
     let c_h = 14.0;
@@ -11221,6 +11367,12 @@ fn update_tube_and_subject(
         let vr_flip = human_vr_prev > 0.6 && dyns.human_vr < -0.1;
         let r_advanced = dyns.human_r > human_r_prev;
         human_hit_wall = near_wall && vr_flip && r_advanced;
+    }
+
+    // Decaying impulse used to drive ragdoll-ish animation.
+    dyns.human_hit_impulse = (dyns.human_hit_impulse - dt * 2.0).max(0.0);
+    if human_hit_wall {
+        dyns.human_hit_impulse = (dyns.human_hit_impulse + 1.0).min(2.0);
     }
 
     let ball_r_max = (TUBE_RADIUS - BALL_RADIUS).max(0.25);
@@ -11334,11 +11486,8 @@ fn update_tube_and_subject(
         other => pose_targets(other),
     };
 
-    let posture_rate = if matches!(*pose_mode, PoseMode::Auto | PoseMode::Random) {
-        16.0
-    } else {
-        14.0
-    };
+    // Exponential smoothing: choose a rate so a step change reaches ~95% within POSE_TRANSITION_SEC.
+    let posture_rate = (-(0.05f32).ln()) / POSE_TRANSITION_SEC.max(1e-3);
     let posture_alpha = 1.0 - (-posture_rate * dt).exp();
     dyns.human_roll = dyns
         .human_roll
@@ -11349,6 +11498,18 @@ fn update_tube_and_subject(
         .lerp(posture_pitch_target, posture_alpha)
         .clamp(-1.2, 1.2);
 
+    // Vehicle (doughnut) pose: match the same tube-wall-relative pose, but slightly damped.
+    let vehicle_roll_target = posture_roll_target * 0.90;
+    let vehicle_pitch_target = posture_pitch_target * 0.90;
+    dyns.vehicle_roll = dyns
+        .vehicle_roll
+        .lerp(vehicle_roll_target, posture_alpha)
+        .clamp(-2.2, 2.2);
+    dyns.vehicle_pitch = dyns
+        .vehicle_pitch
+        .lerp(vehicle_pitch_target, posture_alpha)
+        .clamp(-1.2, 1.2);
+
     // Roll about the direction of travel, pitch about the across-surface axis.
     let human_posture = Quat::from_axis_angle(subject_forward, dyns.human_roll)
         * Quat::from_axis_angle(subject_around, dyns.human_pitch);
@@ -11356,6 +11517,11 @@ fn update_tube_and_subject(
     // don't end up watching the character's back the whole ride.
     let human_facing_fix = Quat::from_axis_angle(subject_up, std::f32::consts::PI);
     let desired_human_rot = human_facing_fix * (human_posture * desired_rot);
+
+    // Doughnut pose: it has "sides" too, so it should tilt/roll with the selected pose.
+    let doughnut_pose = Quat::from_axis_angle(subject_forward, dyns.vehicle_roll)
+        * Quat::from_axis_angle(subject_around, dyns.vehicle_pitch);
+    let desired_doughnut_rot = doughnut_pose * desired_rot;
 
     // Ball rolling: integrate roll based on surface speed.
     let v_ball = v_center + tube_wall_tangent * (dyns.omega * dyns.ball_r);
@@ -11377,11 +11543,6 @@ fn update_tube_and_subject(
     }
     let desired_ball_rot = Quat::from_axis_angle(ball_roll_axis, dyns.ball_roll) * desired_rot;
 
-    // Couple vehicle orientation to the human's posture/impact so composite modes read
-    // as a single system (rider + vehicle) instead of two independent animations.
-    let vehicle_perturb = Quat::from_axis_angle(subject_forward, dyns.human_roll * 0.28)
-        * Quat::from_axis_angle(subject_around, dyns.human_pitch * 0.28);
-
     for (mut tr, is_doughnut) in &mut subject {
         // Doughnut is the vehicle mesh; human is the rider mesh.
         let is_doughnut = is_doughnut.is_some();
@@ -11391,7 +11552,7 @@ fn update_tube_and_subject(
             // offset the human slightly outward so it reads as "riding".
             SubjectMode::HumanDoughnut => {
                 if is_doughnut {
-                    (subject_pos_human, vehicle_perturb * desired_rot)
+                    (subject_pos_human, desired_doughnut_rot)
                 } else {
                     // "Riding" placement: keep the doughnut on the track and lift the
                     // human slightly outward so it sits on top of the ring.
@@ -11400,21 +11561,31 @@ fn update_tube_and_subject(
             }
 
             // Composite: show both human + ball; keep them co-located at the ball path.
-            // Human gets an extra spin so it reads as being "inside" the ball.
+            // Human should follow the ball's rolling frame so extremities read tangent to
+            // the ball surface (not spinning around an unrelated axis).
             SubjectMode::HumanBall => {
                 if is_doughnut {
                     // Hide doughnut in this mode (visibility system does this too), but keep a sane target.
                     (subject_pos_human, desired_rot)
                 } else {
-                    let spin = Quat::from_axis_angle(subject_up, (t * 1.8).rem_euclid(std::f32::consts::TAU));
-                    (subject_pos_ball, (vehicle_perturb * desired_ball_rot) * spin)
+                    // Apply the same facing correction used in human modes.
+                    let desired_human_in_ball_rot = human_facing_fix * desired_ball_rot;
+                    // Offset toward the tube wall so the body reads as tangent to the ball surface.
+                    // Additionally, shift along the model's head/feet axis to keep extremities inside.
+                    let radial = HUMAN_IN_BALL_RADIAL_OFFSET.max(0.0);
+                    let body_axis = (desired_human_in_ball_rot * Vec3::Y).normalize_or_zero();
+                    let body_axis_offset = HUMAN_IN_BALL_BODY_AXIS_OFFSET;
+                    (
+                        subject_pos_ball + subject_up * radial + body_axis * body_axis_offset,
+                        desired_human_in_ball_rot,
+                    )
                 }
             }
 
             // Single-subject modes.
             SubjectMode::Doughnut => {
                 if is_doughnut {
-                    (subject_pos_human, desired_rot)
+                    (subject_pos_human, desired_doughnut_rot)
                 } else {
                     (subject_pos_human, desired_human_rot)
                 }
@@ -11453,7 +11624,7 @@ fn update_tube_and_subject(
 
     if let Ok(mut tr) = ball.single_mut() {
         let mut desired = if active_subject_mode == SubjectMode::HumanBall {
-            vehicle_perturb * desired_ball_rot
+            desired_ball_rot
         } else {
             desired_ball_rot
         };
@@ -11473,6 +11644,12 @@ fn update_tube_and_subject(
         let target = active_pos + subject_up * 0.9 - subject_forward * 0.6;
         light_tr.translation = light_tr.translation.lerp(target, pos_alpha);
     }
+
+    let effective_pose_mode = match *pose_mode {
+        PoseMode::Auto | PoseMode::Random => auto_pose.current,
+        other => other,
+    };
+    let pose_is_back = matches!(effective_pose_mode, PoseMode::Back);
 
     let random_subject_distance = if *camera_preset == CameraPreset::Random {
         Some(auto_cam.subject_distance)
@@ -11495,6 +11672,7 @@ fn update_tube_and_subject(
         selected_camera_mode,
         active_subject_mode,
         auto_cam.mode_since_sec,
+        pose_is_back,
         random_subject_distance,
         pass_anchor,
         cam_center,
@@ -11759,7 +11937,7 @@ fn update_subject_appearance(
     mut materials: ResMut<Assets<StandardMaterial>>,
     human_mat: Query<
         (Entity, &MeshMaterial3d<StandardMaterial>),
-        (With<SubjectTag>, Without<BallTag>),
+        (With<HumanSubjectTag>, Without<DoughnutTag>, Without<BallTag>),
     >,
     ball_mat: Query<(Entity, &MeshMaterial3d<StandardMaterial>), With<BallTag>>,
 ) {
@@ -13591,25 +13769,12 @@ fn ui_overlay(
                             if ui
                                 .selectable_value(
                                     &mut *scheme_mode,
-                                    ColorSchemeMode::Fluid,
-                                    ColorSchemeMode::Fluid.label(),
-                                )
-                                .clicked()
-                            {
-                                settings.scheme = 6;
-                                settings.pattern = 4; // Automatically switch to fluid pattern
-                                *pattern_mode = TexturePatternMode::Fluid;
-                            }
-
-                            if ui
-                                .selectable_value(
-                                    &mut *scheme_mode,
                                     ColorSchemeMode::Sun,
                                     ColorSchemeMode::Sun.label(),
                                 )
                                 .clicked()
                             {
-                                settings.scheme = 7;
+                                settings.scheme = 6;
                             }
                             if ui
                                 .selectable_value(
@@ -13619,7 +13784,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.scheme = 8;
+                                settings.scheme = 7;
                             }
 
                             if ui
@@ -13630,7 +13795,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.scheme = 9;
+                                settings.scheme = 8;
                             }
 
                             if ui
@@ -13641,7 +13806,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.scheme = 10;
+                                settings.scheme = 9;
                             }
                         });
 
@@ -13719,44 +13884,12 @@ fn ui_overlay(
                             if ui
                                 .selectable_value(
                                     &mut *pattern_mode,
-                                    TexturePatternMode::Fluid,
-                                    TexturePatternMode::Fluid.label(),
-                                )
-                                .clicked()
-                            {
-                                settings.pattern = 4;
-                            }
-
-                            if ui
-                                .selectable_value(
-                                    &mut *pattern_mode,
-                                    TexturePatternMode::FluidStripe,
-                                    TexturePatternMode::FluidStripe.label(),
-                                )
-                                .clicked()
-                            {
-                                settings.pattern = 5;
-                            }
-
-                            if ui
-                                .selectable_value(
-                                    &mut *pattern_mode,
-                                    TexturePatternMode::FluidSwirl,
-                                    TexturePatternMode::FluidSwirl.label(),
-                                )
-                                .clicked()
-                            {
-                                settings.pattern = 6;
-                            }
-                            if ui
-                                .selectable_value(
-                                    &mut *pattern_mode,
                                     TexturePatternMode::Wave,
                                     TexturePatternMode::Wave.label(),
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 7;
+                                settings.pattern = 4;
                             }
 
                             if ui
@@ -13767,7 +13900,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 8;
+                                settings.pattern = 5;
                             }
 
                             if ui
@@ -13778,7 +13911,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 9;
+                                settings.pattern = 6;
                             }
 
                             if ui
@@ -13789,7 +13922,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 10;
+                                settings.pattern = 7;
                             }
                             if ui
                                 .selectable_value(
@@ -13799,7 +13932,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 11;
+                                settings.pattern = 8;
                             }
                             if ui
                                 .selectable_value(
@@ -13809,7 +13942,7 @@ fn ui_overlay(
                                 )
                                 .clicked()
                             {
-                                settings.pattern = 12;
+                                settings.pattern = 9;
                             }
                         });
                 });
@@ -14051,8 +14184,6 @@ fn ui_overlay(
                                 ui.label(label_style("Space")); ui.label(desc_style("Toggle Playback")); ui.end_row();
                                 ui.label(label_style("1")); ui.label(desc_style("Cycle Color Scheme")); ui.end_row();
                                 ui.label(label_style("2")); ui.label(desc_style("Cycle Texture Pattern")); ui.end_row();
-                                ui.label(label_style("Arrow Up")); ui.label(desc_style("Increase Playback Speed")); ui.end_row();
-                                ui.label(label_style("Arrow Down")); ui.label(desc_style("Decrease Playback Speed")); ui.end_row();
                                 ui.label(label_style("F5")); ui.label(desc_style("Capture PNG (One-shot)")); ui.end_row();
                                 ui.label(label_style("F6")); ui.label(desc_style("Toggle GIF Recording")); ui.end_row();
                                 ui.label(label_style("ESC")); ui.label(desc_style("Close this overlay")); ui.end_row();
@@ -14481,6 +14612,7 @@ fn camera_pose(
     selected_mode: CameraMode,
     subject_mode: SubjectMode,
     mode_age_sec: f32,
+    pose_is_back: bool,
     random_subject_distance: Option<f32>,
     pass_anchor: Option<(Vec3, Vec3, Vec3, Vec3)>,
     cam_center: Vec3,
@@ -14523,9 +14655,44 @@ fn camera_pose(
     let over_look = cam_center;
     let over_up = cam_tangent.cross(cam_n).normalize_or_zero();
 
-    let back_pos = cam_center + cam_tangent * -12.0 + cam_n * 1.2;
-    let back_look = cam_center + cam_tangent * 3.0;
+    // Back camera:
+    // - briefly "looks back" from the direction the subject is moving (camera ahead of subject)
+    // - then pulls farther ahead and holds a wider framing so we can see both subject and the
+    //   tube receding away from the viewer.
     let back_up = cam_n;
+    let back_hold_sec = 0.65;
+    let back_pull_sec = 1.35;
+    let back_t = ((mode_age_sec - back_hold_sec) / back_pull_sec).clamp(0.0, 1.0);
+    let back_t = back_t * back_t * (3.0 - 2.0 * back_t); // smoothstep
+
+    // Camera is ahead of subject (along +tangent), looking back down the tube (-tangent).
+    let close_ahead = 2.2;
+    let far_ahead = 8.2;
+    let close_side = 0.35;
+    let far_side = 0.75;
+    let close_up = 0.95;
+    let far_up = 1.35;
+
+    // If the subject Pose is "Back", give the shot a touch more room.
+    let pose_room = if pose_is_back { 1.12 } else { 1.0 };
+
+    let back_pos_close = target_pos
+        + subject_tangent * (close_ahead * pose_room)
+        + cam_b * close_side
+        + cam_n * close_up;
+    let back_pos_far = target_pos
+        + subject_tangent * (far_ahead * pose_room)
+        + cam_b * far_side
+        + cam_n * far_up;
+
+    // Look far enough past the subject so the tube reads as receding.
+    let look_past_close = 10.0;
+    let look_past_far = 22.0;
+    let back_look_close = target_pos - subject_tangent * look_past_close;
+    let back_look_far = target_pos - subject_tangent * look_past_far;
+
+    let back_pos = back_pos_close.lerp(back_pos_far, back_t);
+    let back_look = back_look_close.lerp(back_look_far, back_t);
 
     // Keep the chase camera stable in the tube frame.
     // If we offset using subject_up, the camera orbits with the rider/ball and it can feel like
@@ -14724,10 +14891,7 @@ fn camera_pose(
     // Only apply to the modes intended to feature the subject.
     if !in_intro {
         match selected_mode {
-            CameraMode::BallChase
-            | CameraMode::Back
-            | CameraMode::FocusedChase
-            | CameraMode::FocusedSide => {
+            CameraMode::BallChase | CameraMode::FocusedChase | CameraMode::FocusedSide => {
                 let desired_dist = match selected_mode {
                     CameraMode::FocusedChase | CameraMode::FocusedSide => focused_dist,
                     _ => random_subject_distance.unwrap_or(5.0),
@@ -15070,400 +15234,12 @@ fn build_torus_mesh(
     mesh
 }
 
-// ---------------------------- fluid simulation ----------------------------
-
-#[derive(Resource)]
-struct FluidSimulation {
-    wave_field: Vec<f32>,      // Current wave amplitude
-    wave_prev: Vec<f32>,       // Previous wave amplitude
-    wave2_field: Vec<f32>,     // Second coupled wave
-    wave2_prev: Vec<f32>,      // Previous second wave
-    velocity_field: Vec<Vec2>, // Derived velocity from waves
-    density_field: Vec<f32>,   // Density derived from waves
-    width: usize,
-    height: usize,
-    time: f32,
-    frame: u32,
-    // Whether the fluid feature is enabled (controls lazy creation of GPU textures)
-    enabled: bool,
-    velocity_handle: Option<bevy::prelude::Handle<Image>>,
-    density_handle: Option<bevy::prelude::Handle<Image>>,
-}
-
-impl Default for FluidSimulation {
-    fn default() -> Self {
-        let width = 64;
-        let height = 64;
-        let size = width * height;
-
-        let mut wave_field = vec![0.0; size];
-        let mut wave_prev = vec![0.0; size];
-        let mut wave2_field = vec![0.0; size];
-        let mut wave2_prev = vec![0.0; size];
-        let mut velocity_field = Vec::new();
-        let mut density_field = Vec::new();
-
-        // Initialize wave packets like in the shader
-        for y in 0..height {
-            for x in 0..width {
-                let idx = y * width + x;
-                let coord = Vec2::new(x as f32, y as f32);
-                let center = Vec2::new(width as f32 / 2.0, height as f32 / 2.0);
-                let center2 = Vec2::new(width as f32 / 3.0, height as f32 / 3.0);
-
-                // Wave packet initialization
-                let dist1 = (coord - center).length();
-                let dist2 = (coord - center2).length();
-
-                let k1 = (dist1 * 0.1).cos() * (-dist1 * dist1 * 0.01).exp();
-                let k2 = (dist2 * 0.1).cos() * (-dist2 * dist2 * 0.01).exp();
-
-                wave_field[idx] = k1;
-                wave_prev[idx] = k1;
-                wave2_field[idx] = k2;
-                wave2_prev[idx] = k2;
-
-                // Initialize derived fields
-                velocity_field.push(Vec2::ZERO);
-                density_field.push(0.5);
-            }
-        }
-
-        Self {
-            wave_field,
-            wave_prev,
-            wave2_field,
-            wave2_prev,
-            velocity_field,
-            density_field,
-            width,
-            height,
-            time: 0.0,
-            frame: 0,
-            enabled: false,
-            velocity_handle: None,
-            density_handle: None,
-        }
-    }
-}
-
-impl FluidSimulation {
-    fn update(&mut self, dt: f32, playback_time: f32) {
-        self.time = playback_time;
-        self.frame += 1;
-
-        let c = 0.25; // Courant number
-
-        // Create new wave fields
-        let mut new_wave = vec![0.0; self.wave_field.len()];
-        let mut new_wave2 = vec![0.0; self.wave2_field.len()];
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = y * self.width + x;
-
-                // Boundary check
-                let border = 1;
-                let in_border = x < border
-                    || y < border
-                    || x >= self.width - border
-                    || y >= self.height - border;
-
-                if in_border {
-                    new_wave[idx] = 0.0;
-                    new_wave2[idx] = 0.0;
-                    continue;
-                }
-
-                // Wave 1 computation
-                {
-                    let center = self.wave_field[idx];
-                    let prev = self.wave_prev[idx];
-
-                    // Get neighbors
-                    let up = if y < self.height - 1 {
-                        self.wave_field[(y + 1) * self.width + x]
-                    } else {
-                        0.0
-                    };
-                    let down = if y > 0 {
-                        self.wave_field[(y - 1) * self.width + x]
-                    } else {
-                        0.0
-                    };
-                    let right = if x < self.width - 1 {
-                        self.wave_field[y * self.width + (x + 1)]
-                    } else {
-                        0.0
-                    };
-                    let left = if x > 0 {
-                        self.wave_field[y * self.width + (x - 1)]
-                    } else {
-                        0.0
-                    };
-
-                    // Laplacian
-                    let ddy = up - 2.0 * center + down;
-                    let ddx = right - 2.0 * center + left;
-
-                    let next: f32 = if self.frame <= 3 {
-                        // Initial step
-                        center - 0.5 * c * (ddy + ddx)
-                    } else {
-                        // Wave equation with coupling
-                        let m2 = 1.0;
-                        let coord = Vec2::new(x as f32, y as f32);
-                        let resolution = Vec2::new(self.width as f32, self.height as f32);
-                        let mut uv = (coord / resolution) * 2.0 - 1.0;
-                        uv.x *= resolution.x / resolution.y;
-                        let potential = uv.dot(uv);
-
-                        let del = ddy + ddx;
-                        let other_wave = self.wave2_field[idx];
-                        let coupling = other_wave * other_wave * 50.0;
-
-                        let update = del - (m2 + potential + coupling) * center;
-                        -prev + 2.0 * center + 0.5 * c * update
-                    };
-
-                    new_wave[idx] = next;
-                }
-
-                // Wave 2 computation (coupled)
-                {
-                    let center = self.wave2_field[idx];
-                    let prev = self.wave2_prev[idx];
-
-                    // Get neighbors
-                    let up = if y < self.height - 1 {
-                        self.wave2_field[(y + 1) * self.width + x]
-                    } else {
-                        0.0
-                    };
-                    let down = if y > 0 {
-                        self.wave2_field[(y - 1) * self.width + x]
-                    } else {
-                        0.0
-                    };
-                    let right = if x < self.width - 1 {
-                        self.wave2_field[y * self.width + (x + 1)]
-                    } else {
-                        0.0
-                    };
-                    let left = if x > 0 {
-                        self.wave2_field[y * self.width + (x - 1)]
-                    } else {
-                        0.0
-                    };
-
-                    // Laplacian
-                    let ddy = up - 2.0 * center + down;
-                    let ddx = right - 2.0 * center + left;
-
-                    let next: f32 = if self.frame <= 3 {
-                        // Initial step
-                        center - 0.5 * c * (ddy + ddx)
-                    } else {
-                        // Wave equation with coupling
-                        let m2 = 1.0;
-                        let coord = Vec2::new(x as f32, y as f32);
-                        let resolution = Vec2::new(self.width as f32, self.height as f32);
-                        let mut uv = (coord / resolution) * 2.0 - 1.0;
-                        uv.x *= resolution.x / resolution.y;
-                        let potential = uv.dot(uv);
-
-                        let del = ddy + ddx;
-                        let other_wave = self.wave_field[idx];
-                        let coupling = other_wave * other_wave * 50.0;
-
-                        let update = del - (m2 + potential + coupling) * center;
-                        -prev + 2.0 * center + 0.5 * c * update
-                    };
-
-                    new_wave2[idx] = next;
-                }
-            }
-        }
-
-        // Update wave fields
-        self.wave_prev.copy_from_slice(&self.wave_field);
-        self.wave_field.copy_from_slice(&new_wave);
-        self.wave2_prev.copy_from_slice(&self.wave2_field);
-        self.wave2_field.copy_from_slice(&new_wave2);
-
-        // Compute derived velocity and density fields
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = y * self.width + x;
-
-                // Compute velocity from wave gradients
-                let eps = 1.0;
-                let wave_center = self.wave_field[idx];
-                let wave_right = if x < self.width - 1 {
-                    self.wave_field[y * self.width + (x + 1)]
-                } else {
-                    wave_center
-                };
-                let wave_up = if y < self.height - 1 {
-                    self.wave_field[(y + 1) * self.width + x]
-                } else {
-                    wave_center
-                };
-
-                let grad_x = (wave_right - wave_center) / eps;
-                let grad_y = (wave_up - wave_center) / eps;
-
-                self.velocity_field[idx] = Vec2::new(grad_x, grad_y) * 0.1;
-
-                // Compute density from wave amplitudes
-                let wave1_amp = wave_center.abs();
-                let wave2_amp = self.wave2_field[idx].abs();
-                self.density_field[idx] = (wave1_amp + wave2_amp * 0.5).clamp(0.0, 1.0);
-            }
-        }
-
-        // Update velocity field with some time-varying patterns
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let idx = y * self.width + x;
-                let x_norm = x as f32 / self.width as f32 - 0.5;
-                let y_norm = y as f32 / self.height as f32 - 0.5;
-
-                // Create time-varying swirling motion
-                let angle = self.time * 0.5 + (x_norm * y_norm * 4.0);
-                let radius = (x_norm * x_norm + y_norm * y_norm).sqrt();
-
-                let vel_x = angle.cos() * radius * 0.2 + (self.time * 0.3).sin() * 0.05;
-                let vel_y = angle.sin() * radius * 0.2 + (self.time * 0.3).cos() * 0.05;
-
-                self.velocity_field[idx] = Vec2::new(vel_x, vel_y);
-
-                // Apply damping to prevent runaway velocities
-                self.velocity_field[idx] *= 0.98;
-            }
-        }
-
-        // Add programmatic perturbations for dynamic fluid motion
-        self.apply_programmatic_forces(dt);
-    }
-
-    fn apply_programmatic_forces(&mut self, dt: f32) {
-        // Create moving force points that create interesting fluid patterns
-        let time = self.time;
-
-        // Force point 1: orbiting around center
-        let force1_u = 0.5 + (time * 0.8).cos() * 0.3;
-        let force1_v = 0.5 + (time * 0.8).sin() * 0.3;
-        self.apply_force_at_uv(force1_u, force1_v, 0.3, dt);
-
-        // Force point 2: figure-8 pattern
-        let force2_u = 0.5 + (time * 1.2).sin() * 0.25;
-        let force2_v = 0.5 + (time * 0.6).sin() * 2.0 * (time * 1.2).cos() * 0.15;
-        self.apply_force_at_uv(force2_u, force2_v, 0.2, dt);
-
-        // Force point 3: bouncing around edges
-        let force3_u = ((time * 1.5).sin() * 0.5 + 0.5).clamp(0.1, 0.9);
-        let force3_v = ((time * 1.1).cos() * 0.5 + 0.5).clamp(0.1, 0.9);
-        self.apply_force_at_uv(force3_u, force3_v, 0.25, dt);
-    }
-
-    fn apply_force_at_uv(&mut self, u: f32, v: f32, force_strength: f32, dt: f32) {
-        let x = (u * self.width as f32) as usize;
-        let y = (v * self.height as f32) as usize;
-
-        let x = x.min(self.width - 1);
-        let y = y.min(self.height - 1);
-
-        // Apply force in a small radius around the position
-        let radius: i32 = 4;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let nx = (x as i32 + dx).clamp(0, self.width as i32 - 1) as usize;
-                let ny = (y as i32 + dy).clamp(0, self.height as i32 - 1) as usize;
-
-                let dist_sq = (dx * dx + dy * dy) as f32;
-                if dist_sq <= (radius * radius) as f32 {
-                    let idx = ny * self.width + nx;
-                    let falloff = 1.0 - dist_sq / (radius * radius) as f32;
-
-                    // Apply velocity impulse outward from center
-                    let impulse_x =
-                        (nx as f32 - x as f32) * 0.05 * force_strength * falloff * dt * 50.0;
-                    let impulse_y =
-                        (ny as f32 - y as f32) * 0.05 * force_strength * falloff * dt * 50.0;
-
-                    self.velocity_field[idx] += Vec2::new(impulse_x, impulse_y);
-
-                    // Add some density
-                    self.density_field[idx] += force_strength * falloff * dt * 5.0;
-                    self.density_field[idx] = self.density_field[idx].clamp(0.0, 1.0);
-                }
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn get_velocity_at(&self, u: f32, v: f32) -> Vec2 {
-        let x = (u * self.width as f32) as usize;
-        let y = (v * self.height as f32) as usize;
-
-        let x = x.min(self.width - 1);
-        let y = y.min(self.height - 1);
-
-        self.velocity_field[y * self.width + x]
-    }
-
-    #[allow(dead_code)]
-    fn apply_force(&mut self, u: f32, v: f32, force_strength: f32, dt: f32) {
-        let x = (u * self.width as f32) as usize;
-        let y = (v * self.height as f32) as usize;
-
-        let x = x.min(self.width - 1);
-        let y = y.min(self.height - 1);
-
-        // Apply force in a small radius around the mouse position
-        let radius: i32 = 3;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                let nx = (x as i32 + dx).clamp(0, self.width as i32 - 1) as usize;
-                let ny = (y as i32 + dy).clamp(0, self.height as i32 - 1) as usize;
-
-                let dist_sq = (dx * dx + dy * dy) as f32;
-                if dist_sq <= (radius * radius) as f32 {
-                    let idx = ny * self.width + nx;
-                    let falloff = 1.0 - dist_sq / (radius * radius) as f32;
-
-                    // Apply velocity impulse
-                    let impulse = Vec2::new(
-                        (nx as f32 - x as f32) * 0.1 * force_strength * falloff * dt * 100.0,
-                        (ny as f32 - y as f32) * 0.1 * force_strength * falloff * dt * 100.0,
-                    );
-
-                    self.velocity_field[idx] += impulse;
-
-                    // Add some density
-                    self.density_field[idx] += force_strength * falloff * dt * 10.0;
-                    self.density_field[idx] = self.density_field[idx].clamp(0.0, 1.0);
-                }
-            }
-        }
-    }
-}
-
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
 struct TubeMaterial {
     #[uniform(0)]
     // Pack everything into a single uniform buffer: WebGPU has a low per-stage uniform-buffer limit.
     // Layout: [params0, params1, orange, white, dark_inside, dark_outside]
     u: [Vec4; 6],
-
-    #[texture(1)]
-    #[sampler(2)]
-    fluid_velocity: Option<Handle<Image>>,
-
-    #[texture(3)]
-    #[sampler(4)]
-    fluid_density: Option<Handle<Image>>,
 }
 
 impl Default for TubeMaterial {
@@ -15477,8 +15253,6 @@ impl Default for TubeMaterial {
                 Color::srgb_u8(0x0A, 0x00, 0x00).to_linear().to_vec4(),
                 Color::srgb_u8(0x05, 0x00, 0x00).to_linear().to_vec4(),
             ],
-            fluid_velocity: None,
-            fluid_density: None,
         }
     }
 }
@@ -15555,26 +15329,21 @@ impl TubeMaterial {
                 self.u[3] = Color::srgb(1.0, 1.0, 1.0).to_linear().to_vec4(); // White
             }
             6 => {
-                // Fluid: actual fluid-like colors (will be implemented)
-                self.u[2] = Color::srgb_u8(0xD2, 0x6B, 0x11).to_linear().to_vec4(); // Orange
-                self.u[3] = Color::srgb_u8(0xFF, 0xF8, 0xF0).to_linear().to_vec4(); // White
-            }
-            7 => {
                 // Sun: plasma-like colors (moved from fluid)
                 self.u[2] = Color::srgb_u8(0xFF, 0x45, 0x00).to_linear().to_vec4(); // Orange red
                 self.u[3] = Color::srgb_u8(0xFF, 0xFF, 0x00).to_linear().to_vec4(); // Yellow
             }
-            8 => {
+            7 => {
                 // Psychedelic: purple and magenta
                 self.u[2] = Color::srgb_u8(0x8A, 0x2B, 0xE2).to_linear().to_vec4(); // Blue violet
                 self.u[3] = Color::srgb_u8(0xFF, 0x00, 0xFF).to_linear().to_vec4(); // Magenta
             }
-            9 => {
+            8 => {
                 // Neon: cyan and pink
                 self.u[2] = Color::srgb_u8(0x00, 0xFF, 0xFF).to_linear().to_vec4(); // Cyan
                 self.u[3] = Color::srgb_u8(0xFF, 0x14, 0x93).to_linear().to_vec4(); // Deep pink
             }
-            10 => {
+            9 => {
                 // Matrix: green and black
                 self.u[2] = Color::srgb_u8(0x00, 0x20, 0x00).to_linear().to_vec4(); // Dark green
                 self.u[3] = Color::srgb_u8(0x00, 0xFF, 0x00).to_linear().to_vec4(); // Bright green

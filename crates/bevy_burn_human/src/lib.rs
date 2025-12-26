@@ -116,12 +116,17 @@ pub struct BurnHumanInput {
 #[derive(Component, Clone, Copy)]
 pub struct BurnHumanMeshSettings {
     pub compute_normals: bool,
+    /// When true (default), generated meshes are cached by input hash.
+    /// Disable this for continuously-animated inputs to avoid unbounded cache growth;
+    /// in that mode, the plugin updates the existing mesh handle in-place.
+    pub cache_mesh: bool,
 }
 
 impl Default for BurnHumanMeshSettings {
     fn default() -> Self {
         Self {
             compute_normals: true,
+            cache_mesh: true,
         }
     }
 }
@@ -182,24 +187,54 @@ fn update_burn_human_meshes(
             continue;
         }
 
-        if let Some(existing) = cache.handles.get(&key) {
-            mesh_handle.0 = existing.clone();
+        // Cached/static path: de-duplicate mesh assets across entities/frames.
+        if settings.cache_mesh {
+            if let Some(existing) = cache.handles.get(&key) {
+                mesh_handle.0 = existing.clone();
+                cached.0 = key;
+                continue;
+            }
+
+            let output = assets
+                .body
+                .forward(input.as_anny_input())
+                .expect("burn_human forward");
+            let handle = meshes.add(build_mesh(
+                &output,
+                assets.faces.as_ref(),
+                assets.uvs.as_ref(),
+                settings.compute_normals,
+            ));
+            cache.handles.insert(key, handle.clone());
+            mesh_handle.0 = handle;
             cached.0 = key;
             continue;
         }
 
+        // Animated/no-cache path: keep a stable handle and update the Mesh in-place.
         let output = assets
             .body
             .forward(input.as_anny_input())
             .expect("burn_human forward");
-        let handle = meshes.add(build_mesh(
+        let new_mesh = build_mesh(
             &output,
             assets.faces.as_ref(),
             assets.uvs.as_ref(),
             settings.compute_normals,
-        ));
-        cache.handles.insert(key, handle.clone());
-        mesh_handle.0 = handle;
+        );
+
+        if mesh_handle.0 == Handle::<Mesh>::default() {
+            mesh_handle.0 = meshes.add(new_mesh);
+            cached.0 = key;
+            continue;
+        }
+
+        if let Some(existing) = meshes.get_mut(&mesh_handle.0) {
+            *existing = new_mesh;
+        } else {
+            // Handle points at a missing mesh asset; fall back to inserting a fresh one.
+            mesh_handle.0 = meshes.add(new_mesh);
+        }
         cached.0 = key;
     }
 }
