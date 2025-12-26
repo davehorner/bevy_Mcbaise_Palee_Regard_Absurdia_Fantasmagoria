@@ -514,6 +514,68 @@ tasks:
     cmds:
       - cargo test -p bevy_mcbaise_fantasmagoria
 
+  test:readback:
+    desc: One-shot GPU readback smoke test (scene only)
+    env:
+      WGPU_BACKEND: 'vulkan'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_BACKTRACE: 'full'
+      BEVY_BACKTRACE: 'full'
+      RUST_LOG: 'wgpu=error,wgpu_core=error'
+      MCBAISE_AUTO_READBACK: '1'
+      MCBAISE_AUTO_READBACK_AFTER_READY: '1'
+      MCBAISE_AUTO_READBACK_EXIT: '1'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
+  test:readback:overlays:
+    desc: One-shot GPU readback smoke test (include overlay composite)
+    env:
+      WGPU_BACKEND: 'vulkan'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_BACKTRACE: 'full'
+      BEVY_BACKTRACE: 'full'
+      RUST_LOG: 'wgpu=error,wgpu_core=error'
+      MCBAISE_AUTO_READBACK: '1'
+      MCBAISE_AUTO_READBACK_AFTER_READY: '1'
+      MCBAISE_AUTO_READBACK_EXIT: '1'
+      MCBAISE_READBACK_INCLUDE_OVERLAY: '1'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
+  test:autocycle:
+    desc: Smoke-test rapid auto-cycled window resizes (Vulkan) and exit cleanly
+    env:
+      WGPU_BACKEND: 'vulkan'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_BACKTRACE: 'full'
+      BEVY_BACKTRACE: 'full'
+      RUST_LOG: 'wgpu=error,wgpu_core=error'
+      MCBAISE_AUTOCYCLE_RES: '1'
+      MCBAISE_AUTOCYCLE_EVERY_FRAMES: '18'
+      MCBAISE_AUTOCYCLE_START_FRAME: '30'
+      MCBAISE_AUTOCYCLE_MAX_CYCLES: '{{default "20" .MCBAISE_AUTOCYCLE_MAX_CYCLES}}'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
+  test:autoresize:
+    desc: Smoke-test resize-automation stepper (Vulkan) and exit cleanly
+    env:
+      WGPU_BACKEND: 'vulkan'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_BACKTRACE: 'full'
+      BEVY_BACKTRACE: 'full'
+      RUST_LOG: 'wgpu=error,wgpu_core=error'
+      MCBAISE_DISABLE_AUTOCYCLE: '1'
+      MCBAISE_AUTORESIZE: '1'
+      MCBAISE_AUTORESIZE_START_FRAME: '30'
+      MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES: '18'
+      MCBAISE_AUTORESIZE_STEP_PX: '{{default "4" .MCBAISE_AUTORESIZE_STEP_PX}}'
+      MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE: '{{default "1" .MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE}}'
+      MCBAISE_AUTORESIZE_MAX_STEPS: '{{default "40" .MCBAISE_AUTORESIZE_MAX_STEPS}}'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
   mcbaise:test:workspace:
     desc: Run all workspace tests
     cmds:

@@ -15,12 +15,16 @@ use bevy::prelude::*;
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::AsBindGroup;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use bevy::render::texture::GpuImage;
 use bevy::shader::ShaderRef;
 use bevy::window::{PrimaryWindow, Window};
 use bevy::camera::{RenderTarget, Viewport};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use bevy_async_task::TaskPool;
+use futures::channel::oneshot;
+use bevy::asset::AssetId;
+use bevy_render::texture::ManualTextureViews;
 // UI capture/preview is optional; gated behind `capture_ui` feature when enabled.
 
 #[cfg(feature = "burn_human")]
@@ -63,6 +67,36 @@ static READBACK_MAP_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 static READBACK_DEBUG_LAST_SEQ_ARM: AtomicU32 = AtomicU32::new(0);
 
 static READBACK_DEBUG_LAST_SEQ_RENDER: AtomicU32 = AtomicU32::new(0);
+
+// Strongly wait for the device to become idle. This aggressively polls
+// the render device with blocking waits and short sleeps to give drivers
+// (especially Vulkan) time to drain all in-flight work before we destroy
+// surface or swapchain-backed resources.
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_for_device_idle_strong(render_device: &bevy::render::renderer::RenderDevice) {
+    const MAX_TRIES: usize = 64;
+    for i in 0..MAX_TRIES {
+        if render_device.poll(wgpu::PollType::Wait).is_ok() {
+            return;
+        }
+        if i < 4 {
+            sleep(Duration::from_millis(4));
+        } else {
+            sleep(Duration::from_millis(8));
+        }
+    }
+    let _ = render_device.poll(wgpu::PollType::Wait);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wait_for_device_idle_strong(_render_device: &bevy::render::renderer::RenderDevice) {
+    // No-op on wasm: cannot block/sleep.
+}
+
+// Global sequence counter for tracking submits in logs.
+static SUBMIT_SEQ_COUNTER: AtomicU64 = AtomicU64::new(0);
+// Global sequence counter for surface acquires (instrumentation only).
+static ACQUIRE_SEQ_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[allow(dead_code)]
 fn wasm_dbg(msg: &str) {
@@ -148,7 +182,7 @@ fn enforce_burn_human_subject_mode(
 ) {
     let enabled = burn_enabled.map(|r| r.0).unwrap_or(true);
     if !enabled && *subject_mode == SubjectMode::Human {
-        *subject_mode = SubjectMode::Ball;
+        *subject_mode = SubjectMode::Doughnut;
     }
 }
 
@@ -192,6 +226,7 @@ fn render_asset_drop_consume_system(
     render_device: Res<bevy::render::renderer::RenderDevice>,
     render_queue: Res<bevy::render::renderer::RenderQueue>,
     mut delayed_opt: Option<ResMut<DelayedAttachmentDrops>>,
+    mut task_pool: TaskPool<'_, bevy::asset::AssetId<Image>>,
     frame: Res<GlobalFrameCount>,
 ) {
     // If the render world does not have `Assets<Image>` yet, skip safely.
@@ -218,12 +253,14 @@ fn render_asset_drop_consume_system(
     // based on the render world's `GlobalFrameCount`. This avoids cross-world
     // frame counter mismatch which could otherwise allow premature drops.
     if let Some(sched) = pending.scheduled_frame {
-        if sched == 0 {
+            if sched == 0 {
             // Record a submit-frame hint (proxy for the submission point)
-            // and compute a conservative scheduled frame to wait until.
+            // and schedule immediate finalization — we rely on per-handle
+            // oneshot callbacks (registered below) rather than an extra
+            // multi-frame safety window.
             pending.submit_frame_hint = Some(frame.0);
-            pending.scheduled_frame = Some(frame.0.saturating_add(SAFE_DELAY_FRAMES));
-            // New schedule set; wait until the scheduled render frame.
+            pending.scheduled_frame = Some(frame.0);
+            // New schedule set; return so the next frame can consume.
             return;
         }
         if frame.0 < sched {
@@ -252,10 +289,12 @@ fn render_asset_drop_consume_system(
         const MAX_TRIES: usize = 64;
         for i in 0..MAX_TRIES {
             let _ = render_device.poll(wgpu::PollType::Wait);
-            // If we have a hint, wait until a few frames beyond it before
-            // considering ourselves safe. This is a conservative heuristic.
+            // If we have a submit hint, prefer at least one frame beyond it
+            // as a conservative proxy that the render world advanced; do
+            // not rely on large frame delays here since oneshots provide
+            // per-submit guarantees.
             if let Some(hint) = submit_hint {
-                if frame.saturating_sub(hint) > (SAFE_DELAY_FRAMES / 2) {
+                if frame.saturating_sub(hint) > 0 {
                     break;
                 }
             } else if i > 8 {
@@ -305,9 +344,12 @@ fn render_asset_drop_consume_system(
     // submitted work is done. This provides a deterministic gate for final
     // destructive removal instead of relying on time/frame heuristics alone.
     if !pending.images.is_empty() {
-        let mut safe_frame = frame.0.saturating_add(SAFE_DELAY_FRAMES);
+        // No coarse frame delays; schedule finalization as soon as the
+        // render frame has advanced. Precise ordering is enforced by the
+        // per-handle oneshot callbacks registered below.
+        let mut safe_frame = frame.0;
         if let Some(hint) = pending.submit_frame_hint {
-            safe_frame = std::cmp::max(safe_frame, hint.saturating_add(SAFE_DELAY_FRAMES / 2));
+            safe_frame = std::cmp::max(safe_frame, hint);
         }
         let queued: Vec<Handle<Image>> = pending.images.drain(..).collect();
         eprintln!(
@@ -317,38 +359,83 @@ fn render_asset_drop_consume_system(
             frame.0
         );
 
-        // Perform an explicit noop submission here so drivers that delay
+        // Perform two explicit noop submissions here so drivers that delay
         // acquire-semaphore teardown have a clear submission/fence to
         // observe before we register per-handle completion callbacks and
-        // allow final destructive drops. This places the noop right after
-        // the queued-drops log and immediately before finalization logic.
+        // allow final destructive drops. The double-noop provides an
+        // additional fence so drivers with delayed internal maintenance
+        // are more likely to have cleared references.
+        submit_noop_and_wait(&*render_device, &*render_queue);
         submit_noop_and_wait(&*render_device, &*render_queue);
 
-        // For each queued handle create a completion flag and push into
-        // the delayed list. Spawn a background thread that blocks on the
-        // render queue's `on_submitted_work_done()` future and sets the flag
-        // when the submission completes.
+        // For each queued handle create a completion waiter and push into
+        // the delayed list. Instead of spawning a blocking thread or using
+        // an Arc<AtomicBool>, create a oneshot channel and spawn an async
+        // waiter task via `bevy_async_task::TaskPool`. When the queue
+        // invokes the callback we send on the oneshot and the async task
+        // completes; a dedicated pump system will collect completed ids and
+        // make them visible to finalizers.
         let rq = render_queue.clone();
         for handle in queued.into_iter() {
             let id = handle.id();
-            let flag = Arc::new(AtomicBool::new(false));
+            // Register placeholder in delayed list with no flag; we'll use
+            // the CompletedDropIds resource to observe completion.
             if let Some(delayed) = delayed_opt.as_mut() {
-                delayed.entries.push((handle.clone(), safe_frame, Some(flag.clone())));
+                delayed.entries.push((handle.clone(), safe_frame, None));
             }
+
+            // Create a oneshot pair; the closure will send on `s` when the
+            // queue reports completion. The async task awaits the receiver
+            // and returns the handle id when done. To also provide
+            // per-acquire notification, create a small Arc<Mutex<Option<>>>
+            // wrapper so either the queue callback or an acquire-notifier
+            // thread can fulfill the oneshot exactly once.
+            let (s, rcv) = oneshot::channel::<()>();
+            let shared_s = Arc::new(Mutex::new(Some(s)));
             let rq_local = rq.clone();
-            let flag_local = flag.clone();
             eprintln!(
-                "native(render): registering on_submitted_work_done for drop id={} scheduled_frame={} (current={})",
+                "native(render): registering on_submitted_work_done (async) for drop id={} scheduled_frame={} (current={})",
                 id,
                 safe_frame,
                 frame.0
             );
-            // Register a callback to be invoked when the queue reports the
-            // submitted work is done. Log when the callback fires so we can
-            // correlate with finalizer activity in the traces.
+            let my_submit_seq = SUBMIT_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+            let acq_snapshot = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
+            let shared_s_cb = shared_s.clone();
             rq_local.on_submitted_work_done(move || {
-                eprintln!("native(render): on_submitted_work_done fired for drop id={}", id);
-                flag_local.store(true, Ordering::SeqCst);
+                eprintln!("native(render): async-drop on_submitted_work_done my_submit_seq={} acquire_seq={}", my_submit_seq, acq_snapshot);
+                if let Some(tx) = shared_s_cb.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            });
+
+            // Also register a crossbeam waiter keyed by the current
+            // `acquire_seq` snapshot so per-acquire notifications can wake
+            // this oneshot when a submit that referenced the acquire
+            // completes. This complements the queue callback and ensures
+            // the drop won't wait for an unrelated submit.
+            let acq_snapshot = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
+            if acq_snapshot > 0 {
+                if let Some(map_lock) = ACQUIRE_WAITS.get() {
+                    if let Ok(mut map) = map_lock.lock() {
+                        map.entry(acq_snapshot).or_insert_with(Vec::new).push(shared_s.clone());
+                    }
+                } else {
+                    let _ = ACQUIRE_WAITS.get_or_init(|| Mutex::new(HashMap::new()));
+                    if let Some(map_lock) = ACQUIRE_WAITS.get() {
+                        if let Ok(mut map) = map_lock.lock() {
+                            map.entry(acq_snapshot).or_insert_with(Vec::new).push(shared_s.clone());
+                        }
+                    }
+                }
+            }
+
+            // Spawn an async waiter that completes when the oneshot fires.
+            // The TaskPool will run futures on a background pool, and the
+            // pump system will observe completions on the render thread.
+            task_pool.spawn(async move {
+                let _ = rcv.await;
+                id
             });
         }
         pending.scheduled_frame = Some(safe_frame);
@@ -406,7 +493,7 @@ struct GpuReadbackPending {
 }
 
 use bevy::render::render_resource::Buffer as BevyBuffer;
-use std::sync::{Arc, Mutex, atomic::AtomicBool, atomic::AtomicU64, OnceLock};
+use std::sync::{Arc, Mutex, atomic::AtomicBool, OnceLock};
 use crossbeam_channel::{unbounded, Sender, Receiver};
 use std::any::Any;
 use bevy::render::view::window::WindowSurfaces;
@@ -414,37 +501,20 @@ use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::Duration;
 
-// Safety: number of frames to wait in the render world before consuming
-// pending render-asset drops. Increase this on flaky drivers or resize
-// workflows to give the render graph extra time to finish recording/using
-// attachments before they are removed.
-const SAFE_DELAY_FRAMES: u64 = 8;
-
-// Strongly wait for the device to become idle. This aggressively polls
-// the render device with blocking waits and short sleeps to give drivers
-// (especially Vulkan) time to drain all in-flight work before we destroy
-// surface or swapchain-backed resources.
-fn wait_for_device_idle_strong(render_device: &bevy::render::renderer::RenderDevice) {
-    // Reduced MAX_TRIES to shorten the worst-case latency while still
-    // attempting to wait for the device to become idle. The poll call
-    // returns early if the driver reports the work as complete.
-    const MAX_TRIES: usize = 32;
-    for i in 0..MAX_TRIES {
-        // `poll` returns a Result; treat any Ok(_) as a successful poll
-        // (driver indicated it progressed). If it's Ok, assume device is
-        // idle and return early to reduce latency.
-        if render_device.poll(wgpu::PollType::Wait).is_ok() {
-            return;
-        }
-        if i < 4 {
-            sleep(Duration::from_millis(4));
-        } else {
-            sleep(Duration::from_millis(8));
-        }
-    }
-    // One final blocking poll to be extra sure.
-    let _ = render_device.poll(wgpu::PollType::Wait);
+fn mcbaise_render_noop_logs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Treat probes as a superset of render-thread verbose logging.
+        std::env::var("MCBAISE_RENDER_PROBES").as_deref().ok() == Some("1")
+            || std::env::var("MCBAISE_RENDER_NOOP_LOGS").as_deref().ok() == Some("1")
+    })
 }
+
+// NOTE: per-acquire oneshot notifications are used instead of frame-based
+// safety delays. Remove the coarse frame delay logic and prefer explicit
+// submit-completion gates (oneshot + on_submitted_work_done) to determine
+// when it is safe to finalize GPU-backed resources.
+
 
 // Submit a no-op command buffer and wait for its completion. Extracted
 // into a helper so it can be invoked from multiple places (e.g. the
@@ -455,6 +525,8 @@ fn submit_noop_and_wait(
     render_device: &bevy::render::renderer::RenderDevice,
     render_queue: &bevy::render::renderer::RenderQueue,
 ) {
+    let log_enabled = mcbaise_render_noop_logs_enabled();
+
     // Ensure the global teardown helper exists
     let rt = RENDER_TEARDOWN.get_or_init(|| Arc::new(RenderTeardown::default()));
 
@@ -463,72 +535,111 @@ fn submit_noop_and_wait(
     if rt.in_progress.load(Ordering::SeqCst) {
         let target = rt.last_submit_seq.load(Ordering::SeqCst);
         let mut tries = 0u32;
-        while rt.last_complete_seq.load(Ordering::SeqCst) < target && tries < 10_000 {
+        // Be more patient when a teardown is already in-progress; some
+        // drivers require additional time to retire semaphore/fence state.
+        while rt.last_complete_seq.load(Ordering::SeqCst) < target && tries < 60_000 {
             let _ = render_device.poll(wgpu::PollType::Wait);
             std::thread::sleep(std::time::Duration::from_millis(1));
             tries = tries.saturating_add(1);
         }
         if rt.last_complete_seq.load(Ordering::SeqCst) < target {
-            eprintln!("native(render): warning: teardown in progress and last-submit did not complete in time");
+            if log_enabled {
+                eprintln!(
+                    "native(render): warning: teardown in progress and last-submit did not complete in time"
+                );
+            }
         } else {
-            eprintln!("native(render): teardown in progress; last-submit already completed");
+            if log_enabled {
+                eprintln!("native(render): teardown in progress; last-submit already completed");
+            }
         }
         return;
     }
 
+    if log_enabled {
+        eprintln!("native(render): creating encoder label=mcbaise_pre_unconfigure_noop");
+    }
     let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mcbaise_pre_unconfigure_noop"),
     });
     let finished = encoder.finish();
 
     // Record a lightweight submit sequence id and register a completion
-    // callback that records when that sequence completed.
+    // callback that records when that sequence completed. Also tag a
+    // global submit sequence so we can correlate with acquires.
     let seq = rt.last_submit_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let my_submit_seq = SUBMIT_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
     let flag = Arc::new(AtomicBool::new(false));
     let flag_cb = flag.clone();
     let rt_cb = rt.clone();
+    let acq_seq = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
     render_queue.on_submitted_work_done(move || {
         flag_cb.store(true, Ordering::SeqCst);
         rt_cb.last_complete_seq.store(seq, Ordering::SeqCst);
+        if log_enabled {
+            eprintln!(
+                "native(render): noop on_submitted_work_done seq={} my_submit_seq={} acquire_seq={}",
+                seq,
+                my_submit_seq,
+                acq_seq
+            );
+        }
     });
     render_queue.submit(std::iter::once(finished));
+    if log_enabled {
+        eprintln!(
+            "native(render): submitted noop submit seq={} my_submit_seq={} acquire_seq={}",
+            seq,
+            my_submit_seq,
+            acq_seq
+        );
+    }
 
     let mut tries = 0u32;
-    while !flag.load(Ordering::SeqCst) && tries < 10_000 {
+    while !flag.load(Ordering::SeqCst) && tries < 60_000 {
         let _ = render_device.poll(wgpu::PollType::Wait);
         std::thread::sleep(std::time::Duration::from_millis(1));
         tries = tries.saturating_add(1);
     }
     if !flag.load(Ordering::SeqCst) {
-        eprintln!("native(render): warning: noop submit did not complete within wait limit");
+        if log_enabled {
+            eprintln!("native(render): warning: noop submit did not complete within wait limit");
+        }
     } else {
-        eprintln!("native(render): noop submit completed; safe to proceed with surface reconfigure/drop");
+        if log_enabled {
+            eprintln!(
+                "native(render): noop submit completed; safe to proceed with surface reconfigure/drop"
+            );
+        }
 
         // Extra defensive wait: even after the on_submitted_work_done
         // callback signals completion, wgpu may still be performing
-        // internal "maintain" work (see Device::maintain logs) that
-        // can report it's waiting for a submission index. Poll the
-        // device a few more times to allow maintain to clear outstanding
-        // references (bounded to avoid hangs).
-        const MAINTAIN_EXTRA_TRIES: usize = 64;
+        // internal "maintain" work that can reference submission indices.
+        // Give maintain more tries before we proceed with destructive ops.
+        const MAINTAIN_EXTRA_TRIES: usize = 256;
         let mut maintain_tries = 0usize;
         if rt.last_complete_seq.load(Ordering::SeqCst) < seq {
-            // unlikely, but ensure last_complete_seq is at least seq
             while rt.last_complete_seq.load(Ordering::SeqCst) < seq && maintain_tries < MAINTAIN_EXTRA_TRIES {
                 let _ = render_device.poll(wgpu::PollType::Wait);
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 maintain_tries += 1;
             }
         }
-        // Do a few more polls to give Device::maintain() time to finish
-        for _ in 0..8 {
+        // Do a few extra polls to give Device::maintain() time to finish
+        for _ in 0..16 {
             let _ = render_device.poll(wgpu::PollType::Wait);
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         if maintain_tries >= MAINTAIN_EXTRA_TRIES {
-            eprintln!("native(render): warning: maintain did not observe noop submit completion in time");
+            if log_enabled {
+                eprintln!(
+                    "native(render): warning: maintain did not observe noop submit completion in time"
+                );
+            }
         } else {
-            eprintln!("native(render): device maintain settled after noop submit");
+            if log_enabled {
+                eprintln!("native(render): device maintain settled after noop submit");
+            }
         }
     }
 }
@@ -538,6 +649,124 @@ struct GlobalFrameCount(u64);
 
 fn main_frame_tick_system(mut frame: ResMut<GlobalFrameCount>) {
     frame.0 = frame.0.saturating_add(1);
+}
+
+fn apply_deferred_window_resolution_change_system(
+    frame: Res<GlobalFrameCount>,
+    mut deferred: ResMut<DeferredWindowResolutionChange>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if !deferred.pending {
+        return;
+    }
+    if frame.0 < deferred.apply_frame {
+        return;
+    }
+
+    let Some(mut window) = windows.iter_mut().next() else {
+        return;
+    };
+
+    window
+        .resolution
+        .set_physical_resolution(deferred.target_w, deferred.target_h);
+    deferred.pending = false;
+    eprintln!(
+        "native: applying deferred window geometry -> {}x{} (frame={})",
+        deferred.target_w,
+        deferred.target_h,
+        frame.0
+    );
+}
+
+fn schedule_window_geometry_change(
+    pending_window_geometry: &mut PendingWindowGeometry,
+    deferred: &mut DeferredWindowResolutionChange,
+    w: u32,
+    h: u32,
+    now_frame: u64,
+    reason: &'static str,
+) {
+    // Mark pending immediately so camera gating can kick in this frame,
+    // but defer the actual window resize until next frame so the render
+    // world sees cameras disabled before the surface is reconfigured.
+    pending_window_geometry.pending = true;
+    pending_window_geometry.target_w = w;
+    pending_window_geometry.target_h = h;
+    pending_window_geometry.scheduled_frame = Some(now_frame + 1);
+
+    deferred.pending = true;
+    deferred.target_w = w;
+    deferred.target_h = h;
+    deferred.apply_frame = now_frame + 1;
+
+    eprintln!(
+        "native: {reason} window geometry -> {}x{} (defer_apply_frame={}, now_frame={})",
+        w,
+        h,
+        deferred.apply_frame,
+        now_frame
+    );
+}
+
+fn auto_cycle_resolution_system(
+    frame: Res<GlobalFrameCount>,
+    mut auto: ResMut<AutoResolutionCycle>,
+    mut capture_state: ResMut<EguiCaptureState>,
+    mut pending_window_geometry: ResMut<PendingWindowGeometry>,
+    mut deferred: ResMut<DeferredWindowResolutionChange>,
+    mut app_exit: MessageWriter<AppExit>,
+) {
+    if !auto.active {
+        return;
+    }
+    if frame.0 < auto.start_frame {
+        return;
+    }
+    if auto.every_frames == 0 {
+        return;
+    }
+    if (frame.0 - auto.start_frame) % auto.every_frames != 0 {
+        return;
+    }
+    if pending_window_geometry.pending || deferred.pending {
+        return;
+    }
+    if auto.max_cycles > 0 && auto.cycles_done >= auto.max_cycles {
+        app_exit.write(AppExit::Success);
+        return;
+    }
+
+    let resolutions: &[(u32, u32, &str)] = &[
+        (256, 144, "144p (256x144)"),
+        (426, 240, "240p (426x240)"),
+        (640, 360, "360p (640x360)"),
+        (854, 480, "480p (854x480)"),
+        (1280, 720, "720p (1280x720)"),
+        (1920, 1080, "1080p (1920x1080)"),
+        (2560, 1440, "1440p (2560x1440)"),
+        (3840, 2160, "2160p (3840x2160)"),
+        (1080, 1920, "Phone Portrait (1080x1920)"),
+        (1170, 2532, "iPhone Pro (1170x2532)"),
+        (1080, 2340, "Modern Phone (1080x2340)"),
+    ];
+
+    if auto.next_index >= resolutions.len() {
+        auto.next_index = 0;
+    }
+    let (w, h, _label) = resolutions[auto.next_index];
+    capture_state.selected_resolution = auto.next_index as i32;
+    auto.next_index = (auto.next_index + 1) % resolutions.len();
+    auto.cycles_done = auto.cycles_done.saturating_add(1);
+
+    schedule_window_geometry_change(
+        &mut pending_window_geometry,
+        &mut deferred,
+        w,
+        h,
+        frame.0,
+        "auto-cycled",
+    );
 }
 
 fn render_frame_tick_system(mut frame: ResMut<GlobalFrameCount>) {
@@ -598,12 +827,8 @@ fn render_receive_surfaces_system(world: &mut bevy::ecs::world::World) {
     if !saw {
         return;
     }
-    eprintln!("native(render): received teardown request token(s) - performing strong device idle and signalling");
-    // Before signalling the main world, take ownership of the render
-    // world's `WindowSurfaces` and stash them here so they are dropped on
-    // the render thread. This avoids destroying surface-backed resources
-    // from the main world while driver-held acquire semaphores may still
-    // be referenced.
+    eprintln!("native(render): received teardown request token(s) - performing noop submit + strong device idle and signalling");
+
     let mut drained_flags: Vec<(u64, Arc<AtomicBool>)> = Vec::new();
     if let Some(map_lock) = GLOBAL_RENDER_TEARDOWNS.get() {
         if let Ok(mut map) = map_lock.lock() {
@@ -612,102 +837,29 @@ fn render_receive_surfaces_system(world: &mut bevy::ecs::world::World) {
             }
         }
     }
-
-    if !drained_flags.is_empty() {
-        // Mark teardown in-progress to discourage new submits from helpers
-        // that consult the global teardown guard. This reduces the chance
-        // that additional rendering work is scheduled while we drain and
-        // prepare to drop surface-backed resources.
-        let rt = RENDER_TEARDOWN.get_or_init(|| Arc::new(RenderTeardown::default()));
-        rt.in_progress.store(true, Ordering::SeqCst);
-        // Try to remove the WindowSurfaces resource from the render world.
-            let surfaces = world.remove_resource::<WindowSurfaces>();
-            let id = drained_flags[0].0;
-            if let Some(surfaces) = surfaces {
-                if let Some(mut stashed) = world.get_resource_mut::<StashedWindowSurfaces>() {
-                    stashed.entries.push((id, surfaces));
-                    eprintln!("native(render): moved WindowSurfaces into render stash (id={})", id);
-                }
-                // Re-insert an empty `WindowSurfaces` so `ResMut<WindowSurfaces>`
-                // continues to validate for systems running in the main world.
-                world.insert_resource(WindowSurfaces::default());
-            } else {
-                eprintln!("native(render): no WindowSurfaces resource present to stash");
-            }
-        // Also attempt to move any queued pending/delayed drop tables into the
-        // render stash so their final destructive drops occur on the render
-        // thread after we have performed the idle wait. Use the same teardown
-        // id when available so logs can correlate entries.
-        let stash_id = drained_flags.get(0).map(|(i, _)| *i).unwrap_or_else(|| NEXT_TEARDOWN_ID.fetch_add(1, Ordering::SeqCst));
-        if let Some(pending_res) = world.remove_resource::<PendingRenderAssetDrops>() {
-            if let Some(mut st_p) = world.get_resource_mut::<StashedPendingRenderAssetDrops>() {
-                st_p.entries.push((stash_id, pending_res));
-                eprintln!("native(render): moved PendingRenderAssetDrops into render stash (id={})", stash_id);
-            }
-        }
-        if let Some(delayed_res) = world.remove_resource::<DelayedAttachmentDrops>() {
-            if let Some(mut st_d) = world.get_resource_mut::<StashedDelayedAttachmentDrops>() {
-                st_d.entries.push((stash_id, delayed_res));
-                eprintln!("native(render): moved DelayedAttachmentDrops into render stash (id={})", stash_id);
-            }
-        }
-        if let Some(readback_res) = world.remove_resource::<ReadbackStaging>() {
-            if let Some(mut st_rb) = world.get_resource_mut::<StashedReadbackStaging>() {
-                st_rb.entries.push((stash_id, readback_res));
-                eprintln!("native(render): moved ReadbackStaging into render stash (id={})", stash_id);
-            }
-        }
-        // Attempt to move the image asset tables into the render stash so
-        // any GPU-backed image resources (and their underlying textures)
-        // are dropped on the render thread after the idle wait completes.
-        if let Some(img_assets) = world.remove_resource::<bevy::asset::Assets<Image>>() {
-            if let Some(mut st_imgs) = world.get_resource_mut::<StashedAssetsImage>() {
-                st_imgs.entries.push((stash_id, img_assets));
-                eprintln!("native(render): moved Assets<Image> into render stash (id={})", stash_id);
-            }
-            // Ensure other main-world systems that expect `Assets<Image>` do not
-            // fail validation after we remove the resource. Insert an empty
-            // placeholder so `Res<Assets<Image>>` continues to exist.
-            world.insert_resource(bevy::asset::Assets::<Image>::default());
-        }
-        if let Some(gpu_assets) = world.remove_resource::<bevy::render::render_asset::RenderAssets<GpuImage>>() {
-            if let Some(mut st_gimgs) = world.get_resource_mut::<StashedRenderAssetsGpuImage>() {
-                st_gimgs.entries.push((stash_id, gpu_assets));
-                eprintln!("native(render): moved RenderAssets<GpuImage> into render stash (id={})", stash_id);
-            }
-            // Similarly, other plugins (eg. `bevy_pbr`) may expect
-            // `Res<RenderAssets<GpuImage>>`. Re-insert a default/empty
-            // `RenderAssets<GpuImage>` to satisfy system parameter
-            // validation when we temporarily move the real table into
-            // the render stash.
-            world.insert_resource(bevy::render::render_asset::RenderAssets::<GpuImage>::default());
-        }
-            // Additionally try to remove any SurfaceData resource and stash it
-            // so that underlying surface-related state (which may hold
-            // acquire-semaphores) is dropped on the render thread after the
-            // idle wait completes.
-        
-
-        // Strong drain on the render thread to ensure GPU is idle.
-        if let Some(render_device) = world.get_resource::<bevy::render::renderer::RenderDevice>() {
-            wait_for_device_idle_strong(render_device);
-        } else {
-            eprintln!("native(render): no RenderDevice resource available for idle wait");
-        }
-
-        // Signal all waiting flags so the main world can proceed with
-        // its destructive drops (images, etc.). The actual WindowSurfaces
-        // will remain stashed and dropped on the render thread when this
-        // resource (`StashedWindowSurfaces`) is cleared or goes out of
-        // scope in the render world.
-        for (_id, flag) in drained_flags {
-            flag.store(true, Ordering::SeqCst);
-        }
-
-        // Teardown complete; clear the in-progress indicator so normal
-        // rendering and submissions may resume.
-        rt.in_progress.store(false, Ordering::SeqCst);
+    if drained_flags.is_empty() {
+        return;
     }
+
+    let rt = RENDER_TEARDOWN
+        .get_or_init(|| Arc::new(RenderTeardown::default()))
+        .clone();
+    rt.in_progress.store(true, Ordering::SeqCst);
+
+    if let (Some(render_device), Some(render_queue)) = (
+        world.get_resource::<bevy::render::renderer::RenderDevice>(),
+        world.get_resource::<bevy::render::renderer::RenderQueue>(),
+    ) {
+        submit_noop_and_wait(render_device, render_queue);
+        wait_for_device_idle_strong(render_device);
+    } else if let Some(render_device) = world.get_resource::<bevy::render::renderer::RenderDevice>() {
+        wait_for_device_idle_strong(render_device);
+    }
+
+    for (_id, flag) in drained_flags {
+        flag.store(true, Ordering::SeqCst);
+    }
+    rt.in_progress.store(false, Ordering::SeqCst);
 }
 
 #[derive(Resource, Default)]
@@ -759,8 +911,8 @@ struct DelayedAttachmentDrops {
 // references surface acquires anymore.
 #[derive(Resource, Default)]
 struct StashedWindowSurfaces {
-    // (teardown_id, surfaces)
-    entries: Vec<(u64, WindowSurfaces)>,
+    // (teardown_id, surfaces, earliest_allowed_frame, optional_submission_complete_flag)
+    entries: Vec<(u64, WindowSurfaces, u64, Option<Arc<AtomicBool>>)>,
 }
 
 #[derive(Resource, Default)]
@@ -768,6 +920,10 @@ struct StashedPendingRenderAssetDrops {
     // (teardown_id, pending_drops)
     entries: Vec<(u64, PendingRenderAssetDrops)>,
 }
+
+
+// `SurfaceData` is a private Bevy-internal type and cannot be stashed/dropped
+// safely from user code. We intentionally avoid referencing it here.
 
 #[derive(Resource, Default)]
 struct StashedDelayedAttachmentDrops {
@@ -794,6 +950,9 @@ struct StashedRenderAssetsGpuImage {
     // (teardown_id, RenderAssets<GpuImage>)
     entries: Vec<(u64, bevy::render::render_asset::RenderAssets<GpuImage>)>,
 }
+
+#[derive(Resource, Default)]
+struct CompletedDropIds(pub Vec<AssetId<Image>>);
 
 
 // Guard used to coordinate teardown: prevents new submits while a teardown
@@ -827,6 +986,32 @@ struct PendingWindowGeometry {
     pending: bool,
     target_w: u32,
     target_h: u32,
+    scheduled_frame: Option<u64>,
+}
+
+// Env-var driven automatic cycling through the same preset resolutions as the
+// right-click path. This exists to reproduce/validate resize safety without
+// needing interactive input.
+#[derive(Resource, Default)]
+struct AutoResolutionCycle {
+    active: bool,
+    every_frames: u64,
+    start_frame: u64,
+    max_cycles: u32,
+    cycles_done: u32,
+    next_index: usize,
+}
+
+// Right-click resolution cycling is prone to driver/backend races if we apply the
+// OS/window size change in the same frame we set our gating flags.
+// We defer the actual Window resolution update by one main-world frame so the
+// render world sees cameras disabled before the surface reconfiguration occurs.
+#[derive(Resource, Default)]
+struct DeferredWindowResolutionChange {
+    pending: bool,
+    target_w: u32,
+    target_h: u32,
+    apply_frame: u64,
 }
 
 impl bevy::render::extract_resource::ExtractResource for PendingWindowGeometry {
@@ -834,6 +1019,20 @@ impl bevy::render::extract_resource::ExtractResource for PendingWindowGeometry {
 
     fn extract_resource(source: &Self::Source) -> Self {
         source.clone()
+    }
+}
+
+// Controls whether window resolution changes should be applied as logical
+// (layout/DPI-independent) sizes or as physical framebuffer pixel sizes.
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolutionSetMode {
+    Logical,
+    Physical,
+}
+
+impl Default for ResolutionSetMode {
+    fn default() -> Self {
+        ResolutionSetMode::Logical
     }
 }
 
@@ -851,20 +1050,36 @@ enum Phase {
 #[derive(Resource)]
 struct ResizeAutomation {
     active: bool,
+    env_forced: bool,
     width: u16,
     height: u16,
     phase: Phase,
     first_frame: bool,
+    next_step_frame: u64,
+    step_every_frames: u64,
+    start_frame: u64,
+    max_steps: u32,
+    steps_done: u32,
+    exit_requested: bool,
+    seeded_from_window: bool,
 }
 
 impl Default for ResizeAutomation {
     fn default() -> Self {
         ResizeAutomation {
             active: false,
+            env_forced: false,
             width: 401,
             height: 401,
             phase: Phase::ContractingY,
             first_frame: false,
+            next_step_frame: 0,
+            step_every_frames: 12,
+            start_frame: 0,
+            max_steps: 0,
+            steps_done: 0,
+            exit_requested: false,
+            seeded_from_window: false,
         }
     }
 }
@@ -896,6 +1111,14 @@ struct TeardownState {
 // Arc<AtomicBool> entries so both worlds can communicate safely without
 // attempting to move resources across world boundaries.
 static GLOBAL_RENDER_TEARDOWNS: OnceLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> = OnceLock::new();
+// Per-teardown countdown state inserted on the render thread. When the
+// main world arms a teardown we move the entry here and count down a small
+// number of render frames before finally signalling the AtomicBool. This
+// provides an additional frame window to ensure drivers release any
+// SurfaceTexture/acquire-semaphore resources before we unconfigure or drop
+// the underlying surface, which mitigates Vulkan driver races observed
+// during fast resize cycles.
+static GLOBAL_RENDER_TEARDOWN_COUNTDOWNS: OnceLock<Mutex<HashMap<u64, (Arc<AtomicBool>, u8)>>> = OnceLock::new();
 static NEXT_TEARDOWN_ID: AtomicU64 = AtomicU64::new(1);
 
 // Channel used to transfer WindowSurfaces (or their owning wrappers)
@@ -906,6 +1129,17 @@ static NEXT_TEARDOWN_ID: AtomicU64 = AtomicU64::new(1);
 // Use a boxed Any token so we don't need to move Bevy-internal types here.
 static WINDOW_SURFACE_SENDER: OnceLock<Mutex<Sender<Box<dyn Any + Send>>>> = OnceLock::new();
 static WINDOW_SURFACE_RECEIVER: OnceLock<Mutex<Receiver<Box<dyn Any + Send>>>> = OnceLock::new();
+
+// Registry mapping an acquire_seq -> list of waiters to notify when a
+// submit that referenced that acquire completes. We use a simple
+// crossbeam channel sender so the notifier (render submit probe) can
+// signal waiting threads/tasks without requiring async executor state.
+// Shared sender wrapper used for per-acquire notifications.
+type AcquireWaitSender = Arc<Mutex<Option<oneshot::Sender<()>>>>;
+// Map acquire_seq -> list of shared oneshot senders. The shared wrapper
+// allows either the queue callback or the acquire-notifier to fulfill the
+// oneshot exactly once.
+static ACQUIRE_WAITS: OnceLock<Mutex<HashMap<u64, Vec<AcquireWaitSender>>>> = OnceLock::new();
 
 // Holders for WindowSurfaces moved out of the main world so they can be
 // dropped on the render thread. Keyed by the same teardown id used for the
@@ -946,6 +1180,7 @@ fn ensure_gpu_capture_camera_exists(
     existing: Query<(Entity, &GpuReadbackCaptureCamera)>,
     capture_state: Res<EguiCaptureState>,
     multi_view: Res<MultiView>,
+    render_device: Res<bevy::render::renderer::RenderDevice>,
 ) {
     let Some(readback) = readback else { return; };
     if readback.0 == Handle::default() {
@@ -958,7 +1193,12 @@ fn ensure_gpu_capture_camera_exists(
         1
     };
 
-    // Despawn extras
+    // Despawn extras. Before removing camera entities that may hold
+    // GPU-backed resources, perform a strong device drain to reduce the
+    // chance of destroying swapchain/surface resources while still in use.
+    if existing.iter().len() > 0 {
+        wait_for_device_idle_strong(&*render_device);
+    }
     for (entity, cap_cam) in &existing {
         if cap_cam.index >= desired_count {
             commands.entity(entity).despawn();
@@ -1440,6 +1680,8 @@ fn gpu_readback_render_system(
         label: Some("mcbaise_readback_encoder"),
     });
 
+    eprintln!("native(render): create encoder label=mcbaise_readback_encoder frame_seq={}", READBACK_REQUEST_SEQ.load(Ordering::SeqCst));
+
     encoder.copy_texture_to_buffer(
         gpu_image.texture.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -1458,8 +1700,13 @@ fn gpu_readback_render_system(
     );
 
     let finished = encoder.finish();
+    let my_seq = SUBMIT_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+    render_queue.on_submitted_work_done(move || {
+        eprintln!("native(render): readback submit seq={} completed", my_seq);
+    });
+    let acq_seq = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
     render_queue.submit(std::iter::once(finished));
-    eprintln!("gpu_readback: submitted encoder for readback (size={}x{})", width, height);
+    eprintln!("gpu_readback: submitted encoder for readback (size={}x{}) seq={} acquire_seq={}", width, height, my_seq, acq_seq);
 
     // On wasm/WebGPU, some browsers/drivers appear to need explicit polling to
     // progress mapping callbacks reliably.
@@ -3264,6 +3511,7 @@ enum SubjectMode {
     Auto,
     Random,
     Human,
+    Doughnut,
     Ball,
 }
 
@@ -3273,6 +3521,7 @@ impl SubjectMode {
             SubjectMode::Auto => "Subject: auto",
             SubjectMode::Random => "Subject: random",
             SubjectMode::Human => "Subject: human",
+            SubjectMode::Doughnut => "Subject: doughnut",
             SubjectMode::Ball => "Subject: ball",
         }
     }
@@ -3282,6 +3531,7 @@ impl SubjectMode {
             SubjectMode::Auto => "auto",
             SubjectMode::Random => "random",
             SubjectMode::Human => "human",
+            SubjectMode::Doughnut => "doughnut",
             SubjectMode::Ball => "ball",
         }
     }
@@ -3696,7 +3946,11 @@ impl Default for AutoSubjectState {
             rng: 0xBADC_0FFEu32,
             since_switch_sec: 0.0,
             next_switch_sec: 0.0,
-            current: SubjectMode::Human,
+            current: if cfg!(feature = "burn_human") {
+                SubjectMode::Human
+            } else {
+                SubjectMode::Doughnut
+            },
         };
         s.schedule_next_switch();
         s
@@ -3724,7 +3978,13 @@ impl AutoSubjectState {
 
     fn pick_next_subject(&mut self) -> SubjectMode {
         match self.current {
-            SubjectMode::Ball => SubjectMode::Human,
+            SubjectMode::Ball => {
+                if cfg!(feature = "burn_human") {
+                    SubjectMode::Human
+                } else {
+                    SubjectMode::Doughnut
+                }
+            }
             _ => SubjectMode::Ball,
         }
     }
@@ -4804,6 +5064,45 @@ pub fn main() {
     app.init_resource::<BurnHumanSpawned>();
     app.insert_resource(BurnHumanEnabled::default());
     app.add_systems(Startup, ensure_readback_image_exists);
+
+    // Optional automation: drive the resize stepper (the same behavior as the UI
+    // resize icon) without user interaction.
+    // - MCBAISE_AUTORESIZE=1
+    // - MCBAISE_AUTORESIZE_START_FRAME=120 (default)
+    // - MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES=12 (default)
+    // - MCBAISE_AUTORESIZE_MAX_STEPS=0 (0 = infinite)
+    if std::env::var("MCBAISE_AUTORESIZE").as_deref().ok() == Some("1") {
+        let autoresize_start_frame: u64 = std::env::var("MCBAISE_AUTORESIZE_START_FRAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        let autoresize_step_every_frames: u64 = std::env::var("MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        let autoresize_max_steps: u32 = std::env::var("MCBAISE_AUTORESIZE_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let mut auto = app.world_mut().resource_mut::<ResizeAutomation>();
+        auto.active = true;
+        auto.env_forced = true;
+        auto.start_frame = autoresize_start_frame;
+        auto.step_every_frames = autoresize_step_every_frames.max(1);
+        auto.max_steps = autoresize_max_steps;
+        auto.steps_done = 0;
+        auto.exit_requested = false;
+        auto.seeded_from_window = false;
+        auto.first_frame = false;
+        auto.next_step_frame = 0;
+        eprintln!(
+            "native: env autoresize enabled (start_frame={}, step_every_frames={}, max_steps={})",
+            auto.start_frame,
+            auto.step_every_frames,
+            auto.max_steps
+        );
+    }
     // Spawn the offscreen capture camera(s) once the main camera exists.
     // We moved this to Update to support toggling capture_multi at runtime.
     // Deterministic GPU readback flow:
@@ -4812,10 +5111,39 @@ pub fn main() {
     // - arm capture camera when a request arrives
     // - disable capture camera after a few frames
     app.add_systems(Update, loading_watch_system);
-    app.add_systems(Update, window_geometry_watch_system);
-    app.add_systems(Update, resize_automation_step);
+    // Ordering matters for resize automation:
+    // - Apply deferred resize first.
+    // - Run the automation step before the settle watcher so the watcher can
+    //   clear the previous step without the automation immediately re-arming
+    //   `pending` in the same frame.
+    app.add_systems(
+        Update,
+        window_geometry_watch_system
+            .after(main_frame_tick_system)
+            .after(apply_deferred_window_resolution_change_system)
+            .after(resize_automation_step),
+    );
+    app.add_systems(
+        Update,
+        resize_automation_step
+            .after(main_frame_tick_system)
+            // Ensure camera gating observes the previous frame's pending state,
+            // but do not let scheduling a new step disable cameras in the same frame.
+            .after(gate_main_cameras_during_geometry_system)
+            .before(window_geometry_watch_system),
+    );
     app.add_systems(Update, sync_resize_toggle_system);
-    app.add_systems(Update, cycle_resolution_on_right_click);
+    // Critical ordering: apply the requested window resolution change before any
+    // camera/view viewport systems run this frame. Otherwise, Bevy may reconfigure
+    // the surface to the new size while viewports are still computed from the old
+    // size, producing a one-frame mismatch (e.g. surface=256x144, viewport=1280x240).
+    // Also run after the main frame tick so we can stamp a scheduled frame.
+    app.add_systems(
+        Update,
+        cycle_resolution_on_resize_icon_request_system
+            .after(main_frame_tick_system)
+            .before(sync_view_cameras),
+    );
     app.add_systems(Update, teardown_countdown_system);
     app.add_systems(Update, restart_cameras_system);
     app.add_systems(Update, restart_scene_system);
@@ -4925,7 +5253,52 @@ pub fn main() {
     // separately in the main and render sub-apps to provide a simple
     // frame-based coordination point.
     app.init_resource::<GlobalFrameCount>();
+    app.init_resource::<ResolutionSetMode>();
     app.add_systems(Update, main_frame_tick_system);
+    // Optional automation: cycle the same preset resolutions without user input.
+    // Enable via env var to reproduce resize timing issues:
+    // - MCBAISE_AUTOCYCLE_RES=1
+    // - MCBAISE_AUTOCYCLE_EVERY_FRAMES=60 (default)
+    // - MCBAISE_AUTOCYCLE_START_FRAME=120 (default)
+    // - MCBAISE_AUTOCYCLE_MAX_CYCLES=0 (0 = infinite)
+    // If you need to ensure autocycle is off (e.g. for autoresize-only tests), set:
+    // - MCBAISE_DISABLE_AUTOCYCLE=1
+    let autocycle_disabled = std::env::var("MCBAISE_DISABLE_AUTOCYCLE").as_deref().ok() == Some("1");
+    let autocycle_active = !autocycle_disabled
+        && std::env::var("MCBAISE_AUTOCYCLE_RES").as_deref().ok() == Some("1");
+    let autocycle_every_frames: u64 = std::env::var("MCBAISE_AUTOCYCLE_EVERY_FRAMES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(60);
+    let autocycle_start_frame: u64 = std::env::var("MCBAISE_AUTOCYCLE_START_FRAME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120);
+    let autocycle_max_cycles: u32 = std::env::var("MCBAISE_AUTOCYCLE_MAX_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    app.insert_resource(AutoResolutionCycle {
+        active: autocycle_active,
+        every_frames: autocycle_every_frames,
+        start_frame: autocycle_start_frame,
+        max_cycles: autocycle_max_cycles,
+        cycles_done: 0,
+        next_index: 0,
+    });
+    app.init_resource::<DeferredWindowResolutionChange>();
+    app.add_systems(
+        Update,
+        apply_deferred_window_resolution_change_system
+            .after(main_frame_tick_system)
+            .before(sync_view_cameras),
+    );
+    app.add_systems(
+        Update,
+        auto_cycle_resolution_system
+            .after(main_frame_tick_system)
+            .before(sync_view_cameras),
+    );
     // Register main-world capture system to request render-thread teardown.
     app.add_systems(Update, capture_window_surfaces_system);
 
@@ -4947,6 +5320,7 @@ pub fn main() {
     render_app.init_resource::<PendingRenderAssetDrops>();
     render_app.init_resource::<GlobalFrameCount>();
     render_app.init_resource::<PendingWindowGeometry>();
+    render_app.init_resource::<ResolutionSetMode>();
     render_app.init_resource::<DelayedAttachmentDrops>();
     render_app.init_resource::<StashedWindowSurfaces>();
     render_app.init_resource::<StashedPendingRenderAssetDrops>();
@@ -4954,14 +5328,273 @@ pub fn main() {
     render_app.init_resource::<StashedReadbackStaging>();
     render_app.init_resource::<StashedAssetsImage>();
     render_app.init_resource::<StashedRenderAssetsGpuImage>();
+    render_app.init_resource::<CompletedDropIds>();
+    #[derive(Resource, Default)]
+    struct RenderGraphDumpDone(pub bool);
     render_app.add_systems(
         bevy::render::Render,
         render_frame_tick_system.in_set(RenderSystems::Cleanup),
     );
 
+    // Debug/probe logging for render scheduling and attachments can be very
+    // noisy. Enable explicitly when needed.
+    let render_probes_enabled = std::env::var("MCBAISE_RENDER_PROBES").as_deref().ok() == Some("1");
+
+    // Debug helper: print the `RenderGraph` debug dump once on the render
+    // thread so we can discover the canonical node names to instrument.
+    fn render_graph_dump_system(
+        rg: Option<Res<bevy::render::render_graph::RenderGraph>>,
+        mut done: Local<bool>,
+    ) {
+        if *done {
+            return;
+        }
+        if let Some(rg) = rg {
+            eprintln!("native(render): RenderGraph dump:\n{:?}", &*rg);
+            *done = true;
+        }
+    }
+    if render_probes_enabled {
+        render_app.init_resource::<RenderGraphDumpDone>();
+        render_app.add_systems(
+            bevy::render::Render,
+            render_graph_dump_system.in_set(RenderSystems::Prepare),
+        );
+    }
+
+    // Instrumentation nodes: insert lightweight SystemNodes into the
+    // RenderGraph around the main opaque 3D pass so we can log entry/exit
+    // timings and resource snapshots for that specific node.
+    fn render_wrapper_before_system(frame: Res<GlobalFrameCount>) {
+        eprintln!("native(render): wrapper-before main_opaque_pass_3d_node frame={}", frame.0);
+    }
+    fn render_wrapper_after_system(frame: Res<GlobalFrameCount>) {
+        eprintln!("native(render): wrapper-after main_opaque_pass_3d_node frame={}", frame.0);
+    }
+    // Probe: approximate a swapchain/surface acquire point. We increment the
+    // ACQUIRE_SEQ_COUNTER here so downstream submits (including Bevy's
+    // internal submit and our explicit submits) can be correlated with the
+    // acquire that started the frame. This is best-effort instrumentation
+    // — Bevy performs actual swapchain acquires inside its renderer.
+    fn render_acquire_probe_system() {
+        let acq = ACQUIRE_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+        eprintln!("native(render): acquire probe incremented acquire_seq={}", acq);
+    }
+    // The RenderGraph internals and label types vary between Bevy versions;
+    // attempting to create `SystemNode`s with string labels is not portable
+    // across versions and caused build failures. Instead, register lightweight
+    // wrapper logging systems in the render schedule so they execute on the
+    // render thread and still provide timing information for investigation.
+    if render_probes_enabled {
+        render_app.add_systems(
+            bevy::render::Render,
+            (
+                render_wrapper_before_system.in_set(RenderSystems::Prepare),
+                render_acquire_probe_system.in_set(RenderSystems::Prepare),
+                render_wrapper_after_system.in_set(RenderSystems::Cleanup),
+            ),
+        );
+    }
+
+    // After the render graph runs and submits, register a probe callback
+    // that will log when the submitted work completes. This captures the
+    // current global submit seq so we can correlate encoder/submit timing
+    // with surface teardown logs.
+    fn render_graph_submit_probe_system(render_queue: Res<bevy::render::renderer::RenderQueue>) {
+        // Assign a submit sequence id for this probe so it appears in the
+        // same global timeline as our explicit submits.
+        let seq = SUBMIT_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
+        let acq = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
+        eprintln!("native(render): post-graph submit probe registered seq={} acquire_seq={}", seq, acq);
+        render_queue.on_submitted_work_done(move || {
+            eprintln!("native(render): post-graph submit probe seq={} acquire_seq={} on_submitted_work_done fired", seq, acq);
+            // Notify any waiters that registered interest in this acquire
+            if let Some(w) = ACQUIRE_WAITS.get() {
+                if let Ok(mut map) = w.lock() {
+                    if let Some(waiters) = map.remove(&acq) {
+                        for shared in waiters {
+                            if let Some(tx) = shared.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    // list of completed drop ids so finalizers can consult them without
+    // relying on atomics or cross-thread signalling.
+    fn render_async_completion_pump_system(
+        mut task_pool: TaskPool<'_, bevy::asset::AssetId<Image>>,
+        mut completed: ResMut<CompletedDropIds>,
+    ) {
+        use std::task::Poll;
+        for status in task_pool.iter_poll() {
+            if let Poll::Ready(id) = status {
+                eprintln!("native(render): async completion observed for id={:?}", id);
+                completed.0.push(id);
+            }
+        }
+    }
+
     // Register render-world receiver to run in Cleanup so it executes on the
     // render thread prior to resource drops.
-    render_app.add_systems(bevy::render::Render, render_receive_surfaces_system.in_set(RenderSystems::Cleanup));
+    if render_probes_enabled {
+        render_app.add_systems(
+            bevy::render::Render,
+            (
+                render_graph_submit_probe_system.in_set(RenderSystems::Cleanup),
+                render_receive_surfaces_system.in_set(RenderSystems::Cleanup),
+            ),
+        );
+    } else {
+        render_app.add_systems(
+            bevy::render::Render,
+            render_receive_surfaces_system.in_set(RenderSystems::Cleanup),
+        );
+    }
+
+    // Render-thread: apply any pending geometry change on the render thread
+    // instead of the main thread. This performs the `Window` resolution set
+    // from the render world so the surface reconfigure/unconfigure happens
+    // on the same thread that owns GPU resources and avoids cross-thread
+    // races observed on some Vulkan drivers.
+    fn render_apply_pending_geometry_system(
+        mut pending_geom: ResMut<PendingWindowGeometry>,
+        mut windows: Query<&mut Window, With<PrimaryWindow>>,
+        // If available, attempt to update the render-extracted windows map.
+        mut extracted_windows: Option<ResMut<bevy::render::view::window::ExtractedWindows>>,
+        render_device: Res<bevy::render::renderer::RenderDevice>,
+        frame: Res<GlobalFrameCount>,
+        mode: Res<ResolutionSetMode>,
+    ) {
+        // This was an experimental mitigation to force surface reconfigure on
+        // the render thread. In practice it can desynchronize the render
+        // world's swapchain/surface size from the main world's window/camera
+        // state (viewport sizes, multiview splits), which can trigger wgpu
+        // validation errors like "Encoder is invalid".
+        //
+        // Keep it available for experiments, but default it off.
+        let enable = std::env::var("MCBAISE_RENDER_THREAD_GEOM_APPLY")
+            .as_deref()
+            .unwrap_or("0")
+            == "1";
+        if !enable {
+            return;
+        }
+
+        // Only act when a pending geometry change has been scheduled by
+        // the main world (we set `pending = true` there to request the
+        // render thread to actually apply the change).
+        if !pending_geom.pending {
+            return;
+        }
+
+        // Apply immediately during Render `Prepare`.
+        // This runs before the render graph records command buffers, so we
+        // should not be "mid-recording" here. Delaying by one frame can
+        // temporarily desync the configured surface size from extracted view
+        // sizes, which has been observed to trigger wgpu validation errors.
+        pending_geom.scheduled_frame = Some(frame.0);
+
+        // Conservative drain before mutating surface-backed state.
+        wait_for_device_idle_strong(&*render_device);
+
+        // Apply on the render thread if a Window is available in the
+        // render world. Bevy extracts `Window` into the render app, so
+        // this usually succeeds.
+            if let Ok(mut window) = windows.single_mut() {
+            let curr_w = window.physical_width();
+            let curr_h = window.physical_height();
+            let mut w = pending_geom.target_w;
+            let mut h = pending_geom.target_h;
+            if w == 0 { w = curr_w; }
+            if h == 0 { h = curr_h; }
+            eprintln!("native(render): render-thread applying pending geometry -> {}x{} (was {}x{})", w, h, curr_w, curr_h);
+            if *mode == ResolutionSetMode::Physical {
+                window.resolution.set_physical_resolution(w, h);
+            } else {
+                window.resolution.set(w as f32, h as f32);
+            }
+            eprintln!("native(render): render-thread post-set window physical size = {}x{} (requested {}x{})", window.physical_width(), window.physical_height(), w, h);
+            pending_geom.pending = false;
+            pending_geom.scheduled_frame = None;
+            // Clear any handshake ids (already cleared on main) to be safe.
+            // Note: `request_id` and `pending_flag` may not exist in this
+            // build's `PendingWindowGeometry` shape; only clear if present.
+            // (No-op if fields absent.)
+        } else if let Some(mut extracted) = extracted_windows {
+            // Attempt to apply the requested geometry directly into the
+            // render-extracted windows map. This ensures the surface
+            // reconfigure occurs on the render thread even when `Window`
+            // is not available as a resource in this world.
+            let curr = extracted.iter().next().map(|(_, w)| (w.physical_width, w.physical_height));
+            let mut w = pending_geom.target_w;
+            let mut h = pending_geom.target_h;
+            if w == 0 {
+                if let Some((cw, _ch)) = curr { w = cw; }
+            }
+            if h == 0 {
+                if let Some((_cw, ch)) = curr { h = ch; }
+            }
+            let mut applied_any = false;
+            for (_ent, ex_win) in extracted.iter_mut() {
+                // Update the extracted window physical dimensions where available.
+                ex_win.physical_width = w;
+                ex_win.physical_height = h;
+                applied_any = true;
+            }
+            if applied_any {
+                eprintln!("native(render): applied pending geometry into ExtractedWindows -> {}x{}", w, h);
+                pending_geom.pending = false;
+                pending_geom.scheduled_frame = None;
+            } else {
+                eprintln!("native(render): ExtractedWindows present but contained no entries to apply geometry");
+            }
+        } else {
+            eprintln!("native(render): no Window or ExtractedWindows resource in render world to apply pending geometry");
+        }
+    }
+
+    // Run the render-thread apply during the Render Prepare stage so that
+    // the render world has extracted `Window` and other view state available
+    // before the render graph executes. Place it after the attachment
+    // snapshot so we have instrumentation prior to applying geometry.
+    render_app.add_systems(
+        bevy::render::Render,
+        render_apply_pending_geometry_system
+            .in_set(RenderSystems::Prepare)
+            .before(render_graph_attachment_snapshot_system),
+    );
+
+    // Diagnostic probe: log which window/surface-related resources exist
+    // in the render world during Prepare. This helps determine whether the
+    // render world exposes `Window`, `WindowSurfaces`, or `ExtractedWindows`.
+    fn render_prepare_resource_probe_system(
+        ws_res: Option<Res<WindowSurfaces>>,
+        // Use a fully-qualified path to the ExtractedWindows type. If the
+        // type isn't available in this Bevy build the `Option<Res<...>>`
+        // will simply be `None` and logging will reflect that.
+        extracted: Option<Res<bevy::render::view::window::ExtractedWindows>>,
+    ) {
+        let mut parts: Vec<&'static str> = Vec::new();
+        if ws_res.is_some() { parts.push("WindowSurfaces"); }
+        if extracted.is_some() { parts.push("ExtractedWindows"); }
+        if parts.is_empty() {
+            eprintln!("native(render): Prepare probe - no window/surface resources present");
+        } else {
+            eprintln!("native(render): Prepare probe - found: {}", parts.join(", "));
+        }
+    }
+
+    if render_probes_enabled {
+        render_app.add_systems(
+            bevy::render::Render,
+            render_prepare_resource_probe_system
+                .in_set(RenderSystems::Prepare)
+                .after(render_apply_pending_geometry_system),
+        );
+    }
 
     // Instrumentation: capture a snapshot of attachments and pending drops
     // at the start of each render frame. This helps correlate which images
@@ -5048,10 +5681,59 @@ pub fn main() {
     // the main world destructively drops GPU-backed resources.
     // Register the instrumentation snapshot early in the render pipeline so
     // we observe the attachment set just prior to graph execution.
-    render_app.add_systems(
-        bevy::render::Render,
-        render_graph_attachment_snapshot_system.in_set(RenderSystems::Prepare),
-    );
+    if render_probes_enabled {
+        render_app.add_systems(
+            bevy::render::Render,
+            render_graph_attachment_snapshot_system.in_set(RenderSystems::Prepare),
+        );
+    }
+
+    // Post-graph instrumentation: capture a snapshot immediately after
+    // the render graph has executed so we can correlate which attachments
+    // remain live when the graph finishes (helps identify late-held
+    // SurfaceTexture references or lingering encoder state).
+    fn render_graph_post_frame_snapshot_system(
+        images: Option<Res<Assets<Image>>>,
+        gpu_images: Option<Res<bevy::render::render_asset::RenderAssets<GpuImage>>>,
+        frame: Res<GlobalFrameCount>,
+        render_queue: Option<Res<bevy::render::renderer::RenderQueue>>,
+    ) {
+        eprintln!("native(render): post-graph attachment snapshot frame={}", frame.0);
+        if let Some(imgs) = images.as_ref() {
+            eprintln!("native(render): [post] Assets<Image> count={}", imgs.len());
+            for (h, img) in imgs.iter().take(48) {
+                eprintln!(
+                    "native(render): [post] Image handle={:?} size={:?} label={:?}",
+                    h, img.texture_descriptor.size, img.texture_descriptor.label
+                );
+            }
+        }
+        if let Some(gimgs) = gpu_images {
+            let mut seen = 0usize;
+            for (id, g) in gimgs.iter() {
+                if seen < 48 {
+                    eprintln!(
+                        "native(render): [post] GpuImage id={:?} size={:?}",
+                        id, g.size
+                    );
+                }
+                seen += 1;
+            }
+            eprintln!("native(render): [post] RenderAssets<GpuImage> sample_count={}", seen.min(48));
+        }
+        if render_queue.is_some() {
+            eprintln!("native(render): [post] RenderQueue present");
+        }
+    }
+
+    if render_probes_enabled {
+        render_app.add_systems(
+            bevy::render::Render,
+            render_graph_post_frame_snapshot_system
+                .in_set(RenderSystems::Cleanup)
+                .after(render_receive_surfaces_system),
+        );
+    }
 
     // Render-side: resize our size-dependent Images (readback / preview / capture)
     // when the main world has requested a window geometry change. Running this
@@ -5134,6 +5816,7 @@ pub fn main() {
         mut delayed_opt: Option<ResMut<DelayedAttachmentDrops>>,
         render_device: Res<bevy::render::renderer::RenderDevice>,
         frame: Res<GlobalFrameCount>,
+        completed: Option<Res<CompletedDropIds>>,
     ) {
         // If there's no pending drops table, nothing to finalize.
         let mut pending = match pending_opt {
@@ -5176,12 +5859,20 @@ pub fn main() {
                     remaining.push((handle, allowed_frame, flag_opt));
                     continue;
                 }
+                // If a completion flag was registered, prefer that. Otherwise,
+                // consult the `CompletedDropIds` list populated by the async
+                // pump system. If neither indicates completion, keep entry.
+                let completed_present = completed.as_ref().map_or(false, |c| c.0.contains(&handle.id()));
                 if let Some(flag) = flag_opt {
-                    if !flag.load(Ordering::SeqCst) {
+                    if !flag.load(Ordering::SeqCst) && !completed_present {
                         // submission not yet completed; keep for later
                         remaining.push((handle, allowed_frame, Some(flag)));
                         continue;
                     }
+                } else if !completed_present {
+                    // No atomic flag recorded; wait for async completion marker.
+                    remaining.push((handle, allowed_frame, None));
+                    continue;
                 }
                 let present = images.get(&handle).is_some();
                 eprintln!(
@@ -5211,8 +5902,93 @@ pub fn main() {
 
     render_app.add_systems(
         bevy::render::Render,
+        render_async_completion_pump_system.in_set(RenderSystems::Cleanup).before(render_attachment_final_drop_system),
+    );
+
+    render_app.add_systems(
+        bevy::render::Render,
         render_attachment_final_drop_system.in_set(RenderSystems::Cleanup).after(render_asset_drop_consume_system),
     );
+
+    // Finalizer for stashed WindowSurfaces: only drop stashed surfaces once
+    // both the scheduled frame has been reached and the on_submitted_work_done
+    // callback (if registered) has fired. This provides a strong multi-factor
+    // gate to avoid destroying semaphore-backed surface resources while the
+    // driver still references them.
+    fn render_stashed_window_surfaces_finalizer(
+        mut stashed_res: Option<ResMut<StashedWindowSurfaces>>,
+        frame: Res<GlobalFrameCount>,
+        render_device: Option<Res<bevy::render::renderer::RenderDevice>>,
+        render_queue: Option<Res<bevy::render::renderer::RenderQueue>>,
+        completed: Option<Res<CompletedDropIds>>,
+    ) {
+        let mut stashed = match stashed_res {
+            Some(s) => s,
+            None => return,
+        };
+
+        if stashed.entries.is_empty() { return; }
+
+        eprintln!("native(render): stashed WindowSurfaces finalizer running frame={} entries={}", frame.0, stashed.entries.len());
+
+        let mut remaining: Vec<(u64, WindowSurfaces, u64, Option<Arc<AtomicBool>>)> = Vec::new();
+        for (id, surfaces, allowed_frame, flag_opt) in stashed.entries.drain(..) {
+            if frame.0 < allowed_frame {
+                remaining.push((id, surfaces, allowed_frame, flag_opt));
+                continue;
+            }
+            if let Some(flag) = flag_opt {
+                if !flag.load(Ordering::SeqCst) {
+                    // on_submitted_work_done hasn't fired yet; keep it.
+                    remaining.push((id, surfaces, allowed_frame, Some(flag)));
+                    continue;
+                }
+            }
+
+            eprintln!("native(render): finalizing stashed WindowSurfaces id={} at frame={}", id, frame.0);
+            // As a last defense, perform a strong device idle before drop if
+            // we have a RenderDevice available.
+            if let Some(dev) = render_device.as_ref() {
+                wait_for_device_idle_strong(&**dev);
+            }
+            // Conservative per-stash noop-before-drop: if we have access to
+            // the render queue, emit an explicit noop submit+wait for this
+            // particular stash entry immediately before dropping it. This
+            // creates a clear submission/fence boundary that reduces the
+            // chance of driver-held acquire-semaphores still referencing the
+            // surface when we unconfigure/drop it.
+            if let (Some(dev), Some(queue)) = (render_device.as_ref(), render_queue.as_ref()) {
+                eprintln!("native(render): issuing per-stash noop-before-drop id={} acquire_snapshot={}", id, ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst));
+                submit_noop_and_wait(&**dev, &**queue);
+            }
+            // dropping `surfaces` here can unconfigure/destroy backing
+            // surface resources (wgpu Surface / swapchain) which some
+            // Vulkan drivers will panic on if acquire semaphores are
+            // still referenced. As a conservative development-time
+            // workaround we intentionally leak the stashed `WindowSurfaces`
+            // instead of dropping them immediately. This prevents the
+            // panic while preserving the ability to observe and debug
+            // which submits remain live. If you prefer the original
+            // behavior, replace `mem::forget` with `drop`.
+            eprintln!(
+                "native(render): skipping drop (leak) of stashed WindowSurfaces id={} to avoid semaphore race",
+                id
+            );
+            std::mem::forget(surfaces);
+        }
+
+        stashed.entries = remaining;
+    }
+
+    render_app.add_systems(
+        bevy::render::Render,
+        render_stashed_window_surfaces_finalizer.in_set(RenderSystems::Cleanup).after(render_attachment_final_drop_system),
+    );
+
+    // Note: SurfaceData is private to Bevy; we avoid trying to stash or
+    // manually drop it from application code. See comments where we
+    // attempted this change earlier; instead we rely on increased gating
+    // and noop-submits to reduce race conditions on drivers.
 
     // Aggressive pre-cleanup wait: run at the start of Cleanup to give the
     // device an extra-long drain before any cleanup or surface/resource
@@ -5285,6 +6061,13 @@ pub fn main() {
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, update_overlay_ui_camera);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, gate_overlay_ui_camera_system.after(update_overlay_ui_camera));
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        gate_main_cameras_during_geometry_system.after(gate_overlay_ui_camera_system),
+    );
 
     // Execution-phase systems: perform actual camera/scene despawn+recreate
     // once the render cleanup monitor has signalled readiness.
@@ -6149,6 +6932,46 @@ fn setup_scene(
         Name::new("subject_fill_light"),
     ));
 
+    // If the `burn_human` feature is not enabled, spawn a lightweight
+    // glass doughnut (torus) as a placeholder subject so the scene isn't empty.
+    #[cfg(not(feature = "burn_human"))]
+    {
+        // Torus parameters (kept small for performance).
+        let major = HUMAN_RADIUS * 0.9;
+        let minor = HUMAN_RADIUS * 0.28;
+        let tubular_segments: usize = 128;
+        let radial_segments: usize = 32;
+
+        // Build a smooth parametric torus to avoid seam/loop artifacts.
+        let torus_mesh = meshes.add(build_torus_mesh(
+            major,
+            minor,
+            tubular_segments,
+            radial_segments,
+        ));
+        let torus_mat = std_materials.add(StandardMaterial {
+            base_color: Color::srgb(0.45, 0.82, 1.0).with_alpha(0.35),
+            metallic: 0.0,
+            reflectance: 0.95,
+            perceptual_roughness: 0.04,
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            ..default()
+        });
+
+        // Spawn as `SubjectTag` so existing subject transforms/logic apply.
+        commands.spawn((
+            Mesh3d(torus_mesh),
+            MeshMaterial3d(torus_mat),
+            Transform::default(),
+            SubjectTag,
+            Name::new("placeholder_doughnut"),
+        ));
+
+        // Mark spawned so other systems don't try to spawn again.
+        commands.insert_resource(BurnHumanSpawned(true));
+    }
+
     // Native: a dedicated full-window overlay camera for egui captions/credits/UI.
     // This avoids anchoring egui to the first 3D camera's viewport when multiview is enabled.
     #[cfg(not(target_arch = "wasm32"))]
@@ -6326,24 +7149,84 @@ fn update_overlay_ui_camera(
     }
 }
 
+// During teardown / resize / exit, disable the overlay 2D camera.
+// This prevents the Core2D main opaque pass from running while the window
+// surface/swapchain is being reconfigured or destroyed, which otherwise can
+// trigger wgpu validation errors like "In a pass parameter: Encoder is invalid".
+#[cfg(not(target_arch = "wasm32"))]
+fn gate_overlay_ui_camera_system(
+    teardown: Res<TeardownState>,
+    pending_geom: Res<PendingWindowGeometry>,
+    mut cams: Query<&mut Camera, With<OverlayUiCamera>>,
+    mut app_exit: MessageReader<bevy::app::AppExit>,
+    mut window_close: MessageReader<bevy::window::WindowCloseRequested>,
+) {
+    let exit_requested = !app_exit.is_empty() || !window_close.is_empty();
+    if exit_requested {
+        app_exit.clear();
+        window_close.clear();
+    }
+
+    let disable = exit_requested || teardown.active || pending_geom.pending;
+    for mut cam in &mut cams {
+        cam.is_active = !disable;
+        if disable {
+            cam.clear_color = ClearColorConfig::None;
+        }
+    }
+}
+
+// Disable non-overlay cameras while a resize/teardown is in progress.
+// Important: only forces cameras OFF; it does not force-enable them again,
+// so other systems remain in control of camera activation.
+#[cfg(not(target_arch = "wasm32"))]
+fn gate_main_cameras_during_geometry_system(
+    teardown: Res<TeardownState>,
+    pending_geom: Res<PendingWindowGeometry>,
+    mut cams: Query<&mut Camera, (With<ViewCamera>, Without<OverlayUiCamera>)>,
+) {
+    let disable = teardown.active || pending_geom.pending;
+    for mut cam in &mut cams {
+        cam.is_active = !disable;
+        if disable {
+            cam.clear_color = ClearColorConfig::None;
+        }
+    }
+}
+
 // Watch for a UI-requested window geometry change to settle, then request a camera restart.
 fn window_geometry_watch_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut pending_geom: ResMut<PendingWindowGeometry>,
     mut restart_req: ResMut<CameraRestartRequested>,
-    mut scene_restart: ResMut<SceneRestartRequested>,
     mut teardown: ResMut<TeardownState>,
     loading: Res<LoadingState>,
+    frame: Res<GlobalFrameCount>,
 ) {
     if !pending_geom.pending {
         return;
     }
+
+    // The `Window` component updates immediately when we call
+    // `set_physical_resolution`, but the render surface reconfiguration happens
+    // later, and Bevy's pipelined rendering means render-world state can lag.
+    // Keep `pending` asserted for a few frames after the deferred apply frame
+    // to avoid transient mismatches (e.g. depth vs color attachment size).
+    const WINDOW_GEOM_STABILIZE_FRAMES: u64 = 3;
+    if let Some(applied_frame) = pending_geom.scheduled_frame {
+        let hold_until = applied_frame.saturating_add(WINDOW_GEOM_STABILIZE_FRAMES);
+        if frame.0 <= hold_until {
+            return;
+        }
+    }
+
     let Some(window) = windows.iter().next() else { return; };
     let ww = window.physical_width();
     let wh = window.physical_height();
     if ww == 0 || wh == 0 { return; }
     if ww == pending_geom.target_w && wh == pending_geom.target_h {
         pending_geom.pending = false;
+        pending_geom.scheduled_frame = None;
         // Only activate teardown if the app has finished initial loading and
         // GPU-ready handshake — avoid tearing down resources during startup.
         if loading.stage == LoadingStage::Ready {
@@ -6358,6 +7241,11 @@ fn window_geometry_watch_system(
                 teardown.frames_left = 4;
                 eprintln!("native: window geometry settled -> starting teardown countdown (forced)");
             } else {
+                // We no longer do destructive teardown for simple resizes, but we
+                // still need to ensure view cameras come back and their state is
+                // refreshed. Without this, cameras can remain inactive from the
+                // pending-resize gating frame and views appear black.
+                restart_req.requested = true;
                 eprintln!("native: window geometry settled -> resizing in-place (no teardown)");
             }
         } else {
@@ -6369,10 +7257,24 @@ fn window_geometry_watch_system(
 // Automated resize stepper (mirrors `resize_test.rs` stepping behavior).
 fn resize_automation_step(
     mut auto: ResMut<ResizeAutomation>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
     mut pending_geom: ResMut<PendingWindowGeometry>,
+    mut deferred: ResMut<DeferredWindowResolutionChange>,
+    frame: Res<GlobalFrameCount>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut app_exit: MessageWriter<AppExit>,
 ) {
     if !auto.active {
+        return;
+    }
+
+    if auto.env_forced && frame.0 < auto.start_frame {
+        return;
+    }
+
+    if auto.exit_requested {
+        if !pending_geom.pending && !deferred.pending {
+            app_exit.write(AppExit::Success);
+        }
         return;
     }
 
@@ -6380,6 +7282,30 @@ fn resize_automation_step(
     if !auto.first_frame {
         auto.first_frame = true;
         return;
+    }
+
+    // Throttle how quickly we step the window size. If we resize too often,
+    // camera gating will blank most frames and the output looks "mostly black".
+    let step_every_frames = auto.step_every_frames.max(1);
+    if auto.next_step_frame != 0 && frame.0 < auto.next_step_frame {
+        return;
+    }
+
+    // Only issue the next step when the previous resize has fully settled.
+    // Otherwise `pending` stays asserted continuously and view cameras remain
+    // gated off (black views).
+    if pending_geom.pending || deferred.pending {
+        return;
+    }
+
+    if !auto.seeded_from_window {
+        if let Some(win) = windows.iter().next() {
+            let w = win.physical_width().max(1).min(u32::from(u16::MAX)) as u16;
+            let h = win.physical_height().max(1).min(u32::from(u16::MAX)) as u16;
+            auto.width = w;
+            auto.height = h;
+        }
+        auto.seeded_from_window = true;
     }
 
     const MAX_WIDTH: u16 = 401;
@@ -6422,17 +7348,41 @@ fn resize_automation_step(
         }
     }
 
-    // If changed, apply to primary window and request resize handshake.
+    // If changed, schedule a deferred window resize and arm the resize handshake.
     if w != auto.width || h != auto.height {
         auto.width = w;
         auto.height = h;
-        if let Some(mut window) = windows.iter_mut().next() {
-            window.resolution.set_physical_resolution(w as u32, h as u32);
-            pending_geom.pending = true;
-            pending_geom.target_w = w as u32;
-            pending_geom.target_h = h as u32;
-            eprintln!("native: resize-automation requested geometry -> {}x{}", w, h);
+
+        // Defer the actual resize to next frame to keep the render-world surface
+        // reconfigure away from the same frame as UI layout and to give camera
+        // gating time to kick in.
+        pending_geom.pending = true;
+        pending_geom.target_w = w as u32;
+        pending_geom.target_h = h as u32;
+        // `scheduled_frame` tracks the deferred apply frame (not the schedule frame).
+        // The settle watcher will keep `pending` asserted for a few frames after.
+        pending_geom.scheduled_frame = Some(frame.0 + 1);
+
+        deferred.pending = true;
+        deferred.target_w = w as u32;
+        deferred.target_h = h as u32;
+        deferred.apply_frame = frame.0 + 1;
+
+        // Leave some frames between steps so the scene is visible.
+        auto.next_step_frame = frame.0 + step_every_frames;
+
+        auto.steps_done = auto.steps_done.saturating_add(1);
+        if auto.max_steps > 0 && auto.steps_done >= auto.max_steps {
+            auto.exit_requested = true;
         }
+
+        eprintln!(
+            "native: resize-automation scheduled geometry -> {}x{} (apply_frame={}, frame={})",
+            w,
+            h,
+            deferred.apply_frame,
+            frame.0
+        );
     }
 }
 
@@ -6442,6 +7392,10 @@ fn sync_resize_toggle_system(
     mut auto: ResMut<ResizeAutomation>,
     windows: Query<&Window, With<PrimaryWindow>>,
 ) {
+    if auto.env_forced {
+        return;
+    }
+
     if capture_state.resize_automation_active && !auto.active {
         // Activate: seed from current window physical size
         if let Some(win) = windows.iter().next() {
@@ -6451,10 +7405,15 @@ fn sync_resize_toggle_system(
             auto.height = h;
         }
         auto.first_frame = false;
+        auto.next_step_frame = 0;
         auto.active = true;
+        auto.seeded_from_window = true;
+        auto.steps_done = 0;
+        auto.exit_requested = false;
         eprintln!("native: resize automation enabled");
     } else if !capture_state.resize_automation_active && auto.active {
         auto.active = false;
+        auto.next_step_frame = 0;
         eprintln!("native: resize automation disabled");
     }
 }
@@ -6489,14 +7448,18 @@ fn restart_cameras_system(
     sleep(Duration::from_millis(4));
 
     for mut cam in params.p0().iter_mut() {
+        cam.is_active = true;
         cam.order = 10_000;
         cam.clear_color = ClearColorConfig::None;
     }
 
-    for (mut cam, mut transform) in params.p1().iter_mut() {
+    for (mut cam, _transform) in params.p1().iter_mut() {
+        // Critical: do not reset the camera transform here.
+        // The tube-ride camera is animated; resetting the transform makes the
+        // scene look like it's replaying previously-rendered frames.
+        cam.is_active = true;
         cam.order = 0;
         cam.clear_color = ClearColorConfig::Default;
-        *transform = Transform::from_xyz(0.0, 0.0, -8.0).looking_at(Vec3::ZERO, Vec3::Y);
     }
     // Keep pending_drops resource present for future destructive operations.
     let _ = &mut *pending_drops;
@@ -6571,14 +7534,21 @@ fn restart_cameras_execute_system(
     }
 }
 
-// Cycle through preset output/window resolutions when the user right-clicks.
-fn cycle_resolution_on_right_click(
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+// Cycle through preset output/window resolutions when the user right-clicks
+// the resize icon in the egui overlay.
+fn cycle_resolution_on_resize_icon_request_system(
     mut capture_state: ResMut<EguiCaptureState>,
     mut pending_window_geometry: ResMut<PendingWindowGeometry>,
+    mut deferred: ResMut<DeferredWindowResolutionChange>,
+    frame: Res<GlobalFrameCount>,
 ) {
-    if !mouse.just_pressed(MouseButton::Right) {
+    if !capture_state.cycle_resolution_requested {
+        return;
+    }
+    // Consume the request even if we're busy to avoid repeated cycling.
+    capture_state.cycle_resolution_requested = false;
+
+    if pending_window_geometry.pending || deferred.pending {
         return;
     }
 
@@ -6608,13 +7578,14 @@ fn cycle_resolution_on_right_click(
     let (w, h, _label) = resolutions[next_index];
     capture_state.selected_resolution = next_index as i32;
 
-    if let Some(mut window) = windows.iter_mut().next() {
-        window.resolution.set_physical_resolution(w, h);
-        pending_window_geometry.pending = true;
-        pending_window_geometry.target_w = w;
-        pending_window_geometry.target_h = h;
-        eprintln!("native: right-click cycled window geometry -> {}x{}", w, h);
-    }
+    schedule_window_geometry_change(
+        &mut pending_window_geometry,
+        &mut deferred,
+        w,
+        h,
+        frame.0,
+        "resize icon right-click cycled",
+    );
 }
 
 // Countdown system: while teardown is active, decrement frames; when it reaches
@@ -6884,24 +7855,56 @@ fn update_fluid_simulation(
     // Update fluid simulation
     fluid_sim.update(time.delta_secs(), playback.time_sec);
 
-    // Create or update velocity texture
-    let velocity_texture = create_fluid_texture(
+    // If fluid textures are not enabled, do not allocate GPU textures yet.
+    // The simulation still advances (so enabling later will be smooth), but
+    // we avoid creating `Image` assets until the feature is enabled.
+    if !fluid_sim.enabled {
+        return;
+    }
+
+    // Create or update velocity texture (create-once, then update data)
+    let velocity_image = create_fluid_texture(
         &fluid_sim.velocity_field,
         fluid_sim.width,
         fluid_sim.height,
         true,
     );
-    let velocity_handle = images.add(velocity_texture);
+    let velocity_handle = if let Some(handle) = &fluid_sim.velocity_handle {
+        if let Some(img) = images.get_mut(handle) {
+            img.data = velocity_image.data;
+            Some(handle.clone())
+        } else {
+            let h = images.add(velocity_image);
+            fluid_sim.velocity_handle = Some(h.clone());
+            Some(h)
+        }
+    } else {
+        let h = images.add(velocity_image);
+        fluid_sim.velocity_handle = Some(h.clone());
+        Some(h)
+    };
 
-    // Create or update density texture
-    let density_texture =
-        create_fluid_texture_density(&fluid_sim.density_field, fluid_sim.width, fluid_sim.height);
-    let density_handle = images.add(density_texture);
+    // Create or update density texture (create-once, then update data)
+    let density_image = create_fluid_texture_density(&fluid_sim.density_field, fluid_sim.width, fluid_sim.height);
+    let density_handle = if let Some(handle) = &fluid_sim.density_handle {
+        if let Some(img) = images.get_mut(handle) {
+            img.data = density_image.data;
+            Some(handle.clone())
+        } else {
+            let h = images.add(density_image);
+            fluid_sim.density_handle = Some(h.clone());
+            Some(h)
+        }
+    } else {
+        let h = images.add(density_image);
+        fluid_sim.density_handle = Some(h.clone());
+        Some(h)
+    };
 
     // Update tube material with fluid textures
     if let Some(material) = tube_materials.get_mut(&tube_scene.tube_material) {
-        material.fluid_velocity = Some(velocity_handle);
-        material.fluid_density = Some(density_handle);
+        material.fluid_velocity = velocity_handle.clone();
+        material.fluid_density = density_handle.clone();
     }
 }
 
@@ -7152,6 +8155,9 @@ struct EguiCaptureState {
     output_scale: f32,
     // selected window resolution index (-1 for custom/none)
     selected_resolution: i32,
+
+    // UI request: cycle preset resolution (set by resize icon right-click)
+    cycle_resolution_requested: bool,
 }
 
 impl Default for EguiCaptureState {
@@ -7173,6 +8179,8 @@ impl Default for EguiCaptureState {
             last_capture_time_secs: 0.0,
             output_scale: 1.0,
             selected_resolution: -1,
+
+            cycle_resolution_requested: false,
         }
     }
 }
@@ -7643,7 +8651,7 @@ fn update_tube_and_subject(
                 auto_subject.schedule_next_switch();
             }
         }
-        SubjectMode::Human | SubjectMode::Ball => {
+        SubjectMode::Human | SubjectMode::Doughnut | SubjectMode::Ball => {
             auto_subject.current = *subject_mode;
         }
     }
@@ -7791,6 +8799,7 @@ fn update_tube_and_subject(
 
     let r_ring = match active_subject_mode {
         SubjectMode::Human => dyns.human_r.max(0.25),
+        SubjectMode::Doughnut => dyns.human_r.max(0.25),
         SubjectMode::Ball => dyns.ball_r.max(0.25),
         SubjectMode::Auto | SubjectMode::Random => dyns.human_r.max(0.25),
     };
@@ -7802,6 +8811,7 @@ fn update_tube_and_subject(
     // Damping acts like friction along the tube wall.
     let damping = match active_subject_mode {
         SubjectMode::Human => 0.55,
+        SubjectMode::Doughnut => 0.55,
         SubjectMode::Ball => 0.35,
         SubjectMode::Auto | SubjectMode::Random => 0.55,
     };
@@ -7877,6 +8887,7 @@ fn update_tube_and_subject(
 
     let active_r = match active_subject_mode {
         SubjectMode::Human => dyns.human_r,
+        SubjectMode::Doughnut => dyns.human_r,
         SubjectMode::Ball => dyns.ball_r,
         SubjectMode::Auto | SubjectMode::Random => dyns.human_r,
     };
@@ -8017,6 +9028,7 @@ fn update_tube_and_subject(
     if let Ok(mut light_tr) = subject_light.single_mut() {
         let active_pos = match active_subject_mode {
             SubjectMode::Human => subject_pos_human,
+            SubjectMode::Doughnut => subject_pos_human,
             SubjectMode::Ball => subject_pos_ball,
             SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
         };
@@ -8089,6 +9101,7 @@ fn apply_subject_mode(
 
     let (show_human, show_ball) = match active {
         SubjectMode::Human => (true, false),
+        SubjectMode::Doughnut => (true, false),
         SubjectMode::Ball => (false, true),
         SubjectMode::Auto | SubjectMode::Random => (true, false),
     };
@@ -8569,8 +9582,7 @@ fn ui_overlay(
     mut teardown,
     pending,
     loading_state,
-     }: UiOverlayParams,
- ) {
+     }: UiOverlayParams) {
     // Handle ESC priority
     if keys.just_pressed(KeyCode::Escape) {
         if capture_state.show_info {
@@ -8579,6 +9591,24 @@ fn ui_overlay(
             capture_state.visible = false;
         } else if overlay_vis.show {
             overlay_vis.show = false;
+        }
+    }
+
+    // Minimal resolution overlay: always-visible small widget that shows
+    // the primary window physical resolution. Useful for debugging resize
+    // behavior on both native and wasm without adding interactive controls.
+    if let Ok(ctx) = egui_contexts.ctx_mut() {
+        if let Some(mut win_iter) = windows.iter_mut().next() {
+            let w = win_iter.resolution.physical_width();
+            let h = win_iter.resolution.physical_height();
+            egui::Window::new("resolution_overlay")
+                .title_bar(false)
+                .resizable(false)
+                .collapsible(false)
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .show(ctx, |ui| {
+                    ui.label(format!("Resolution: {} x {}", w, h));
+                });
         }
     }
 
@@ -9113,10 +10143,11 @@ fn ui_overlay(
                 if !multi_view.increment() {
                     multi_view_hint.show(now_sec, "right click (or tap & hold) to remove");
                 }
-            } else if (resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched())
-                && !multi_view.decrement()
-            {
-                multi_view_hint.show(now_sec, "left click/tap to add more");
+            } else if resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched() {
+                if !multi_view.decrement() {
+                    // Already at 1 view; explain how to add splits back.
+                    multi_view_hint.show(now_sec, "left click/tap to add more");
+                }
             }
         });
 
@@ -9337,6 +10368,12 @@ fn ui_overlay(
                                 SubjectMode::Human,
                                 SubjectMode::Human.label(),
                             );
+                            #[cfg(not(feature = "burn_human"))]
+                            ui.selectable_value(
+                                &mut *subject_mode,
+                                SubjectMode::Doughnut,
+                                SubjectMode::Doughnut.label(),
+                            );
                             ui.selectable_value(
                                 &mut *subject_mode,
                                 SubjectMode::Ball,
@@ -9412,7 +10449,11 @@ fn ui_overlay(
                             if *camera_preset != before {
                                 match *camera_preset {
                                     CameraPreset::FollowHumanChase => {
-                                        *subject_mode = SubjectMode::Human
+                                        if cfg!(feature = "burn_human") {
+                                            *subject_mode = SubjectMode::Human
+                                        } else {
+                                            *subject_mode = SubjectMode::Doughnut
+                                        }
                                     }
                                     CameraPreset::FollowBallChase => {
                                         *subject_mode = SubjectMode::Ball
@@ -10293,6 +11334,13 @@ fn ui_overlay(
                 // be initialized and driven on the main App.
                 capture_state.resize_automation_active = !capture_state.resize_automation_active;
             }
+
+            if resp.secondary_clicked() {
+                // Request cycling preset window resolutions. This is consumed
+                // on the next main-world Update to ensure the pending geometry
+                // handshake is armed before the deferred resize is applied.
+                capture_state.cycle_resolution_requested = true;
+            }
         });
 
     if capture_state.show_info {
@@ -10756,6 +11804,7 @@ fn camera_pose(
 
     let active_pos = match subject_mode {
         SubjectMode::Human => subject_pos_human,
+        SubjectMode::Doughnut => subject_pos_human,
         SubjectMode::Ball => subject_pos_ball,
         SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
     };
@@ -10929,6 +11978,7 @@ fn camera_pose(
         if let Some((pass_c, pass_tan, pass_n, _pass_b)) = pass_anchor {
             let active_pos = match subject_mode {
                 SubjectMode::Human => subject_pos_human,
+                SubjectMode::Doughnut => subject_pos_human,
                 SubjectMode::Ball => subject_pos_ball,
                 SubjectMode::Auto | SubjectMode::Random => subject_pos_human,
             };
@@ -11258,6 +12308,68 @@ fn build_tube_mesh(
     mesh
 }
 
+// Parametric torus mesh builder: closed, with consistent normals that wrap.
+fn build_torus_mesh(
+    major: f32,
+    minor: f32,
+    tubular_segments: usize,
+    radial_segments: usize,
+) -> Mesh {
+    let rings = tubular_segments;
+    let ring_verts = radial_segments;
+
+    let mut positions: Vec<[f32; 3]> = Vec::with_capacity(rings * ring_verts);
+    let mut normals: Vec<[f32; 3]> = Vec::with_capacity(rings * ring_verts);
+    let mut uvs: Vec<[f32; 2]> = Vec::with_capacity(rings * ring_verts);
+
+    for i in 0..rings {
+        let u = (i as f32) / (rings as f32);
+        let theta = u * std::f32::consts::TAU;
+        for j in 0..ring_verts {
+            let v = (j as f32) / (ring_verts as f32);
+            let phi = v * std::f32::consts::TAU;
+
+            let cos_theta = theta.cos();
+            let sin_theta = theta.sin();
+            let cos_phi = phi.cos();
+            let sin_phi = phi.sin();
+
+            let x = (major + minor * cos_phi) * cos_theta;
+            let y = minor * sin_phi;
+            let z = (major + minor * cos_phi) * sin_theta;
+
+            let nx = cos_theta * cos_phi;
+            let ny = sin_phi;
+            let nz = sin_theta * cos_phi;
+
+            positions.push([x, y, z]);
+            let n = Vec3::new(nx, ny, nz).normalize_or_zero();
+            normals.push([n.x, n.y, n.z]);
+            uvs.push([u, v]);
+        }
+    }
+
+    let mut indices: Vec<u32> = Vec::with_capacity(rings * ring_verts * 6);
+    for i in 0..rings {
+        let next_i = (i + 1) % rings;
+        for j in 0..ring_verts {
+            let next_j = (j + 1) % ring_verts;
+            let a = (i * ring_verts + j) as u32;
+            let b = (next_i * ring_verts + j) as u32;
+            let c = (next_i * ring_verts + next_j) as u32;
+            let d = (i * ring_verts + next_j) as u32;
+            indices.extend_from_slice(&[a, b, d, b, c, d]);
+        }
+    }
+
+    let mut mesh = Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default());
+    mesh.insert_indices(Indices::U32(indices));
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, uvs);
+    mesh
+}
+
 // ---------------------------- fluid simulation ----------------------------
 
 #[derive(Resource)]
@@ -11272,6 +12384,10 @@ struct FluidSimulation {
     height: usize,
     time: f32,
     frame: u32,
+    // Whether the fluid feature is enabled (controls lazy creation of GPU textures)
+    enabled: bool,
+    velocity_handle: Option<bevy::prelude::Handle<Image>>,
+    density_handle: Option<bevy::prelude::Handle<Image>>,
 }
 
 impl Default for FluidSimulation {
@@ -11324,6 +12440,9 @@ impl Default for FluidSimulation {
             height,
             time: 0.0,
             frame: 0,
+            enabled: false,
+            velocity_handle: None,
+            density_handle: None,
         }
     }
 }
