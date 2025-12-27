@@ -6,6 +6,10 @@ vars:
   MCBAISE_WWW_DIR: crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www
   MCBAISE_WASM_PROFILE: wasm-release
   MCBAISE_PORT: '5173'
+  # Default backend used by automated smoke tests.
+  # On Windows, Vulkan runtimes/drivers are not always installed; DX12 is a safer default.
+  # Override per task invocation, e.g. `task test:readback backend=dx11`.
+  MCBAISE_TEST_WGPU_BACKEND: '{{if eq OS "windows"}}dx12{{else}}vulkan{{end}}'
 
 
 tasks:
@@ -530,8 +534,10 @@ tasks:
 
   test:readback:
     desc: One-shot GPU readback smoke test (scene only)
+    vars:
+      backend: '{{default .MCBAISE_TEST_WGPU_BACKEND .backend}}'
     env:
-      WGPU_BACKEND: 'vulkan'
+      WGPU_BACKEND: '{{.backend}}'
       WGPU_ERROR_MODE: 'nonfatal'
       RUST_BACKTRACE: 'full'
       BEVY_BACKTRACE: 'full'
@@ -544,8 +550,10 @@ tasks:
 
   test:readback:overlays:
     desc: One-shot GPU readback smoke test (include overlay composite)
+    vars:
+      backend: '{{default .MCBAISE_TEST_WGPU_BACKEND .backend}}'
     env:
-      WGPU_BACKEND: 'vulkan'
+      WGPU_BACKEND: '{{.backend}}'
       WGPU_ERROR_MODE: 'nonfatal'
       RUST_BACKTRACE: 'full'
       BEVY_BACKTRACE: 'full'
@@ -559,8 +567,10 @@ tasks:
 
   test:autocycle:
     desc: Smoke-test rapid auto-cycled window resizes (Vulkan) and exit cleanly
+    vars:
+      backend: '{{default .MCBAISE_TEST_WGPU_BACKEND .backend}}'
     env:
-      WGPU_BACKEND: 'vulkan'
+      WGPU_BACKEND: '{{.backend}}'
       WGPU_ERROR_MODE: 'nonfatal'
       RUST_BACKTRACE: 'full'
       BEVY_BACKTRACE: 'full'
@@ -574,8 +584,10 @@ tasks:
 
   test:autoresize:
     desc: Smoke-test resize-automation stepper (Vulkan) and exit cleanly
+    vars:
+      backend: '{{default .MCBAISE_TEST_WGPU_BACKEND .backend}}'
     env:
-      WGPU_BACKEND: 'vulkan'
+      WGPU_BACKEND: '{{.backend}}'
       WGPU_ERROR_MODE: 'nonfatal'
       RUST_BACKTRACE: 'full'
       BEVY_BACKTRACE: 'full'
@@ -593,8 +605,10 @@ tasks:
 
   test:autoresize:stress:
     desc: Stress-test autoresize (resize every frame, overlays suppressed during resize stream)
+    vars:
+      backend: '{{default .MCBAISE_TEST_WGPU_BACKEND .backend}}'
     env:
-      WGPU_BACKEND: 'vulkan'
+      WGPU_BACKEND: '{{.backend}}'
       WGPU_ERROR_MODE: 'nonfatal'
       RUST_BACKTRACE: 'full'
       BEVY_BACKTRACE: 'full'

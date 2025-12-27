@@ -5,11 +5,6 @@
 // [params0, params1, orange, white, dark_inside, dark_outside]
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> u: array<vec4<f32>, 6>;
 
-@group(#{MATERIAL_BIND_GROUP}) @binding(1) var fluid_velocity_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(2) var fluid_velocity_sampler: sampler;
-@group(#{MATERIAL_BIND_GROUP}) @binding(3) var fluid_density_texture: texture_2d<f32>;
-@group(#{MATERIAL_BIND_GROUP}) @binding(4) var fluid_density_sampler: sampler;
-
 const TAU: f32 = 6.28318530718;
 
 fn aa_band(phase: f32, aa_mul: f32) -> f32 {
@@ -104,6 +99,12 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
     // pattern 1: swirl
     // pattern 2: stripe (wire)
     // pattern 3: swirl (wire)
+    // pattern 4: wave
+    // pattern 5: fractal
+    // pattern 6: particle
+    // pattern 7: grid
+    // pattern 8: hoop (wire)
+    // pattern 9: hoop (alt)
     var phase: f32;
     var base_col: vec3<f32>;
     var final_alpha: f32 = 1.0;
@@ -116,83 +117,32 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
         let t = smoothstep(white_bias, 1.0, aa_band(phase, aa));
         base_col = mix(white.rgb, orange.rgb, t);
     } else if (p == 4) {
-        // fluid: traditional gpgpu-fluid style with dark background and swirling motion
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-        let density = textureSample(fluid_density_texture, fluid_density_sampler, fluid_uv).r;
-
-        // Calculate vorticity (curl) for swirling visualization
-        let eps = 0.005;
-        let vel_right = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv + vec2<f32>(eps, 0.0)).rg;
-        let vel_left = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv - vec2<f32>(eps, 0.0)).rg;
-        let vel_up = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv + vec2<f32>(0.0, eps)).rg;
-        let vel_down = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv - vec2<f32>(0.0, eps)).rg;
-
-        let vorticity = (vel_right.y - vel_left.y - vel_up.x + vel_down.x) / (2.0 * eps);
-
-        // Create fluid-like banded pattern that moves with velocity
-        let flow_angle = atan2(velocity.y, velocity.x);
-        let flow_speed = length(velocity);
-        let swirl_factor = vorticity * 2.0 + density * 3.0;
-
-        // Create phase that combines flow direction with vorticity for swirling motion
-        phase = flow_angle * bands + swirl_factor + time * flow * flow_speed;
-
-        // Use same color mixing as other patterns
-        let t = smoothstep(white_bias, 1.0, aa_band(phase, aa));
-        base_col = mix(white.rgb, orange.rgb, t);
-    } else if (p == 5) {
-        // fluid stripe: flowing stripes advected by fluid velocity
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-        
-        // Advect the UV coordinates based on velocity for flowing stripes
-        let advected_u = mesh.uv.x + velocity.x * 0.1;
-        let advected_v = mesh.uv.y + velocity.y * 0.1;
-        
-        let theta = advected_v * TAU + time * spin + pow(advected_u, 1.18) * TAU * turns;
-        phase = theta * bands + time * flow;
-        let t = smoothstep(white_bias, 1.0, aa_band(phase, aa));
-        base_col = mix(white.rgb, orange.rgb, t);
-    } else if (p == 6) {
-        // fluid swirl: swirling lines advected by fluid velocity
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-
-        // Advect the UV coordinates based on velocity for flowing swirls
-        let advected_u = mesh.uv.x + velocity.x * 0.1;
-        let advected_v = mesh.uv.y + velocity.y * 0.1;
-
-        let theta = advected_v * TAU + time * spin + pow(advected_u, 1.18) * TAU * turns;
-        phase = theta * bands + time * flow;
-        let t = smoothstep(white_bias, 1.0, aa_band(phase, aa));
-        base_col = mix(white.rgb, orange.rgb, t);
-
-    } else if (p == 7) {
-        // Wave: layered sine waves advected by fluid velocity (trippy)
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-        let adv = fluid_uv + velocity * 0.08;
+        // Wave: layered sine waves (procedural)
+        let uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
+        let v = vec2<f32>(
+            sin((uv.y * 3.0 + time * 0.35) * TAU),
+            cos((uv.x * 2.0 - time * 0.27) * TAU),
+        ) * 0.04;
+        let adv = uv + v;
 
         // Two crossing wave fields for interference
         let w1 = sin((adv.x * 12.0 + time * 1.6) * TAU) * 0.5 + 0.5;
         let w2 = sin((adv.y * 18.0 - time * 1.1) * TAU + adv.x * 0.6) * 0.5 + 0.5;
         let wave = pow(w1 * 0.6 + w2 * 0.4, 1.2);
 
-        phase = adv.x * bands * 1.5 + time * flow * (length(velocity) * 0.6 + 0.4);
+        phase = adv.x * bands * 1.5 + time * flow * 0.6;
         let tt = smoothstep(white_bias, 1.0, aa_band(phase, aa));
         // modulate by wave interference for a trippy look
         base_col = mix(white.rgb, orange.rgb, mix(tt, wave, 0.6));
 
-    } else if (p == 8) {
+    } else if (p == 5) {
         // Fractal: simple multi-octave sine "fbm" for psychedelic texture
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
+        let uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
         var f = 0.0;
         var amp = 1.0;
         var freq = 1.0;
         for (var i: i32 = 0; i < 5; i = i + 1) {
-            let a = sin((fluid_uv.x * freq + fluid_uv.y * freq * 0.6 + time * (0.2 * f32(i + 1))) * TAU);
+            let a = sin((uv.x * freq + uv.y * freq * 0.6 + time * (0.2 * f32(i + 1))) * TAU);
             f = f + a * amp;
             amp = amp * 0.5;
             freq = freq * 2.0;
@@ -203,22 +153,20 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
         // push colors more into magenta/blue by using the mix factor nonlinearly
         base_col = mix(white.rgb, orange.rgb, pow(tt * fbm, 0.8));
 
-    } else if (p == 9) {
-        // Particle: spotty particle-like field that drifts with velocity
-        let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-        let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-        let adv = fluid_uv + velocity * 0.12 + vec2<f32>(time * 0.02, -time * 0.015);
+    } else if (p == 6) {
+        // Particle: spotty particle-like field that drifts over time
+        let uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
+        let adv = uv + vec2<f32>(time * 0.02, -time * 0.015);
 
         // Create high-frequency spot field using product of sines
         let s = sin(adv.x * 120.0 * TAU) * sin(adv.y * 120.0 * TAU);
         let spots = smoothstep(0.98, 1.0, s);
-        let density = textureSample(fluid_density_texture, fluid_density_sampler, fluid_uv).r;
-        let brightness = spots * (0.6 + density * 0.8 + length(velocity) * 0.6);
+        let brightness = spots * 0.9;
         base_col = vec3<f32>(0.02) + mix(vec3<f32>(0.0), mix(white.rgb, orange.rgb, 0.9), brightness);
 
         phase = adv.x * bands + time * flow * 0.5;
 
-    } else if (p == 10) {
+    } else if (p == 7) {
         // Grid: compute lines for both UV axis orientations and combine them
         // This ensures the grid wraps correctly regardless of which UV axis is
         // the tube's circumference.
@@ -281,7 +229,7 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
         let wire_col = mix(white.rgb, orange.rgb, 0.5);
         base_col = mix(dark, wire_col, line);
         phase = mesh.uv.x * bands + time * flow;
-    } else if (p == 11) {
+    } else if (p == 8) {
         // HoopWire: pure wireframe — dark faces with hoop rings and vertical
         // grey lines. No colored faces beneath the wires.
         let hoop_resolution = 4800.0;
@@ -320,7 +268,7 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
         skip_depth_mix = true;
         phase = mesh.uv.x * bands + time * flow;
 
-    } else if (p == 12) {
+    } else if (p == 9) {
         // HoopAlt: behave the same as Grid — axis-aligned grid plus hoop rings.
         // Increase hoop density for HoopAlt to match denser default
         let base_grid_u = 192.0;
@@ -381,21 +329,13 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
     let t = smoothstep(white_bias, 1.0, band);
     var col = base_col;
 
-    if (p == 2 || p == 3 || p == 5 || p == 6) {
+    if (p == 2 || p == 3) {
         // Wireframe variants: show mostly dark faces with bright grid lines.
         var wire = 0.0;
         if (p == 3) {
             // Swirl wire: use contours of the swirl pattern
             wire = aa_swirl_wire(phase, aa);
-            } else if (p == 5) {
-            // Fluid stripe wire: advected stripe pattern as wireframe
-            let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
-            let velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).rg;
-            wire = aa_grid_safe(mesh.uv.y, mesh.uv.x, velocity, time, flow, true);
-        } else if (p == 6) {
-            // Fluid swirl wire: advected swirl pattern as wireframe
-            wire = aa_swirl_wire(phase, aa);
-            } else {
+        } else {
             // Stripe wire: use traditional grid
             wire = aa_grid_safe(mesh.uv.y, mesh.uv.x, vec2<f32>(0.0), time, flow, false);
         }

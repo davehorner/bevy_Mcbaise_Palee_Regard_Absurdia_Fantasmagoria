@@ -40,8 +40,6 @@ pub struct BurnHumanAssets;
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "burn_human"))]
 mod native_assets;
-#[cfg(not(target_arch = "wasm32"))]
-use open;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
@@ -177,7 +175,7 @@ fn auto_exit_after_show_for_sec_system(
         Ok(v) => v.parse().ok().unwrap_or(0.0),
         Err(_) => 0.0,
     };
-    if !(show_for_sec > 0.0) {
+    if show_for_sec.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
         return;
     }
 
@@ -387,6 +385,7 @@ struct BurnHumanRagdollRig {
 }
 
 #[cfg(feature = "burn_human")]
+#[allow(clippy::too_many_arguments)]
 fn drive_burn_human_ragdoll(
     burn_enabled: Option<Res<BurnHumanEnabled>>,
     deform_mode: Res<HumanDeformMode>,
@@ -728,7 +727,6 @@ fn spawn_burn_human_when_ready(
             ..Default::default()
         },
         bevy_burn_human::BurnHumanMeshSettings {
-            cache_mesh: false,
             ..Default::default()
         },
         BurnHumanRagdollRig {
@@ -802,7 +800,7 @@ fn render_teardown_monitor_system(render_device: Res<bevy::render::renderer::Ren
     // Use a stronger idle-wait helper that aggressively polls the device
     // to give drivers extra time to finish in-flight work before we signal
     // the main world it's safe to destroy GPU-backed resources.
-    wait_for_device_idle_strong(&*render_device);
+    wait_for_device_idle_strong(&render_device);
     // Drain and signal all pending flags.
     let drained: Vec<_> = guard.drain().collect();
     for (_id, flag) in drained {
@@ -813,9 +811,10 @@ fn render_teardown_monitor_system(render_device: Res<bevy::render::renderer::Ren
 // Render-side consumer: remove image assets from the render world's `Assets<Image>`.
 // This forces the GPU-backed image resources to be dropped on the render thread
 // where wgpu expects them to be freed, avoiding cross-thread swapchain races.
+#[allow(clippy::too_many_arguments)]
 fn render_asset_drop_consume_system(
     images: Option<ResMut<Assets<Image>>>,
-    mut pending_opt: Option<ResMut<PendingRenderAssetDrops>>,
+    pending_opt: Option<ResMut<PendingRenderAssetDrops>>,
     mut staging_res_opt: Option<ResMut<ReadbackStaging>>,
     render_device: Res<bevy::render::renderer::RenderDevice>,
     render_queue: Res<bevy::render::renderer::RenderQueue>,
@@ -824,7 +823,7 @@ fn render_asset_drop_consume_system(
     frame: Res<GlobalFrameCount>,
 ) {
     // If the render world does not have `Assets<Image>` yet, skip safely.
-    let mut images = match images {
+    let images = match images {
         Some(i) => i,
         None => {
             // Nothing to drop on the render side right now.
@@ -847,7 +846,7 @@ fn render_asset_drop_consume_system(
     // based on the render world's `GlobalFrameCount`. This avoids cross-world
     // frame counter mismatch which could otherwise allow premature drops.
     if let Some(sched) = pending.scheduled_frame {
-            if sched == 0 {
+        if sched == 0 {
             // Record a submit-frame hint (proxy for the submission point)
             // and schedule immediate finalization — we rely on per-handle
             // oneshot callbacks (registered below) rather than an extra
@@ -899,25 +898,25 @@ fn render_asset_drop_consume_system(
         }
         let _ = render_device.poll(wgpu::PollType::Wait);
     }
-    wait_for_device_idle_with_hint(&*render_device, frame.0, pending.submit_frame_hint);
+    wait_for_device_idle_with_hint(&render_device, frame.0, pending.submit_frame_hint);
 
     // As an extra safety net, perform a strong idle wait before performing
     // any destructive drops of GPU-backed image resources. This helps ensure
     // surface-acquire semaphores and other transient objects are no longer
     // in use on drivers with delayed teardown semantics.
-    wait_for_device_idle_strong(&*render_device);
+    wait_for_device_idle_strong(&render_device);
 
     // If a readback staging buffer exists in the render world, drop it here
     // so the GPU-backed staging memory is released on the render thread.
-    if let Some(staging_res) = staging_res_opt.as_mut() {
-        if staging_res.buffer.is_some() {
-            eprintln!(
-                "native(render): dropping readback staging buffer ({} bytes)",
-                staging_res.size
-            );
-            staging_res.buffer = None;
-            staging_res.size = 0;
-        }
+    if let Some(staging_res) = staging_res_opt.as_mut()
+        && staging_res.buffer.is_some()
+    {
+        eprintln!(
+            "native(render): dropping readback staging buffer ({} bytes)",
+            staging_res.size
+        );
+        staging_res.buffer = None;
+        staging_res.size = 0;
     }
 
     // Log a snapshot of image handles currently present in the render world's
@@ -959,8 +958,8 @@ fn render_asset_drop_consume_system(
         // allow final destructive drops. The double-noop provides an
         // additional fence so drivers with delayed internal maintenance
         // are more likely to have cleared references.
-        submit_noop_and_wait(&*render_device, &*render_queue);
-        submit_noop_and_wait(&*render_device, &*render_queue);
+        submit_noop_and_wait(&render_device, &render_queue);
+        submit_noop_and_wait(&render_device, &render_queue);
 
         // For each queued handle create a completion waiter and push into
         // the delayed list. Instead of spawning a blocking thread or using
@@ -1010,17 +1009,11 @@ fn render_asset_drop_consume_system(
             // the drop won't wait for an unrelated submit.
             let acq_snapshot = ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst);
             if acq_snapshot > 0 {
-                if let Some(map_lock) = ACQUIRE_WAITS.get() {
-                    if let Ok(mut map) = map_lock.lock() {
-                        map.entry(acq_snapshot).or_insert_with(Vec::new).push(shared_s.clone());
-                    }
-                } else {
-                    let _ = ACQUIRE_WAITS.get_or_init(|| Mutex::new(HashMap::new()));
-                    if let Some(map_lock) = ACQUIRE_WAITS.get() {
-                        if let Ok(mut map) = map_lock.lock() {
-                            map.entry(acq_snapshot).or_insert_with(Vec::new).push(shared_s.clone());
-                        }
-                    }
+                let map_lock = ACQUIRE_WAITS.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Ok(mut map) = map_lock.lock() {
+                    map.entry(acq_snapshot)
+                        .or_insert_with(Vec::new)
+                        .push(shared_s.clone());
                 }
             }
 
@@ -1231,10 +1224,8 @@ fn submit_noop_and_wait(
                     "native(render): warning: teardown in progress and last-submit did not complete in time"
                 );
             }
-        } else {
-            if log_enabled {
-                eprintln!("native(render): teardown in progress; last-submit already completed");
-            }
+        } else if log_enabled {
+            eprintln!("native(render): teardown in progress; last-submit already completed");
         }
         return;
     }
@@ -1242,7 +1233,7 @@ fn submit_noop_and_wait(
     if log_enabled {
         eprintln!("native(render): creating encoder label=mcbaise_pre_unconfigure_noop");
     }
-    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+    let encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mcbaise_pre_unconfigure_noop"),
     });
     let finished = encoder.finish();
@@ -1319,10 +1310,8 @@ fn submit_noop_and_wait(
                     "native(render): warning: maintain did not observe noop submit completion in time"
                 );
             }
-        } else {
-            if log_enabled {
-                eprintln!("native(render): device maintain settled after noop submit");
-            }
+        } else if log_enabled {
+            eprintln!("native(render): device maintain settled after noop submit");
         }
     }
 }
@@ -1336,7 +1325,7 @@ fn submit_noop_and_wait(
 ) {
     let _ = mcbaise_render_noop_logs_enabled();
 
-    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+    let encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("mcbaise_pre_unconfigure_noop_wasm"),
     });
     let finished = encoder.finish();
@@ -1526,6 +1515,7 @@ fn main_frame_tick_system(mut frame: ResMut<GlobalFrameCount>) {
     frame.0 = frame.0.saturating_add(1);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_deferred_window_resolution_change_system(
     frame: Res<GlobalFrameCount>,
     mut deferred: ResMut<DeferredWindowResolutionChange>,
@@ -1563,9 +1553,9 @@ fn apply_deferred_window_resolution_change_system(
     {
         if wait_for_idle {
             if let Some(queue) = render_queue {
-                submit_noop_and_wait(&*render_device, &*queue);
+                submit_noop_and_wait(&render_device, &queue);
             }
-            wait_for_device_idle_strong(&*render_device);
+            wait_for_device_idle_strong(&render_device);
         }
     }
 
@@ -1681,7 +1671,7 @@ fn auto_cycle_resolution_system(
     if auto.every_frames == 0 {
         return;
     }
-    if (frame.0 - auto.start_frame) % auto.every_frames != 0 {
+    if !(frame.0 - auto.start_frame).is_multiple_of(auto.every_frames) {
         return;
     }
     if pending_window_geometry.pending || deferred.pending {
@@ -1789,11 +1779,11 @@ fn render_receive_surfaces_system(world: &mut bevy::ecs::world::World) {
     eprintln!("native(render): received teardown request token(s) - performing noop submit + strong device idle and signalling");
 
     let mut drained_flags: Vec<(u64, Arc<AtomicBool>)> = Vec::new();
-    if let Some(map_lock) = GLOBAL_RENDER_TEARDOWNS.get() {
-        if let Ok(mut map) = map_lock.lock() {
-            for (id, flag) in map.drain() {
-                drained_flags.push((id, flag));
-            }
+    if let Some(map_lock) = GLOBAL_RENDER_TEARDOWNS.get()
+        && let Ok(mut map) = map_lock.lock()
+    {
+        for (id, flag) in map.drain() {
+            drained_flags.push((id, flag));
         }
     }
     if drained_flags.is_empty() {
@@ -1828,6 +1818,7 @@ struct ReadbackStaging {
 }
 
 #[derive(Resource, Clone)]
+#[derive(Default)]
 struct PendingRenderAssetDrops {
     images: Vec<Handle<Image>>,
     scheduled_frame: Option<u64>,
@@ -1837,23 +1828,6 @@ struct PendingRenderAssetDrops {
     // submission index; the consumer will wait for a few frames after
     // this hint and poll the device before performing destructive drops.
     submit_frame_hint: Option<u64>,
-}
-
-impl PendingRenderAssetDrops {
-    fn clear_scheduled(&mut self) {
-        self.scheduled_frame = None;
-        self.submit_frame_hint = None;
-    }
-}
-
-impl Default for PendingRenderAssetDrops {
-    fn default() -> Self {
-        PendingRenderAssetDrops {
-            images: Vec::new(),
-            scheduled_frame: None,
-            submit_frame_hint: None,
-        }
-    }
 }
 
 // Final-stage delayed drops queued on the render thread. Each entry stores
@@ -1874,41 +1848,8 @@ struct StashedWindowSurfaces {
     entries: Vec<(u64, WindowSurfaces, u64, Option<Arc<AtomicBool>>)>,
 }
 
-#[derive(Resource, Default)]
-struct StashedPendingRenderAssetDrops {
-    // (teardown_id, pending_drops)
-    entries: Vec<(u64, PendingRenderAssetDrops)>,
-}
-
-
 // `SurfaceData` is a private Bevy-internal type and cannot be stashed/dropped
 // safely from user code. We intentionally avoid referencing it here.
-
-#[derive(Resource, Default)]
-struct StashedDelayedAttachmentDrops {
-    // (teardown_id, delayed_drops)
-    entries: Vec<(u64, DelayedAttachmentDrops)>,
-}
-
-
-#[derive(Resource, Default)]
-struct StashedReadbackStaging {
-    // (teardown_id, readback_staging)
-    entries: Vec<(u64, ReadbackStaging)>,
-}
-
-
-#[derive(Resource, Default)]
-struct StashedAssetsImage {
-    // (teardown_id, Assets<Image>)
-    entries: Vec<(u64, bevy::asset::Assets<Image>)>,
-}
-
-#[derive(Resource, Default)]
-struct StashedRenderAssetsGpuImage {
-    // (teardown_id, RenderAssets<GpuImage>)
-    entries: Vec<(u64, bevy::render::render_asset::RenderAssets<GpuImage>)>,
-}
 
 #[derive(Resource, Default)]
 struct CompletedDropIds(pub Vec<AssetId<Image>>);
@@ -1983,16 +1924,11 @@ impl bevy::render::extract_resource::ExtractResource for PendingWindowGeometry {
 
 // Controls whether window resolution changes should be applied as logical
 // (layout/DPI-independent) sizes or as physical framebuffer pixel sizes.
-#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Resource, Clone, Copy, Debug, PartialEq, Eq, Default)]
 enum ResolutionSetMode {
+    #[default]
     Logical,
     Physical,
-}
-
-impl Default for ResolutionSetMode {
-    fn default() -> Self {
-        ResolutionSetMode::Logical
-    }
 }
 
 // Phase machine used by the resize automation (mirror of `resize_test.rs`).
@@ -2081,7 +2017,6 @@ static GLOBAL_RENDER_TEARDOWNS: OnceLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> =
 // SurfaceTexture/acquire-semaphore resources before we unconfigure or drop
 // the underlying surface, which mitigates Vulkan driver races observed
 // during fast resize cycles.
-static GLOBAL_RENDER_TEARDOWN_COUNTDOWNS: OnceLock<Mutex<HashMap<u64, (Arc<AtomicBool>, u8)>>> = OnceLock::new();
 static NEXT_TEARDOWN_ID: AtomicU64 = AtomicU64::new(1);
 
 // Channel used to transfer WindowSurfaces (or their owning wrappers)
@@ -2160,7 +2095,7 @@ fn ensure_gpu_capture_camera_exists(
     }
 
     let desired_count = if capture_state.capture_multi {
-        multi_view.count as u8
+        multi_view.count
     } else {
         1
     };
@@ -2169,7 +2104,7 @@ fn ensure_gpu_capture_camera_exists(
     // GPU-backed resources, perform a strong device drain to reduce the
     // chance of destroying swapchain/surface resources while still in use.
     if existing.iter().len() > 0 {
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
     }
     for (entity, cap_cam) in &existing {
         if cap_cam.index >= desired_count {
@@ -2261,7 +2196,7 @@ fn sync_gpu_capture_cameras_from_views(
         for (view_cam, view_proj, view_transform, _fog) in &view_cams {
             if view_cam.index == cap_cam.index {
                 *proj = view_proj.clone();
-                *transform = view_transform.clone();
+                *transform = *view_transform;
                 found = true;
                 break;
             }
@@ -2779,7 +2714,7 @@ fn gpu_readback_render_system(
     let bytes_per_pixel: u32 = 4;
     let unpadded_bytes_per_row = width * bytes_per_pixel;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-    let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
+    let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
     let base_buffer_size = (padded_bytes_per_row as u64) * (height as u64);
 
     let include_overlay = std::env::var("MCBAISE_READBACK_INCLUDE_OVERLAY")
@@ -2819,7 +2754,7 @@ fn gpu_readback_render_system(
     let overlay_offset = if overlay_gpu_image.is_some() {
         // Align to 256 for safety (wgpu requires offset alignment for some copy paths).
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
-        ((base_buffer_size + align - 1) / align) * align
+        base_buffer_size.div_ceil(align) * align
     } else {
         0
     };
@@ -2832,8 +2767,21 @@ fn gpu_readback_render_system(
     eprintln!("gpu_readback: need staging {} bytes ({}x{})", buffer_size, width, height);
 
     // Reuse a persistent staging buffer when possible to reduce allocation churn.
-    let buffer = if staging_res.size >= buffer_size && staging_res.buffer.is_some() {
-        staging_res.buffer.as_ref().unwrap().clone()
+    let buffer = if staging_res.size >= buffer_size {
+        if let Some(existing) = staging_res.buffer.as_ref() {
+            existing.clone()
+        } else {
+            eprintln!("gpu_readback: creating new staging buffer {} bytes", buffer_size);
+            let b = render_device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("mcbaise_readback_staging"),
+                size: buffer_size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            staging_res.buffer = Some(b.clone());
+            staging_res.size = buffer_size;
+            b
+        }
     } else {
         eprintln!("gpu_readback: creating new staging buffer {} bytes", buffer_size);
         let b = render_device.create_buffer(&wgpu::BufferDescriptor {
@@ -2932,6 +2880,16 @@ fn gpu_readback_render_system(
         if overlay_offset != 0 {
             let pr = padded_bytes_per_row as usize;
             let ur = unpadded_bytes_per_row as usize;
+            // Quick sanity check: if the overlay target is still transparent, the composite will
+            // look like "no overlays". Print a tiny alpha checksum so tests can confirm we
+            // actually captured overlay pixels.
+            let mut overlay_alpha_sample: u32 = 0;
+            for px in 0..(width as usize).min(64) {
+                let i = px * 4;
+                let a = data[(overlay_offset as usize) + i + 3] as u32;
+                overlay_alpha_sample = overlay_alpha_sample.wrapping_add(a);
+            }
+            eprintln!("gpu_readback: overlay alpha sample checksum={}", overlay_alpha_sample);
             for row in 0..(height as usize) {
                 let ov_src_start = (overlay_offset as usize) + row * pr;
                 let dst_row = row * ur;
@@ -2958,8 +2916,8 @@ fn gpu_readback_render_system(
         // checksum/sample
         let sample_len = out.len().min(64);
         let mut checksum: u32 = 0;
-        for i in 0..sample_len {
-            checksum = checksum.wrapping_add(out[i] as u32);
+        for b in out.iter().take(sample_len) {
+            checksum = checksum.wrapping_add(*b as u32);
         }
 
         eprintln!("gpu_readback: mapped {} bytes ({}x{}, checksum_sample={})", out.len(), width, height, checksum);
@@ -3024,7 +2982,7 @@ fn gpu_readback_render_system(
                         use image::ColorType;
                         use image::ImageEncoder;
                         let encoder = PngEncoder::new(&mut fout);
-                        match encoder.write_image(&out, width as u32, height as u32, ColorType::Rgba8) {
+                        match encoder.write_image(&out, width, height, ColorType::Rgba8) {
                             Ok(()) => {
                                 // ensure file is flushed/dropped before rename
                                 drop(fout);
@@ -3047,8 +3005,8 @@ fn gpu_readback_render_system(
 
                 // If oneshot requested, clear the env var so subsequent frames aren't recorded.
                 if std::env::var("MCBAISE_READBACK_ONESHOT").as_deref().ok() == Some("1") {
-                    unsafe { let _ = std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
-                    unsafe { let _ = std::env::remove_var("MCBAISE_READBACK_ONESHOT"); }
+                    unsafe { std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
+                    unsafe { std::env::remove_var("MCBAISE_READBACK_ONESHOT"); }
                 }
             }
         }
@@ -5216,24 +5174,42 @@ impl AutoSubjectState {
     }
 
     fn pick_next_subject(&mut self) -> SubjectMode {
-        // In random mode we want some variety, including doughnut when burn_human is enabled.
-        // Keep the choice set small and deterministic (LCG-based).
+        // In random mode we want variety, but when `burn_human` is available we
+        // should *mostly* stick to subject modes that include the human.
+        // Keep this deterministic and low-entropy (LCG-based).
         if cfg!(feature = "burn_human") {
-            let choices = [
+            let human_choices = [
                 SubjectMode::Human,
                 SubjectMode::HumanBall,
                 SubjectMode::HumanDoughnut,
-                SubjectMode::Doughnut,
-                SubjectMode::Ball,
             ];
-            for _ in 0..6 {
+            let non_human_choices = [SubjectMode::Doughnut, SubjectMode::Ball];
+
+            // 85% human-including, 15% non-human.
+            let prefer_human = self.rand01() < 0.85;
+            let choices = if prefer_human {
+                &human_choices[..]
+            } else {
+                &non_human_choices[..]
+            };
+
+            for _ in 0..8 {
                 let idx = (self.lcg_next() % (choices.len() as u32)) as usize;
                 let pick = choices[idx];
                 if pick != self.current {
                     return pick;
                 }
             }
-            choices[0]
+
+            // Fallback: deterministic cycle that still prefers human.
+            match self.current {
+                SubjectMode::Human => SubjectMode::HumanBall,
+                SubjectMode::HumanBall => SubjectMode::HumanDoughnut,
+                SubjectMode::HumanDoughnut => SubjectMode::Human,
+                SubjectMode::Doughnut => SubjectMode::HumanDoughnut,
+                SubjectMode::Ball => SubjectMode::HumanBall,
+                SubjectMode::Auto | SubjectMode::Random => SubjectMode::Human,
+            }
         } else {
             match self.current {
                 SubjectMode::Ball => SubjectMode::Doughnut,
@@ -5561,10 +5537,6 @@ impl ExtractResource for PresentCameraMainEntity {
         source.clone()
     }
 }
-
-#[cfg(not(target_arch = "wasm32"))]
-#[derive(Component)]
-struct PresentSprite;
 
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
@@ -6198,6 +6170,13 @@ pub fn main() {
                 BurnHumanSource::Preloaded(_) => {
                     eprintln!("[mcbaise] assets self-test ok (preloaded)");
                 }
+                BurnHumanSource::AssetPath(p) => {
+                    eprintln!("[mcbaise] assets self-test ok (asset path)");
+                    eprintln!("[mcbaise] asset_path: {p}");
+                }
+                BurnHumanSource::Asset(_) => {
+                    eprintln!("[mcbaise] assets self-test ok (asset handle)");
+                }
             }
         }
 
@@ -6232,6 +6211,13 @@ pub fn main() {
                     }
                     BurnHumanSource::Preloaded(_) => {
                         eprintln!("[mcbaise] assets preflight ok (preloaded)");
+                    }
+                    BurnHumanSource::AssetPath(p) => {
+                        eprintln!("[mcbaise] assets preflight ok (asset path)");
+                        eprintln!("[mcbaise] asset_path: {p}");
+                    }
+                    BurnHumanSource::Asset(_) => {
+                        eprintln!("[mcbaise] assets preflight ok (asset handle)");
                     }
                 }
             }
@@ -6724,18 +6710,11 @@ pub fn main() {
     render_app.init_resource::<ResolutionSetMode>();
     render_app.init_resource::<DelayedAttachmentDrops>();
     render_app.init_resource::<StashedWindowSurfaces>();
-    render_app.init_resource::<StashedPendingRenderAssetDrops>();
-    render_app.init_resource::<StashedDelayedAttachmentDrops>();
-    render_app.init_resource::<StashedReadbackStaging>();
-    render_app.init_resource::<StashedAssetsImage>();
-    render_app.init_resource::<StashedRenderAssetsGpuImage>();
     render_app.init_resource::<CompletedDropIds>();
 
     #[derive(Resource, Default)]
     struct RenderPresentDebugPrinted(pub bool);
     render_app.init_resource::<RenderPresentDebugPrinted>();
-    #[derive(Resource, Default)]
-    struct RenderGraphDumpDone(pub bool);
     render_app.add_systems(
         bevy::render::Render,
         render_frame_tick_system.in_set(RenderSystems::Cleanup),
@@ -6783,11 +6762,11 @@ pub fn main() {
                 if !matches!(cam.target, RenderTarget::Window(_)) {
                     continue;
                 }
-                if let Some(main_ent) = main_ent {
-                    if main_ent.id() == main {
-                        keep_present = Some(ent);
-                        break;
-                    }
+                if let Some(main_ent) = main_ent
+                    && main_ent.id() == main
+                {
+                    keep_present = Some(ent);
+                    break;
                 }
             }
         }
@@ -6797,11 +6776,11 @@ pub fn main() {
                 if !matches!(cam.target, RenderTarget::Window(_)) {
                     continue;
                 }
-                if let Some(main_ent) = main_ent {
-                    if main_ent.id() == main {
-                        keep_overlay = Some(ent);
-                        break;
-                    }
+                if let Some(main_ent) = main_ent
+                    && main_ent.id() == main
+                {
+                    keep_overlay = Some(ent);
+                    break;
                 }
             }
         }
@@ -6828,14 +6807,14 @@ pub fn main() {
                 continue;
             }
 
-            if let Some(keep_overlay) = keep_overlay {
-                if ent == keep_overlay {
-                    let requested_active = cam.is_active;
-                    cam.is_active = requested_active && !resize_pending;
-                    cam.order = 1;
-                    cam.clear_color = ClearColorConfig::None;
-                    continue;
-                }
+            if let Some(keep_overlay) = keep_overlay
+                && ent == keep_overlay
+            {
+                let requested_active = cam.is_active;
+                cam.is_active = requested_active && !resize_pending;
+                cam.order = 1;
+                cam.clear_color = ClearColorConfig::None;
+                continue;
             }
 
             cam.is_active = false;
@@ -6943,7 +6922,6 @@ pub fn main() {
         }
     }
     if render_probes_enabled {
-        render_app.init_resource::<RenderGraphDumpDone>();
         render_app.add_systems(
             bevy::render::Render,
             render_graph_dump_system.in_set(RenderSystems::Prepare),
@@ -6997,14 +6975,13 @@ pub fn main() {
         render_queue.on_submitted_work_done(move || {
             eprintln!("native(render): post-graph submit probe seq={} acquire_seq={} on_submitted_work_done fired", seq, acq);
             // Notify any waiters that registered interest in this acquire
-            if let Some(w) = ACQUIRE_WAITS.get() {
-                if let Ok(mut map) = w.lock() {
-                    if let Some(waiters) = map.remove(&acq) {
-                        for shared in waiters {
-                            if let Some(tx) = shared.lock().unwrap().take() {
-                                let _ = tx.send(());
-                            }
-                        }
+            if let Some(w) = ACQUIRE_WAITS.get()
+                && let Ok(mut map) = w.lock()
+                && let Some(waiters) = map.remove(&acq)
+            {
+                for shared in waiters {
+                    if let Some(tx) = shared.lock().unwrap().take() {
+                        let _ = tx.send(());
                     }
                 }
             }
@@ -7051,7 +7028,7 @@ pub fn main() {
         mut pending_geom: ResMut<PendingWindowGeometry>,
         mut windows: Query<&mut Window, With<PrimaryWindow>>,
         // If available, attempt to update the render-extracted windows map.
-        mut extracted_windows: Option<ResMut<bevy::render::view::window::ExtractedWindows>>,
+        extracted_windows: Option<ResMut<bevy::render::view::window::ExtractedWindows>>,
         render_device: Res<bevy::render::renderer::RenderDevice>,
         frame: Res<GlobalFrameCount>,
         mode: Res<ResolutionSetMode>,
@@ -7086,7 +7063,7 @@ pub fn main() {
         pending_geom.scheduled_frame = Some(frame.0);
 
         // Conservative drain before mutating surface-backed state.
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
 
         // Apply on the render thread if a Window is available in the
         // render world. Bevy extracts `Window` into the render app, so
@@ -7119,11 +7096,15 @@ pub fn main() {
             let curr = extracted.iter().next().map(|(_, w)| (w.physical_width, w.physical_height));
             let mut w = pending_geom.target_w;
             let mut h = pending_geom.target_h;
-            if w == 0 {
-                if let Some((cw, _ch)) = curr { w = cw; }
+            if w == 0
+                && let Some((cw, _ch)) = curr
+            {
+                w = cw;
             }
-            if h == 0 {
-                if let Some((_cw, ch)) = curr { h = ch; }
+            if h == 0
+                && let Some((_cw, ch)) = curr
+            {
+                h = ch;
             }
             let mut applied_any = false;
             for (_ent, ex_win) in extracted.iter_mut() {
@@ -7211,7 +7192,8 @@ pub fn main() {
             for (id, g) in gimgs.iter() {
                 if seen < 48 {
                     let name = images.as_ref().and_then(|imgs| {
-                        imgs.get(id.clone()).and_then(|img| img.texture_descriptor.label.as_ref().map(|s| s.to_string()))
+                        imgs.get(id)
+                            .and_then(|img| img.texture_descriptor.label.as_ref().map(|s| s.to_string()))
                     });
                     if let Some(n) = name {
                         eprintln!(
@@ -7244,7 +7226,7 @@ pub fn main() {
             // observe the pending drops so we can better ensure the driver
             // has completed prior work before any destructive operations.
             if let (Some(dev), Some(queue)) = (render_device, render_queue) {
-                submit_noop_and_wait(&*dev, &*queue);
+                submit_noop_and_wait(&dev, &queue);
             }
         }
     }
@@ -7330,7 +7312,7 @@ pub fn main() {
     fn render_resize_images_system(
         pending_geom: Option<Res<PendingWindowGeometry>>,
         readback: Option<Res<GpuReadbackImage>>,
-        mut images: Option<ResMut<Assets<Image>>>,
+        images: Option<ResMut<Assets<Image>>>,
         render_device: Res<bevy::render::renderer::RenderDevice>,
         mut last: Local<Option<(u32, u32)>>,
     ) {
@@ -7342,25 +7324,23 @@ pub fn main() {
         let target_h = pending.target_h;
 
         // Avoid repeated resizes when size hasn't changed.
-        if let Some((lw, lh)) = *last {
-            if lw == target_w && lh == target_h {
-                return;
-            }
+        if last.is_some_and(|(lw, lh)| lw == target_w && lh == target_h) {
+            return;
         }
 
         // Give the device a conservative drain so drivers have time to finish
         // any work that may reference older attachments before we recreate.
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
 
         if let Some(mut imgs) = images {
             // Resize the explicit readback image if present.
-            if let Some(rb) = readback.as_ref() {
-                if let Some(img) = imgs.get_mut(&rb.0) {
-                    let cur = img.texture_descriptor.size;
-                    if cur.width != target_w || cur.height != target_h {
-                        eprintln!("native(render): resizing readback image {}x{} -> {}x{}", cur.width, cur.height, target_w, target_h);
-                        img.resize(Extent3d { width: target_w, height: target_h, depth_or_array_layers: 1 });
-                    }
+            if let Some(rb) = readback.as_ref()
+                && let Some(img) = imgs.get_mut(&rb.0)
+            {
+                let cur = img.texture_descriptor.size;
+                if cur.width != target_w || cur.height != target_h {
+                    eprintln!("native(render): resizing readback image {}x{} -> {}x{}", cur.width, cur.height, target_w, target_h);
+                    img.resize(Extent3d { width: target_w, height: target_h, depth_or_array_layers: 1 });
                 }
             }
 
@@ -7399,9 +7379,9 @@ pub fn main() {
     // been polled/drained. This performs the destructive removal on the
     // render thread where GPU allocations are owned.
     fn render_attachment_final_drop_system(
-        mut images: Option<ResMut<Assets<Image>>>,
-        mut pending_opt: Option<ResMut<PendingRenderAssetDrops>>,
-        mut delayed_opt: Option<ResMut<DelayedAttachmentDrops>>,
+        images: Option<ResMut<Assets<Image>>>,
+        pending_opt: Option<ResMut<PendingRenderAssetDrops>>,
+        delayed_opt: Option<ResMut<DelayedAttachmentDrops>>,
         render_device: Res<bevy::render::renderer::RenderDevice>,
         frame: Res<GlobalFrameCount>,
         completed: Option<Res<CompletedDropIds>>,
@@ -7450,7 +7430,7 @@ pub fn main() {
                 // If a completion flag was registered, prefer that. Otherwise,
                 // consult the `CompletedDropIds` list populated by the async
                 // pump system. If neither indicates completion, keep entry.
-                let completed_present = completed.as_ref().map_or(false, |c| c.0.contains(&handle.id()));
+                let completed_present = completed.as_ref().is_some_and(|c| c.0.contains(&handle.id()));
                 if let Some(flag) = flag_opt {
                     if !flag.load(Ordering::SeqCst) && !completed_present {
                         // submission not yet completed; keep for later
@@ -7477,7 +7457,7 @@ pub fn main() {
                 // attachments to avoid unnecessary stalls.
                 if present {
                     eprintln!("native(render): present attachment - performing extra device idle drain before removal");
-                    wait_for_device_idle_strong(&*render_device);
+                    wait_for_device_idle_strong(&render_device);
                 }
                 images.remove(&handle);
             }
@@ -7504,11 +7484,11 @@ pub fn main() {
     // gate to avoid destroying semaphore-backed surface resources while the
     // driver still references them.
     fn render_stashed_window_surfaces_finalizer(
-        mut stashed_res: Option<ResMut<StashedWindowSurfaces>>,
+        stashed_res: Option<ResMut<StashedWindowSurfaces>>,
         frame: Res<GlobalFrameCount>,
         render_device: Option<Res<bevy::render::renderer::RenderDevice>>,
         render_queue: Option<Res<bevy::render::renderer::RenderQueue>>,
-        completed: Option<Res<CompletedDropIds>>,
+        _completed: Option<Res<CompletedDropIds>>,
     ) {
         let mut stashed = match stashed_res {
             Some(s) => s,
@@ -7525,19 +7505,19 @@ pub fn main() {
                 remaining.push((id, surfaces, allowed_frame, flag_opt));
                 continue;
             }
-            if let Some(flag) = flag_opt {
-                if !flag.load(Ordering::SeqCst) {
-                    // on_submitted_work_done hasn't fired yet; keep it.
-                    remaining.push((id, surfaces, allowed_frame, Some(flag)));
-                    continue;
-                }
+            if let Some(flag) = flag_opt
+                && !flag.load(Ordering::SeqCst)
+            {
+                // on_submitted_work_done hasn't fired yet; keep it.
+                remaining.push((id, surfaces, allowed_frame, Some(flag)));
+                continue;
             }
 
             eprintln!("native(render): finalizing stashed WindowSurfaces id={} at frame={}", id, frame.0);
             // As a last defense, perform a strong device idle before drop if
             // we have a RenderDevice available.
             if let Some(dev) = render_device.as_ref() {
-                wait_for_device_idle_strong(&**dev);
+                wait_for_device_idle_strong(dev);
             }
             // Conservative per-stash noop-before-drop: if we have access to
             // the render queue, emit an explicit noop submit+wait for this
@@ -7547,7 +7527,7 @@ pub fn main() {
             // surface when we unconfigure/drop it.
             if let (Some(dev), Some(queue)) = (render_device.as_ref(), render_queue.as_ref()) {
                 eprintln!("native(render): issuing per-stash noop-before-drop id={} acquire_snapshot={}", id, ACQUIRE_SEQ_COUNTER.load(Ordering::SeqCst));
-                submit_noop_and_wait(&**dev, &**queue);
+                submit_noop_and_wait(dev, queue);
             }
             // dropping `surfaces` here can unconfigure/destroy backing
             // surface resources (wgpu Surface / swapchain) which some
@@ -7614,13 +7594,13 @@ pub fn main() {
             return;
         }
         eprintln!("native(render): pre-cleanup device idle wait frame={}", frame.0);
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
         // Also emit an explicit noop submission and wait if we have access
         // to the render queue. This creates a clear fence boundary at the
         // driver level which some Vulkan drivers require before surface
         // reconfigure/unconfigure.
         if let Some(queue) = render_queue {
-            submit_noop_and_wait(&*render_device, &*queue);
+            submit_noop_and_wait(&render_device, &queue);
         }
     }
 
@@ -7638,7 +7618,7 @@ pub fn main() {
         render_device: Res<bevy::render::renderer::RenderDevice>,
         render_queue: Res<bevy::render::renderer::RenderQueue>,
     ) {
-        submit_noop_and_wait(&*render_device, &*render_queue);
+        submit_noop_and_wait(&render_device, &render_queue);
     }
 
     render_app.add_systems(
@@ -7845,12 +7825,6 @@ fn native_youtube_align_browser_window(
     #[cfg(windows)]
     {
         use bevy::window::WindowLevel;
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-        use windows_sys::Win32::Foundation::HWND;
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            HWND_TOPMOST, SW_RESTORE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
-            ShowWindow,
-        };
 
         // Once we've positioned Chrome, keep Bevy as topmost so it doesn't fall behind.
         if layout.force_topmost {
@@ -8421,6 +8395,7 @@ fn native_youtube_shutdown_on_exit(
     let _ = sync.tx.send(native_youtube::Command::Shutdown);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -8593,11 +8568,6 @@ fn setup_scene(
             .ok()
             .unwrap_or("0")
             == "1";
-
-        // Keep debug logging independent from material selection.
-        // `MCBAISE_DEBUG_PRESENT=1` should not force solid colors; otherwise it
-        // makes it impossible to debug the real on-screen composite.
-        let present_debug_solid = present_debug_solid;
 
         let present_debug_clear = std::env::var("MCBAISE_PRESENT_DEBUG_CLEAR")
             .as_deref()
@@ -9119,6 +9089,7 @@ fn resize_overlay_ui_render_target_when_stable(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::type_complexity)]
 fn update_present_quads_to_window(
     windows: Query<&Window, With<PrimaryWindow>>,
     present_proj: Query<&Projection, With<PresentCamera>>,
@@ -9151,12 +9122,10 @@ fn update_present_quads_to_window(
     let w = w_u as f32;
     let h = h_u as f32;
 
-    // Keep a sanity check that the present camera is orthographic (expected).
+    // Sanity check that the present camera is orthographic (expected).
     // If this ever regresses to Perspective, the quad will look "far away".
     if let Some(proj) = present_proj.iter().next() {
-        if !matches!(proj, Projection::Orthographic(_)) {
-            // No hard failure; just size as above.
-        }
+        debug_assert!(matches!(proj, Projection::Orthographic(_)));
     }
 
     // Quads are a known-size 1x1 `Plane3d` (local XZ). We rotate them to face
@@ -9203,6 +9172,8 @@ fn sync_present_camera_projection_to_window(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
 fn debug_present_status_system(
     mut printed: ResMut<PresentDebugPrinted>,
     frame: Res<GlobalFrameCount>,
@@ -9368,8 +9339,12 @@ fn update_overlay_ui_camera(
         .unwrap_or("0")
         == "1";
     let readback_in_flight = readback_in_flight();
+    // `READBACK_REQUEST_SEQ` is incremented when a readback is requested, but the
+    // render-world readback phase flag may not be set until later in the frame.
+    // Use this only as a short-lived hint to retarget the overlay camera ASAP.
+    let readback_requested = READBACK_REQUEST_SEQ.load(std::sync::atomic::Ordering::SeqCst) != 0;
     let target_offscreen_for_readback = include_overlay_in_readback
-        && readback_in_flight
+        && (readback_in_flight || readback_requested)
         && overlay_target.0 != Handle::default();
 
     for mut cam in &mut q {
@@ -9391,6 +9366,7 @@ fn update_overlay_ui_camera(
 // surface/swapchain is being reconfigured or destroyed, which otherwise can
 // trigger wgpu validation errors like "In a pass parameter: Encoder is invalid".
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn gate_overlay_ui_camera_system(
     teardown: Res<TeardownState>,
     pending_geom: Res<PendingWindowGeometry>,
@@ -9416,10 +9392,26 @@ fn gate_overlay_ui_camera_system(
         .last_secs
         .is_some_and(|t| (now - t).max(0.0) < hide_secs);
 
+    // During overlay-inclusive readback, we must allow the overlay camera to render
+    // immediately (even if the OS fired an initial resize event at startup), otherwise
+    // the overlay render target will be transparent and the composite will appear as
+    // "no overlays".
+    let force_overlay_for_readback = std::env::var("MCBAISE_READBACK_INCLUDE_OVERLAY")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1"
+        && (readback_in_flight()
+            || READBACK_REQUEST_SEQ.load(std::sync::atomic::Ordering::SeqCst) != 0);
+
     // For autoresize, the window size is intentionally changing frequently.
     // Keep overlays off during the automation run, and only re-enable them
     // after the resize stream has been idle for a short period.
-    let disable = exit_requested || teardown.active || pending_geom.pending || auto.active || recently_resized;
+    let disable = exit_requested
+        || teardown.active
+        || pending_geom.pending
+        || auto.active
+        || (recently_resized && !force_overlay_for_readback);
     for mut cam in &mut cams {
         cam.is_active = !disable;
         if disable {
@@ -9803,8 +9795,8 @@ fn sync_resize_toggle_system(
     if capture_state.resize_automation_active && !auto.active {
         // Activate: seed from current window physical size
         if let Some(win) = windows.iter().next() {
-            let w = win.physical_width().max(1).min(65535) as u16;
-            let h = win.physical_height().max(1).min(65535) as u16;
+            let w = win.physical_width().clamp(1, 65535) as u16;
+            let h = win.physical_height().clamp(1, 65535) as u16;
             auto.width = w;
             auto.height = h;
         }
@@ -9823,15 +9815,14 @@ fn sync_resize_toggle_system(
 }
 
 // Restart main and overlay cameras to ensure GPU state is consistent after big geometry changes.
+#[allow(clippy::type_complexity)]
 fn restart_cameras_system(
-    mut commands: Commands,
     mut restart_req: ResMut<CameraRestartRequested>,
     mut params: ParamSet<(
         Query<&mut Camera, With<OverlayUiCamera>>,
         Query<(&mut Camera, &mut Transform), With<MainCamera>>,
     )>,
     render_device: Res<bevy::render::renderer::RenderDevice>,
-    mut pending_drops: ResMut<PendingRenderAssetDrops>,
     loading: Res<LoadingState>,
 ) {
     if loading.stage != LoadingStage::Ready {
@@ -9866,8 +9857,6 @@ fn restart_cameras_system(
         cam.order = 0;
         cam.clear_color = ClearColorConfig::Default;
     }
-    // Keep pending_drops resource present for future destructive operations.
-    let _ = &mut *pending_drops;
 }
 
 // Execution-phase: once the render cleanup has signalled readiness we perform
@@ -9891,7 +9880,7 @@ fn restart_cameras_execute_system(
         eprintln!("native: render cleanup acknowledged -> performing camera restart (non-destructive)");
         // Give the device an extra conservative drain and a short pause before
         // touching any swapchain-backed resources.
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
 
         let has_overlay = overlay_q.iter().next().is_some();
         let has_main = main_q.iter().next().is_some();
@@ -9996,6 +9985,7 @@ fn cycle_resolution_on_resize_icon_request_system(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn cycle_resolution_on_resize_icon_request_system(
     mut capture_state: ResMut<EguiCaptureState>,
     mut pending_window_geometry: ResMut<PendingWindowGeometry>,
@@ -10117,19 +10107,9 @@ fn teardown_countdown_system(
 
 // If requested, despawn the main scene entities and recreate them at full resolution.
 #[derive(SystemParam)]
-struct RestartSceneParams<'w, 's> {
-    commands: Commands<'w, 's>,
+struct RestartSceneParams<'w> {
     scene_restart: ResMut<'w, SceneRestartRequested>,
-    meshes: ResMut<'w, Assets<Mesh>>,
-    tube_materials: ResMut<'w, Assets<TubeMaterial>>,
     std_materials: ResMut<'w, Assets<StandardMaterial>>,
-    images: ResMut<'w, Assets<Image>>,
-    assets: Option<Res<'w, BurnHumanAssets>>,
-    tube_q: Query<'w, 's, Entity, With<TubeTag>>,
-    subj_q: Query<'w, 's, Entity, With<SubjectTag>>,
-    ball_q: Query<'w, 's, Entity, With<BallTag>>,
-    light_q: Query<'w, 's, Entity, With<SubjectLightTag>>,
-    render_device: Res<'w, bevy::render::renderer::RenderDevice>,
     pending_drops: ResMut<'w, PendingRenderAssetDrops>,
     loading: Res<'w, LoadingState>,
     maybe_readback: Option<Res<'w, GpuReadbackImage>>,
@@ -10137,7 +10117,7 @@ struct RestartSceneParams<'w, 's> {
     maybe_capture: Option<Res<'w, EguiCaptureState>>,
 }
 
-fn restart_scene_system(mut p: RestartSceneParams, frame: Res<GlobalFrameCount>) {
+fn restart_scene_system(mut p: RestartSceneParams, _frame: Res<GlobalFrameCount>) {
     // Avoid arming a full scene teardown while the app is still in its
     // startup/loading phase. This prevents accidental early drops that
     // would tear down GPU resources before the scene is first created.
@@ -10162,8 +10142,6 @@ fn restart_scene_system(mut p: RestartSceneParams, frame: Res<GlobalFrameCount>)
     eprintln!("native: armed scene restart handshake (id={}) - render cleanup will signal readiness", id);
 
     let mut drops = PendingRenderAssetDrops::default();
-    for (_h, mat) in p.tube_materials.iter() {
-    }
     for (_h, mat) in p.std_materials.iter() {
         if let Some(h) = &mat.base_color_texture {
             drops.images.push(h.clone());
@@ -10202,18 +10180,19 @@ fn restart_scene_system(mut p: RestartSceneParams, frame: Res<GlobalFrameCount>)
 
 // Execution-phase: after render cleanup has signalled it's safe, perform
 // the scene despawn and re-setup in the main world.
+#[allow(clippy::too_many_arguments)]
 fn restart_scene_execute_system(
-    mut commands: Commands,
+    commands: Commands,
     mut scene_restart: ResMut<SceneRestartRequested>,
     // resources required by setup_scene
-    mut meshes: ResMut<Assets<Mesh>>,
-    mut tube_materials: ResMut<Assets<TubeMaterial>>,
-    mut std_materials: ResMut<Assets<StandardMaterial>>,
-    mut images: ResMut<Assets<Image>>,
+    meshes: ResMut<Assets<Mesh>>,
+    tube_materials: ResMut<Assets<TubeMaterial>>,
+    std_materials: ResMut<Assets<StandardMaterial>>,
+    images: ResMut<Assets<Image>>,
     main_scene_target: Res<MainSceneRenderTarget>,
     overlay_ui_target: Res<OverlayUiRenderTarget>,
     readback: Option<Res<GpuReadbackImage>>,
-    assets: Option<Res<BurnHumanAssets>>,
+    _assets: Option<Res<BurnHumanAssets>>,
     // queries to find and despawn existing scene entities
     tube_q: Query<Entity, With<TubeTag>>,
     subj_q: Query<Entity, With<SubjectTag>>,
@@ -10231,7 +10210,7 @@ fn restart_scene_execute_system(
         eprintln!("native: render cleanup acknowledged -> performing scene restart (non-destructive)");
         // Extra strong drain before any work that could touch swapchain-backed
         // resources to reduce races on some drivers.
-        wait_for_device_idle_strong(&*render_device);
+        wait_for_device_idle_strong(&render_device);
         // Clear the main-world pending-drops list now that the render thread
         // should have consumed and removed the GPU-backed images.
         pending_drops.images.clear();
@@ -10458,10 +10437,10 @@ fn gif_auto_capture_system(
     // If GIF recording is enabled, request readbacks when idle.
     if std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1") {
         let now = time.elapsed().as_secs_f64();
-        if capture_state.capture_fps > 0 {
-            if now - capture_state.last_capture_time_secs < 1.0 / capture_state.capture_fps as f64 {
-                return;
-            }
+        if capture_state.capture_fps > 0
+            && now - capture_state.last_capture_time_secs < 1.0 / capture_state.capture_fps as f64
+        {
+            return;
         }
 
         capture_state.capture_skip_counter += 1;
@@ -10658,6 +10637,7 @@ impl Default for EguiCaptureState {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn native_controls(
     keys: Res<ButtonInput<KeyCode>>,
     mut playback: ResMut<Playback>,
@@ -11623,11 +11603,7 @@ fn update_tube_and_subject(
     }
 
     if let Ok(mut tr) = ball.single_mut() {
-        let mut desired = if active_subject_mode == SubjectMode::HumanBall {
-            desired_ball_rot
-        } else {
-            desired_ball_rot
-        };
+        let mut desired = desired_ball_rot;
         if tr.rotation.dot(desired) < 0.0 {
             desired = -desired;
         }
@@ -11700,6 +11676,7 @@ fn update_tube_and_subject(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn apply_subject_mode(
     subject_mode: Res<SubjectMode>,
     auto_subject: Res<AutoSubjectState>,
@@ -11894,16 +11871,19 @@ fn apply_appearance_preset(
 
 #[allow(dead_code)]
 fn timeline_human_appearance(video_time_sec: f32) -> AppearancePreset {
-    // Deterministic and simple.
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
-    if u < 3.5 {
+    // Deterministic and sequenced (not random), with long holds so each look
+    // gets time to read.
+    // NOTE: Phase offsets are used across timelines to avoid multiple settings
+    // changing on the same frame.
+    let cycle = 52.0;
+    let u = (video_time_sec + 5.2).rem_euclid(cycle);
+    if u < 16.0 {
         AppearancePreset::OpaqueWhite
-    } else if u < 7.0 {
+    } else if u < 28.0 {
         AppearancePreset::MatteLightBlue
-    } else if u < 10.5 {
+    } else if u < 38.0 {
         AppearancePreset::Polkadot
-    } else if u < 11.0 {
+    } else if u < 44.0 {
         AppearancePreset::Blue
     } else {
         AppearancePreset::BlueGlass
@@ -11912,12 +11892,10 @@ fn timeline_human_appearance(video_time_sec: f32) -> AppearancePreset {
 
 #[allow(dead_code)]
 fn timeline_ball_appearance(video_time_sec: f32) -> AppearancePreset {
-    // Keep the ball mostly "blue glass".
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
-    if u > 11.0 {
-        AppearancePreset::BlueGlass
-    } else if u > 7.0 {
+    // Keep the ball mostly "blue glass" with occasional, longer variation.
+    let cycle = 38.0;
+    let u = (video_time_sec + 9.1).rem_euclid(cycle);
+    if (26.0..34.0).contains(&u) {
         AppearancePreset::Polkadot
     } else {
         AppearancePreset::BlueGlass
@@ -12251,8 +12229,8 @@ fn ui_overlay(
     mut windows,
     mut pending_window_geometry,
     mut deferred_window_resolution_change,
-    mut teardown,
-    pending,
+    teardown,
+    pending: _pending,
     loading_state,
     resize_automation,
     auto_resolution_cycle,
@@ -12326,8 +12304,9 @@ fn ui_overlay(
 
     // Minimal resolution overlay: show only in debug mode.
     // Keep it left of the top-right view pie indicator so they never overlap.
-    if let Ok(ctx) = egui_contexts.ctx_mut() {
-        if let Some(mut win_iter) = windows.iter_mut().next() {
+    if let Ok(ctx) = egui_contexts.ctx_mut()
+        && let Some(win_iter) = windows.iter_mut().next()
+    {
             let w = win_iter.resolution.physical_width();
             let h = win_iter.resolution.physical_height();
 
@@ -12427,7 +12406,6 @@ fn ui_overlay(
                         ));
                     });
             }
-        }
     }
 
     // Scan for new captures in any .tmp/readback_* directory
@@ -12458,7 +12436,7 @@ fn ui_overlay(
 
                  for dir_path in scan_dirs {
                      let dir = match dir_path.to_str() { Some(s) => s, None => continue };
-                     if let Ok(mut entries) = std::fs::read_dir(&dir).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()) {
+                     if let Ok(mut entries) = std::fs::read_dir(dir).map(|r| r.filter_map(|e| e.ok()).collect::<Vec<_>>()) {
                          entries.sort_by_key(|e| e.file_name());
 
                          for ent in entries {
@@ -12481,87 +12459,78 @@ fn ui_overlay(
                                      if meta.len() == 0 {
                                          continue;
                                      }
-                                     if let Ok(modified) = meta.modified() {
-                                         if let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified) {
-                                             if elapsed.as_millis() < 200 {
-                                                 continue;
-                                             }
-                                         }
+                                     if let Ok(modified) = meta.modified()
+                                         && let Ok(elapsed) = std::time::SystemTime::now().duration_since(modified)
+                                         && elapsed.as_millis() < 200
+                                     {
+                                         continue;
                                      }
                                  }
 
-                                 match std::fs::read(&fname) {
-                                     Ok(bytes) => {
+                                 if let Ok(bytes) = std::fs::read(&fname) {
                                          if is_gif {
                                              use std::io::Cursor;
                                              use image::codecs::gif::GifDecoder;
                                              use image::AnimationDecoder;
 
-                                             if let Ok(decoder) = GifDecoder::new(Cursor::new(&bytes)) {
-                                                 if let Ok(frames_vec) = decoder.into_frames().collect_frames() {
-                                                     let mut handles = Vec::with_capacity(frames_vec.len());
-                                                     let mut tex_ids = Vec::with_capacity(frames_vec.len());
-                                                     let mut durations = Vec::with_capacity(frames_vec.len());
-                                                     for frame in frames_vec.into_iter() {
-                                                         let buf: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = frame.buffer().clone();
-                                                         let w = buf.width();
-                                                         let h = buf.height();
-                                                         let raw = buf.into_raw();
-                                                         if let Some(rgba_img) = image::RgbaImage::from_raw(w, h, raw) {
-                                                             let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-                                                             let bevy_image = Image::new(
-                                                                 size,
-                                                                 bevy::render::render_resource::TextureDimension::D2,
-                                                                 rgba_img.into_raw(),
-                                                                 bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
-                                                                 RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-                                                             );
-                                                             let handle = images_assets.add(bevy_image);
-                                                             let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
-                                                             handles.push(handle);
-                                                             tex_ids.push(tex_id);
-                                                             durations.push(0.1);
-                                                         }
-                                                     }
-                                                     if !handles.is_empty() {
-                                                         let entry = PreviewEntry { handles, tex_ids, durations, current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
-                                                         capture_state.loaded.insert(fname.clone(), entry);
-                                                         capture_state.order.push_front(fname.clone());
+                                             if let Ok(decoder) = GifDecoder::new(Cursor::new(&bytes))
+                                                 && let Ok(frames_vec) = decoder.into_frames().collect_frames()
+                                             {
+                                                 let mut handles = Vec::with_capacity(frames_vec.len());
+                                                 let mut tex_ids = Vec::with_capacity(frames_vec.len());
+                                                 let mut durations = Vec::with_capacity(frames_vec.len());
+                                                 for frame in frames_vec.into_iter() {
+                                                     let buf: image::ImageBuffer<image::Rgba<u8>, Vec<u8>> = frame.buffer().clone();
+                                                     let w = buf.width();
+                                                     let h = buf.height();
+                                                     let raw = buf.into_raw();
+                                                     if let Some(rgba_img) = image::RgbaImage::from_raw(w, h, raw) {
+                                                         let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+                                                         let bevy_image = Image::new(
+                                                             size,
+                                                             bevy::render::render_resource::TextureDimension::D2,
+                                                             rgba_img.into_raw(),
+                                                             bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                                                             RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+                                                         );
+                                                         let handle = images_assets.add(bevy_image);
+                                                         let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
+                                                         handles.push(handle);
+                                                         tex_ids.push(tex_id);
+                                                         durations.push(0.1);
                                                      }
                                                  }
-                                             }
-                                         } else {
-                                             match image::load_from_memory(&bytes) {
-                                                 Ok(img) => {
-                                                     let rgba = img.to_rgba8();
-                                                     let (w, h) = (rgba.width(), rgba.height());
-                                                     let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-                                                     let mut bevy_image = Image::new(
-                                                         size,
-                                                         bevy::render::render_resource::TextureDimension::D2,
-                                                         rgba.into_raw(),
-                                                         bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
-                                                         RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-                                                     );
-                                                     // Label preview images for clearer logs.
-                                                     let _ = match &mut bevy_image.texture_descriptor.label {
-                                                         Some(_) => {
-                                                             bevy_image.texture_descriptor.label = Some("preview_image");
-                                                             true
-                                                         }
-                                                         None => false,
-                                                     };
-                                                     let handle = images_assets.add(bevy_image);
-                                                     let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
-                                                     let entry = PreviewEntry { handles: vec![handle], tex_ids: vec![tex_id], durations: vec![0.1], current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
+                                                 if !handles.is_empty() {
+                                                     let entry = PreviewEntry { handles, tex_ids, durations, current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
                                                      capture_state.loaded.insert(fname.clone(), entry);
                                                      capture_state.order.push_front(fname.clone());
                                                  }
-                                                 Err(_) => {}
                                              }
+                                         } else if let Ok(img) = image::load_from_memory(&bytes) {
+                                                 let rgba = img.to_rgba8();
+                                                 let (w, h) = (rgba.width(), rgba.height());
+                                                 let size = bevy::render::render_resource::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+                                                 let mut bevy_image = Image::new(
+                                                     size,
+                                                     bevy::render::render_resource::TextureDimension::D2,
+                                                     rgba.into_raw(),
+                                                     bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
+                                                     RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+                                                 );
+                                                 // Label preview images for clearer logs.
+                                                 let _ = match &mut bevy_image.texture_descriptor.label {
+                                                     Some(_) => {
+                                                         bevy_image.texture_descriptor.label = Some("preview_image");
+                                                         true
+                                                     }
+                                                     None => false,
+                                                 };
+                                                 let handle = images_assets.add(bevy_image);
+                                                 let tex_id = egui_contexts.add_image(bevy_egui::EguiTextureHandle::Strong(handle.clone()));
+                                                 let entry = PreviewEntry { handles: vec![handle], tex_ids: vec![tex_id], durations: vec![0.1], current_idx: 0, last_advance_secs: time.elapsed().as_secs_f64() };
+                                                 capture_state.loaded.insert(fname.clone(), entry);
+                                                 capture_state.order.push_front(fname.clone());
                                          }
-                                     }
-                                     Err(_) => {}
                                  }
                              }
                          }
@@ -12597,7 +12566,7 @@ fn ui_overlay(
                 ui.add_space(120.0);
                 ui.spinner();
                 ui.add_space(10.0);
-                ui.heading(egui::RichText::new(format!("{}", VIDEO_ID)).size(20.0));
+                ui.heading(egui::RichText::new(VIDEO_ID.to_string()).size(20.0));
                 ui.add_space(6.0);
                 ui.label("Loading assets and initializing GPU...");
                 if loading_state.stage == LoadingStage::WaitingForGpu {
@@ -12631,8 +12600,9 @@ fn ui_overlay(
         egui::SidePanel::right("mcbaise_capture_panel").min_width(220.0).show(ctx, |ui| {
         ui.heading("Capture");
         ui.horizontal(|ui| {
-            if ui.button("Capture PNG").clicked() {
-                if let Ok(ts) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if ui.button("Capture PNG").clicked()
+                && let Ok(ts) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            {
                     let sec = ts.as_secs();
                     let dir = format!(".tmp/readback_{}", sec);
                     let _ = std::fs::create_dir_all(&dir);
@@ -12640,7 +12610,6 @@ fn ui_overlay(
                     unsafe { std::env::set_var("MCBAISE_READBACK_ONESHOT", "1"); }
                     READBACK_REQUEST_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     eprintln!("native: UI requested one-shot readback -> {}", dir);
-                }
             }
 
             #[cfg(not(target_arch = "wasm32"))]
@@ -12832,15 +12801,15 @@ fn ui_overlay(
                     ui.horizontal(|ui| {
                         ui.visuals_mut().override_text_color = Some(egui::Color32::from_rgb(255, 100, 100));
                         let mut label = String::from("🔴 Recording GIF...");
-                        if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
-                            if let Ok(entries) = std::fs::read_dir(&dir) {
+                        if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT")
+                            && let Ok(entries) = std::fs::read_dir(dir)
+                        {
                                 let count = entries.filter_map(|e| e.ok()).filter(|e| {
                                     if let Some(n) = e.path().extension() {
                                         n == "png"
                                     } else { false }
                                 }).count();
                                 label.push_str(&format!("  (frames: {})", count));
-                            }
                         }
                         ui.label(label);
                     });
@@ -12992,11 +12961,11 @@ fn ui_overlay(
                 if !multi_view.increment() {
                     multi_view_hint.show(now_sec, "right click (or tap & hold) to remove");
                 }
-            } else if resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched() {
-                if !multi_view.decrement() {
-                    // Already at 1 view; explain how to add splits back.
-                    multi_view_hint.show(now_sec, "left click/tap to add more");
-                }
+            } else if (resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched())
+                && !multi_view.decrement()
+            {
+                // Already at 1 view; explain how to add splits back.
+                multi_view_hint.show(now_sec, "left click/tap to add more");
             }
             });
     }
@@ -14204,8 +14173,10 @@ fn ui_overlay(
     }
 
     // YouTube/MPV initialization splash
-    if let Some(sync) = _native_youtube.as_ref() {
-        if sync.enabled && !sync.has_remote {
+    if let Some(sync) = _native_youtube.as_ref()
+        && sync.enabled
+        && !sync.has_remote
+    {
             egui::CentralPanel::default()
                 .frame(egui::Frame::default().fill(egui::Color32::from_black_alpha(180)))
                 .show(ctx, |ui| {
@@ -14218,19 +14189,20 @@ fn ui_overlay(
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("Launching browser and establishing WebDriver session...").size(18.0).color(egui::Color32::GRAY));
                             
-                            if let Ok(slot) = sync.last_error.lock() {
-                                if let Some(err) = slot.as_ref().map(|s| s.as_str()) {
+                            if let Ok(slot) = sync.last_error.lock()
+                                && let Some(err) = slot.as_deref()
+                            {
                                     ui.add_space(32.0);
                                     ui.label(egui::RichText::new("Initialization Error:").strong().color(egui::Color32::RED));
                                     ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(255, 100, 100)));
-                                }
                             }
                         });
                     });
                 });
-        }
-    } else if let Some(sync) = _native_mpv.as_ref() {
-        if sync.enabled && !sync.has_remote {
+    } else if let Some(sync) = _native_mpv.as_ref()
+        && sync.enabled
+        && !sync.has_remote
+    {
             egui::CentralPanel::default()
                 .frame(egui::Frame::default().fill(egui::Color32::from_black_alpha(240)))
                 .show(ctx, |ui| {
@@ -14243,17 +14215,16 @@ fn ui_overlay(
                             ui.add_space(20.0);
                             ui.label(egui::RichText::new("Starting MPV instance and connecting to IPC...").size(18.0).color(egui::Color32::GRAY));
                             
-                            if let Ok(slot) = sync.last_error.lock() {
-                                if let Some(err) = slot.as_ref().map(|s| s.as_str()) {
+                            if let Ok(slot) = sync.last_error.lock()
+                                && let Some(err) = slot.as_deref()
+                            {
                                     ui.add_space(32.0);
                                     ui.label(egui::RichText::new("Initialization Error:").strong().color(egui::Color32::RED));
                                     ui.label(egui::RichText::new(err).color(egui::Color32::from_rgb(255, 100, 100)));
-                                }
                             }
                         });
                     });
                 });
-        }
     }
 }
 
@@ -14358,12 +14329,14 @@ fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
     // We derive a per-mode "preferred" duration from the suggested range:
     // - fixed range: use that value
     // - otherwise: midpoint
+    // Give each camera mode more time to breathe.
+    let scale = 1.55;
     let preferred = |mode: CameraMode| {
         let (min_sec, max_sec) = mode.suggested_duration_range_sec();
         if (min_sec - max_sec).abs() < 1e-4 {
-            min_sec
+            min_sec * scale
         } else {
-            0.5 * (min_sec + max_sec)
+            0.5 * (min_sec + max_sec) * scale
         }
     };
 
@@ -14378,7 +14351,7 @@ fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
     let focused_mode = CameraMode::FocusedChase;
     let focused_dur = preferred(focused_mode);
 
-    // Keep passing at ~1s per direction (and within the suggested 0.9..1.2 range).
+    // Keep passing within the suggested range.
     let pass_each_dur = preferred(CameraMode::PassingLeft).clamp(0.9, 1.2);
 
     let chase_b_dur = preferred(CameraMode::BallChase);
@@ -14392,8 +14365,10 @@ fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
         + pass_each_dur * 4.0
         + chase_b_dur;
 
-    let u = video_time_sec.rem_euclid(cycle);
-    let cycle_idx = (video_time_sec / cycle).floor() as i32;
+    // Phase offset to avoid syncing with subject/pose/color/texture switches.
+    let phase = 19.7;
+    let u = (video_time_sec + phase).rem_euclid(cycle);
+    let cycle_idx = ((video_time_sec + phase) / cycle).floor() as i32;
 
     let focused_mode = if (cycle_idx & 1) == 0 {
         CameraMode::FocusedChase
@@ -14441,15 +14416,16 @@ fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
 fn timeline_pose_mode(video_time_sec: f32) -> PoseMode {
     // Deterministic pose cycle for timeline mode.
     // Placeholder until the full scripted timeline is ported; guarantees Auto isn't random.
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
-    let cycle_idx = (video_time_sec / cycle).floor() as i32;
+    // Longer and staggered so pose isn't changing in lockstep with other Auto settings.
+    let cycle = 42.0;
+    let u = (video_time_sec + 3.1).rem_euclid(cycle);
+    let cycle_idx = ((video_time_sec + 3.1) / cycle).floor() as i32;
 
-    if u < 3.5 {
+    if u < 12.0 {
         PoseMode::Standing
-    } else if u < 7.0 {
+    } else if u < 22.0 {
         PoseMode::Belly
-    } else if u < 10.5 {
+    } else if u < 32.0 {
         PoseMode::Back
     } else if (cycle_idx & 1) == 0 {
         PoseMode::LeftSide
@@ -14460,33 +14436,46 @@ fn timeline_pose_mode(video_time_sec: f32) -> PoseMode {
 
 fn timeline_subject_mode(video_time_sec: f32) -> SubjectMode {
     // Deterministic subject timeline.
-    // Keep the rider as human for most of the cycle; switch to ball during the chase segment.
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
-    if u > 11.0 {
-        return SubjectMode::Ball;
+    // When the human model is available, keep the subject as human-including for most of the
+    // cycle. Allow occasional non-human segments for variety.
+    // Longer, more readable sequencing.
+    let cycle = 60.0;
+    let u = (video_time_sec + 1.7).rem_euclid(cycle);
+    let cycle_idx = ((video_time_sec + 1.7) / cycle).floor() as i32;
+
+    // A chase segment at the end of each cycle.
+    if u > 54.0 {
+        if !cfg!(feature = "burn_human") {
+            return SubjectMode::Ball;
+        }
+
+        // Mostly keep the human visible during the chase.
+        // Every ~8th cycle, allow a pure-ball chase for variety.
+        return if (cycle_idx % 8) == 0 {
+            SubjectMode::Ball
+        } else {
+            SubjectMode::HumanBall
+        };
     }
 
     if !cfg!(feature = "burn_human") {
         return SubjectMode::Doughnut;
     }
 
-    // Include the newer combined-subject modes in the Auto timeline.
-    // Keep it deterministic, and alternate each 14s cycle.
-    let cycle_idx = (video_time_sec / cycle).floor() as i32;
-    if (cycle_idx & 1) == 0 {
-        if u < 4.0 {
-            SubjectMode::Human
-        } else if u < 7.5 {
+    // Mostly human-only; add an accessory segment in the middle.
+    if u < 20.0 {
+        SubjectMode::Human
+    } else if u < 35.0 {
+        // Alternate accessory by cycle.
+        if (cycle_idx & 1) == 0 {
             SubjectMode::HumanDoughnut
         } else {
-            SubjectMode::Doughnut
+            SubjectMode::HumanBall
         }
     } else {
-        if u < 4.0 {
+        // Rarely show a non-human interlude (kept short) so it doesn't dominate.
+        if (cycle_idx % 12) == 0 && u < 42.0 {
             SubjectMode::Doughnut
-        } else if u < 7.5 {
-            SubjectMode::HumanBall
         } else {
             SubjectMode::Human
         }
@@ -14495,16 +14484,20 @@ fn timeline_subject_mode(video_time_sec: f32) -> SubjectMode {
 
 fn timeline_color_scheme(video_time_sec: f32) -> u32 {
     // Deterministic color timeline (covers all schemes).
-    let step = 3.5;
-    let idx = (video_time_sec / step).floor().max(0.0) as u32;
-    idx % COLOR_SCHEME_COUNT
+    // Longer holds and a fixed sequence so it reads as "automatic" instead of "random".
+    let step = 11.0;
+    let seq: [u32; 10] = [0, 1, 2, 4, 5, 3, 6, 7, 8, 9];
+    let idx = ((video_time_sec + 7.3) / step).floor().max(0.0) as usize;
+    seq[idx % seq.len()] % COLOR_SCHEME_COUNT
 }
 
 fn timeline_texture_pattern(video_time_sec: f32) -> u32 {
     // Deterministic texture timeline (covers all patterns).
-    let step = 3.5;
-    let idx = (video_time_sec / step).floor().max(0.0) as u32;
-    idx % TEXTURE_PATTERN_COUNT
+    // Longer holds and a fixed sequence. Phase offset avoids syncing with colors.
+    let step = 13.0;
+    let seq: [u32; 10] = [2, 3, 8, 0, 1, 4, 5, 6, 7, 9];
+    let idx = ((video_time_sec + 2.9) / step).floor().max(0.0) as usize;
+    seq[idx % seq.len()] % TEXTURE_PATTERN_COUNT
 }
 
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Default)]
@@ -14840,8 +14833,9 @@ fn camera_pose(
     // If we're in a passing shot and the anchor is provided, gently track the
     // subject after it has moved passed the anchor point so the camera reads
     // the subject as it exits the frame.
-    if selected_mode.is_passing() {
-        if let Some((pass_c, pass_tan, pass_n, _pass_b)) = pass_anchor {
+    if selected_mode.is_passing()
+        && let Some((pass_c, pass_tan, pass_n, _pass_b)) = pass_anchor
+    {
             let active_pos = match subject_mode {
                 SubjectMode::Human | SubjectMode::HumanDoughnut | SubjectMode::Doughnut => {
                     subject_pos_human
@@ -14863,7 +14857,6 @@ fn camera_pose(
                 let pos_alpha = 0.12 + 0.28 * follow_strength;
                 pos = pos.lerp(pos_target, pos_alpha);
             }
-        }
     }
 
     if in_intro {

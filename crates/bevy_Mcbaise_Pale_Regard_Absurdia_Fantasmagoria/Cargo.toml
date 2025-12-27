@@ -10,9 +10,7 @@ homepage = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fant
 repository = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
 build = "build.rs"
 publish = true
-exclude = [
-    "www/pkg/**",
-]
+exclude = ["www/pkg/**"]
 
 [lib]
 name = "bevy_mcbaise_fantasmagoria"
@@ -33,10 +31,16 @@ path = "src/main.rs"
 required-features = ["native-mpv"]
 
 [features]
-default = ["native","capture_ui","burn_human"]
+default = ["native", "capture_ui", "burn_human"]
 native = ["bevy/multi_threaded"]
 burn_human = ["bevy_burn_human"]
-native-youtube = ["dep:fantoccini", "dep:tokio", "dep:serde_json", "dep:url", "dep:time"]
+native-youtube = [
+    "dep:fantoccini",
+    "dep:tokio",
+    "dep:serde_json",
+    "dep:url",
+    "dep:time",
+]
 native-mpv = ["dep:tokio", "dep:serde_json"]
 capture_ui = []
 
@@ -69,7 +73,7 @@ bevy = { version = "0.17", default-features = false, features = [
     "zstd_rust",
 ] }
 bevy_egui = "0.38"
-bevy_burn_human = { version = "0.2", optional = true }
+bevy_burn_human = { version = "0.2.0", optional = true }
 fastrand = "2"
 bevy_render = "0.17"
 
@@ -85,12 +89,25 @@ console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2.106"
 wasm-bindgen-futures = "0.4"
 lz4_flex = { version = "0.11", default-features = false }
-web-sys = { version = "0.3", features = ["Window", "Document", "HtmlElement", "HtmlCanvasElement", "ImageBitmap", "CanvasRenderingContext2d", "ImageData"] }
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Document",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "ImageBitmap",
+    "CanvasRenderingContext2d",
+    "ImageData",
+] }
 js-sys = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fantoccini = { version = "0.21", optional = true }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"], optional = true }
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "time",
+    "net",
+    "io-util",
+], optional = true }
 serde_json = { version = "1", optional = true }
 url = { version = "2", optional = true }
 time = { version = "0.3", optional = true }
